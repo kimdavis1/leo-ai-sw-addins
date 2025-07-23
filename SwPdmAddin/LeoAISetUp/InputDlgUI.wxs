@@ -1,0 +1,60 @@
+﻿<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+
+    <UI Id="InputDlgUI">
+
+
+		<Property Id="SELECTED_FILE" Value="C:\LeoAuthKey.json" />
+		<Property Id="VALID_SELECTED_FILE" Value="0"/>
+		
+
+
+		<Dialog Id="InputDlg" Width="370" Height="230" Title="[ProductName] - Select File">
+
+			<Control Id="Banner" Type="Bitmap" X="0" Y="0" Width="370" Height="44"
+           TabSkip="yes" Text="WixUI_Bmp_Banner" />
+				<Control Id="InstructionText" Type="Text" X="15" Y="50" Width="340" Height="40"
+		  Transparent="yes" NoPrefix="yes"
+		  Text="Please select the LeoAuthKey.json file. You can download this from the Tenant Admin Dashboard under Integrations in the Leo AI app." />
+
+			<!-- reuse RegistMsg slot for your prompt -->
+			<Control Id="RegistMsg" Type="Text" X="15" Y="95" Width="120" Height="18"
+					 Transparent="yes" Text="Select the file to use:" />
+
+
+		
+			
+			<Control Id="LogPathEdit" Type="PathEdit" X="15" Y="110" Width="250" Height="18" Property="SELECTED_FILE" Text="[SELECTED_FILE]"></Control>
+			
+			<Control Id="emailLabel" Type="Text" X="210" Y="85" Width="60" Height="18"
+					 Transparent="yes" Text=" " />
+		
+			<Control Id="BrowseBtn" Type="PushButton" X="275" Y="108" Width="70" Height="18"
+					 Text="Browse...">
+				
+				<Publish Event="DoAction" Value="ShowJsonBrowse" Condition="1"></Publish>
+				
+				<Publish Property="SELECTED_FILE" Value="[SELECTED_FILE]" Condition="1"></Publish>
+			</Control>
+
+			
+		
+			
+			<Control Id="InstallBtn" Type="PushButton" Text="OK" X="220" Y="170" Width="60" Height="25" EnableCondition="SELECTED_FILE" DisableCondition="NOT SELECTED_FILE">
+				<!-- only close if a file is chosen -->
+				<Publish Event="DoAction" Value="ValidateFile" Condition="1"></Publish>
+				<Publish Event="EndDialog" Value="Return" Condition="VALID_SELECTED_FILE = &quot;1&quot;"/>
+				
+			</Control>
+
+		
+			<Control Id="CancelBtn" Type="PushButton" Text="Cancel" X="290" Y="170" Width="60" Height="25" Cancel="yes">
+				<Publish Event="EndDialog" Value="Exit" Condition="1" />
+			</Control>
+		</Dialog>
+
+
+    </UI>
+  </Fragment>
+
+</Wix>

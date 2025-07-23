@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Leo AI Solidworks Addin"
+    Version="1.0.0.0"
+    Manufacturer="Opensource"
+    UpgradeCode="f4f2f472-ebf8-40b5-a659-807bc05ab6e9"
+    InstallerVersion="500"
+    Compressed="yes"
+    Scope="perMachine">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="ProductFeature" Title="Leo AI SolidWorks Addin" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+    </Feature>
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="LEO" Name="Leo">
+        <Directory Id="LEOSWADDIN" Name="LeoSWAddin">
+          <Directory Id="INSTALLFOLDER" Name="plugin" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+    
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Component Id="MainComponent" Guid="{68196E00-1C80-4FA4-A7B0-9A69C04BDB30}">
+
+        <File Id="MainDllCopy" Source="sw-addin.dll" KeyPath="no" />
+        <File Id="NewtonsoftJsonCopy" Source="Newtonsoft.Json.dll" KeyPath="no" />
+        <File Id="SolidWorksToolsCopy" Source="solidworkstools.dll" KeyPath="no" />
+        <!-- COM registration for .NET add-in -->
+        <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}">
+          <RegistryValue Name="InprocServer32" Value="mscoree.dll" Type="string" KeyPath="no" />
+          <RegistryValue Name="Assembly" Value="sw_addin, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null" Type="string" />
+          <RegistryValue Name="Class" Value="SwLeoAIAddin.SwAddin" Type="string" />
+          <RegistryValue Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+          <RegistryValue Name="CodeBase" Value="[INSTALLFOLDER]sw-addin.dll" Type="string" />
+        </RegistryKey>
+        <!-- SolidWorks Addin registration -->
+        <RegistryKey Root="HKLM" Key="SOFTWARE\SolidWorks\Addins\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}">
+          <RegistryValue Name="Description" Value="Your AI engineering design copilot" Type="string" />
+          <RegistryValue Name="Title" Value="Leo AI copilot" Type="string" />
+          <RegistryValue Name="LoadAtStartup" Value="1" Type="integer" />
+          <RegistryValue Name="CommandLine" Value="" Type="string" />
+        </RegistryKey>
+      </Component>
+      <Component Id="UserStartupComponent" Guid="*">
+        <RegistryKey Root="HKCU" Key="Software\SolidWorks\AddInsStartup\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}">
+          <RegistryValue Value="1" Type="integer" />
+        </RegistryKey>
+      </Component>
+    </ComponentGroup>
+  </Package>
+</Wix>

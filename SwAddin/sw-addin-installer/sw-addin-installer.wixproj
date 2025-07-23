@@ -1,0 +1,15 @@
+﻿<Project Sdk="WixToolset.Sdk/6.0.0">
+  <PropertyGroup>
+    <OutputType>Package</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <OutputName>sw_addin_installer</OutputName>
+    <WixToolsetOutputType>Bundle</WixToolsetOutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <WixSource Include="Product.wxs" />
+    <Content Include="sw-addin-installer.wax" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\sw-addin\sw-addin.csproj" />
+  </ItemGroup>
+</Project>

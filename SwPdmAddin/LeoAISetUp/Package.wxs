@@ -1,0 +1,129 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+	<Package
+
+	  Name="LeoAI PDM add-in"
+	  Version="1.0.0.0"
+	  Manufacturer="Opensource"
+	  UpgradeCode="fe455201-a208-469a-a5df-dadcfb3e67d6"
+	  InstallerVersion="500"
+	  Compressed="yes"
+	  Scope="perMachine">
+
+		<MediaTemplate EmbedCab="yes"/>
+	
+		<Property Id="MsiLogging" Value="voicewarmupx" />
+		
+		<WixVariable Id="WixUILicenseRtf" Value=".\file-sample_100kB.rtf" />
+
+
+		<MajorUpgrade DowngradeErrorMessage="A newer version is already installed." />
+
+		<Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+		<Property Id="JSONFILE" Value="KEEP" />
+
+		<!-- Directory structure -->
+		<DirectoryRef Id="ProgramFiles64Folder">
+			<Directory Id="INSTALLFOLDER" Name="LeoAISwPdmAddIn" />
+		</DirectoryRef>
+	
+
+
+		<UI>
+			
+
+
+				<ui:WixUI Id="WixUI_InstallDir" />
+			<UIRef Id="CustomSetupUI" />
+			<UIRef Id="InputDlgUI" />
+			<Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="1" />
+			<Publish Dialog="WelcomeDlg" Control="Cancel" Event="EndDialog" Value="Exit" />
+			<Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="2" />
+			
+			
+
+			
+		</UI>
+
+		<Binary Id="BIN_CUSTOMACTIONS" SourceFile="$(var.Bundle.Core.CustomAction.TargetDir)$(var.Bundle.Core.CustomAction.TargetName).CA.dll" />
+
+		<Feature Id="ProductFeature" Title="LeoAI PDM Add-In" Level="1">
+			<ComponentGroupRef Id="AddInBinComponents" />
+		</Feature>
+
+		<CustomAction Id="ShowJsonBrowse"
+  BinaryRef="BIN_CUSTOMACTIONS"
+  DllEntry="ShowJsonBrowse"
+  Execute="immediate"
+  Return="check"
+  Impersonate="no"/>
+
+		<CustomAction Id="ValidateFile"
+  BinaryRef="BIN_CUSTOMACTIONS"
+  DllEntry="ValidateFile"
+  Execute="immediate"
+  Return="check"
+  Impersonate="no"/>
+
+		<CustomAction Id="PrepareCopySelectedJsonData"
+              Property="CopySelectedJson"
+              Value="SELECTED_FILE=[SELECTED_FILE];INSTALLFOLDER=[INSTALLFOLDER]"
+              Execute="immediate"
+              />
+
+		<CustomAction Id="Data_Ceanup"
+              Property="ShowCleanupInstructions"
+              Value="INSTALLFOLDER=[INSTALLFOLDER]"
+              Execute="immediate"
+              />
+
+
+		<CustomAction Id="CopySelectedJson"
+	  BinaryRef="BIN_CUSTOMACTIONS"
+	  DllEntry="CopySelectedJson"
+	  Execute="deferred"
+	  Return="check"
+	  Impersonate="no"/>
+
+		<CustomAction Id="LaunchInteractiveApp"
+	  BinaryRef="BIN_CUSTOMACTIONS"
+	  DllEntry="LaunchInteractiveApp"
+	  Execute="immediate"
+	  Return="check"
+	  />
+
+
+		<CustomAction Id="ShowCleanupInstructions"
+              BinaryRef="BIN_CUSTOMACTIONS"
+              DllEntry="ShowCleanupPopup"
+              Execute="deferred"
+              Return="ignore"
+				  Impersonate="no"/>
+		
+		
+		
+		<InstallExecuteSequence>
+
+
+			<Custom Action="PrepareCopySelectedJsonData" Before="CopySelectedJson" Condition="NOT Installed" />
+
+			<Custom Action="CopySelectedJson" After="InstallFiles" Condition="NOT Installed" />
+			
+			<Custom Action="LaunchInteractiveApp" After="InstallFinalize" Condition="NOT REMOVE"></Custom>
+
+			<Custom Action="Data_Ceanup" Before="ShowCleanupInstructions" />
+			<Custom Action="ShowCleanupInstructions" After="InstallInitialize" Condition="REMOVE=&quot;ALL&quot;"></Custom>
+		</InstallExecuteSequence>
+
+	</Package>
+
+
+	<Fragment>
+		<ComponentGroup Id="AddInBinComponents" Directory="INSTALLFOLDER">
+			<Files Include="$(var.SolutionDir)StagedBinaries\**" />
+		</ComponentGroup>
+	</Fragment>
+
+</Wix>

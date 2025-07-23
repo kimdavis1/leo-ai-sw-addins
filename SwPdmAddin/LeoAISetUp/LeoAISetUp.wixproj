@@ -1,0 +1,20 @@
+﻿<Project Sdk="WixToolset.Sdk/6.0.1">
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <SuppressValidation>true</SuppressValidation>
+  </PropertyGroup>
+  <ItemGroup>
+    <None Include="file-sample_100kB.rtf" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="6.0.1" />
+    <PackageReference Include="WixToolset.Util.wixext" Version="6.0.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\Bundle.Core.CustomAction\Bundle.Core.CustomAction.csproj" />
+    <ProjectReference Include="..\LeoAISwPdmAddIn\LeoAISwPdmAddIn.csproj" />
+    <ProjectReference Include="..\LoadAddIn\LoadAddIn\LoadAddIn.csproj" />
+  </ItemGroup>
+  <Target Name="PreBuild" BeforeTargets="PreBuildEvent">
+    <Exec Command=":: ——— Clean out the old folder ———&#xD;&#xA;if exist &quot;$(SolutionDir)StagedBinaries\&quot; (&#xD;&#xA;    rmdir /S /Q &quot;$(SolutionDir)StagedBinaries\&quot;&#xD;&#xA;)&#xD;&#xA;&#xD;&#xA;:: ——— Recreate it fresh ———&#xD;&#xA;mkdir &quot;$(SolutionDir)StagedBinaries\&quot;&#xD;&#xA;&#xD;&#xA;:: ——— Copy your main Add‑In output ———&#xD;&#xA;xcopy &quot;$(SolutionDir)bin\$(Configuration)\*.*&quot; &quot;$(SolutionDir)StagedBinaries\&quot; /E /I /Y&#xD;&#xA;&#xD;&#xA;:: ——— Copy the LoadAddIn output ———&#xD;&#xA;xcopy &quot;$(SolutionDir)..\LoadAddIn\LoadAddIn\bin\$(Configuration)\*.*&quot; &quot;$(SolutionDir)StagedBinaries\&quot; /E /I /Y" />
+  </Target>
+</Project>

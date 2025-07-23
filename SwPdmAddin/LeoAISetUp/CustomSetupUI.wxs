@@ -1,0 +1,11 @@
+﻿<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <UI Id="CustomSetupUI">
+      <TextStyle Id="RobotoBold" FaceName="RobotoBold" Size="10" />
+      <DialogRef Id="InputDlg" />
+      <InstallUISequence>
+        <Show Dialog="InputDlg" Before="ExecuteAction" />
+      </InstallUISequence>
+    </UI>
+  </Fragment>
+</Wix>
