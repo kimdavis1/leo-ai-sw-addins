@@ -1,16 +1,59 @@
 # LeoAI PDM Add-in Installation Guide
 
-## Prerequisites
+## Quick Installation
+
+### Step 1: Install the MSI
+You can use the pre-built MSI installer or build it yourself. [Prebuilt installers are available for download here.](https://github.com/kimdavis1/leo-ai-sw-addins/blob/main/SwPdmAddin/LeoAISetUp/LeoAISetUp.msi)
+
+1. Run the `LeoAISetUp.msi` file as Administrator.
+2. The add-in and all required files will be installed to:
+   - `C:\Program Files\LeoAISwPdmAddIn`
+3. The installer will automatically register the add-in with your PDM vault(s). No further manual steps are required.
+
+### Step 2: Verification
+After installation:
+1. Open PDM Administrator and connect to your vault.
+2. Navigate to Add-ins in the vault tree. The LeoAI add-in should be visible under your vault's add-ins.
+
+---
+
+## Troubleshooting
+
+### Installation Issues
+- Run the MSI as Administrator from a command prompt if a normal run fails.
+- Check Windows Event Logs for detailed error messages.
+
+### Add-in Not Loading
+- Ensure the correct vault is selected during installation (if prompted).
+- Check PDM Administrator for add-in registration.
+
+---
+
+## Support Notes
+- DLL files and configuration are stored in `C:\Program Files\LeoAISwPdmAddIn`
+- For advanced configuration, use the PDM Administrator interface to manually install an addin in a vault.
+
+---
+
+## File Locations Summary
+| Component         | Location                                         |
+|-------------------|-------------------------------------------------|
+| Installation Dir  | C:\Program Files\LeoAISwPdmAddIn                |
+| LoadAddIn Tool    | C:\Program Files\LeoAISwPdmAddIn\LoadAddIn.exe  |
+
+---
+
+## For Developers: Building from Source
+
+If you want to build the solution yourself, follow these instructions:
+
+### Prerequisites
 Before you begin, ensure you have the following:
 1. Visual Studio 2022 (with C# development capabilities)
 2. HeatWave Extension for VS2022  
    - Available from FireGiant in Visual Studio Extension Manager
 3. Administrative privileges on the development machine
 4. PDM Administrator access for vault configuration
-
----
-
-## Part 1: Building the Solution
 
 ### Step 1: Install HeatWave Extension
 1. Open Visual Studio 2022
@@ -44,54 +87,9 @@ After a successful build, find the generated MSI file in:
 [Solution Directory]\LeoAISetUp\bin\x64\Release\en-US
 ```
 
----
-
-## Part 2: Client Installation
-
-### Step 1: Install the MSI
-You can use the pre-built MSI installer or build it yourself. Prebuilt installers are available in `./LeoAISetUp/LeoAISetUp.msi`.
-
-1. Run the `LeoAISetUp.msi` file as Administrator.
-2. The add-in and all required files will be installed to:
-   - `C:\Program Files\LeoAISwPdmAddIn`
-3. The installer will automatically register the add-in with your PDM vault(s). No further manual steps are required.
-
-### Step 2: Verification
-After installation:
-1. Open PDM Administrator and connect to your vault.
-2. Navigate to Add-ins in the vault tree. The LeoAI add-in should be visible under your vault's add-ins.
-
----
-
-## Troubleshooting
-
 ### Build Errors
 - Ensure the HeatWave extension is properly installed.
 - Verify all project references are resolved.
-
-### Installation Issues
-- Run the MSI as Administrator from a command prompt if a normal run fails.
-- Check Windows Event Logs for detailed error messages.
-
-### Add-in Not Loading
-- Ensure the correct vault is selected during installation (if prompted).
-- Check PDM Administrator for add-in registration.
-
----
-
-## Support Notes
-- DLL files and configuration are stored in `C:\Program Files\LeoAISwPdmAddIn`
-- For advanced configuration, use the PDM Administrator interface to menually install an addin in a vualt.
-
----
-
-## File Locations Summary
-| Component         | Location                                         |
-|-------------------|-------------------------------------------------|
-| Source Solution   | LeoAISwPdmAddIn.sln                             |
-| Generated MSI     | LeoAISetUp\bin\x64\Release\en-US               |
-| Installation Dir  | C:\Program Files\LeoAISwPdmAddIn                |
-| LoadAddIn Tool    | C:\Program Files\LeoAISwPdmAddIn\LoadAddIn.exe  |
 
 ---
 
@@ -102,4 +100,4 @@ The following files from `SwPdmAddin/SWPDMReferences/` are required:
 
 ---
 
-This guide provides comprehensive instructions for both the development team and end clients. Installation is now streamlined and automatic after running the MSI installer. For advanced scenarios or troubleshooting, refer to the sections above.
+This guide provides comprehensive instructions for both end users and developers. Installation is streamlined and automatic after running the MSI installer. For advanced scenarios or troubleshooting, refer to the sections above.
