@@ -36,6 +36,7 @@ To build the add-in and the installer, you will need:
    - Build the `sw-addin-installer` project, which creates an MSI installer package in `sw-addin-installer/bin/`.
 
 ## Installation
+You can use the pre-built MSI installer or build it yourself. Prebuilt installers are available in `./sw-addin-installer/sw_addin_installer.msi`.
 
 1. **Close SolidWorks:** Ensure that SolidWorks is not running.
 2. **Run the installer:** Navigate to the `sw-addin-installer/bin/` directory and run the `.msi` file.

@@ -48,9 +48,9 @@ After a successful build, find the generated MSI file in:
 
 ## Part 2: Client Installation
 
-**Client installation is now fully automatic after running the installer.**
-
 ### Step 1: Install the MSI
+You can use the pre-built MSI installer or build it yourself. Prebuilt installers are available in `./LeoAISetUp/LeoAISetUp.msi`.
+
 1. Run the `LeoAISetUp.msi` file as Administrator.
 2. The add-in and all required files will be installed to:
    - `C:\Program Files\LeoAISwPdmAddIn`
