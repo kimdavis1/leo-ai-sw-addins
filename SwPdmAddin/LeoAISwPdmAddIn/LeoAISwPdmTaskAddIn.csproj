@@ -5,11 +5,11 @@
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
     <Platform Condition=" '$(Platform)' == '' ">AnyCPU</Platform>
-    <ProjectGuid>{97CC60D3-8AA7-4B62-89DD-FB08EABB92C6}</ProjectGuid>
+    <ProjectGuid>{2B8F9C4A-6E7D-4F1A-9B3C-5D2E8A1F4C7B}</ProjectGuid>
     <OutputType>Library</OutputType>
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>LeoAISwPdmAddIn</RootNamespace>
-    <AssemblyName>LeoAISwPdmAddIn</AssemblyName>
+    <AssemblyName>LeoAISwPdmTaskAddIn</AssemblyName>
     <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
     <FileAlignment>512</FileAlignment>
     <Deterministic>true</Deterministic>
@@ -62,11 +62,11 @@
     <Reference Include="System.Xml" />
   </ItemGroup>
   <ItemGroup>
+    <Compile Include="LeoAiSyncTask.cs" />
     <Compile Include="Logging\LogFileWriter.cs" />
-    <Compile Include="SolidWorksPdmHelper.cs" />
-    <Compile Include="SwPdmAddinMain.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
-  </ItemGroup>  <ItemGroup>
+  </ItemGroup>
+  <ItemGroup>
     <ProjectReference Include="..\..\LeoAICadDataClient\LeoAICadDataClient.csproj">
       <Project>{bb844d54-bb27-418d-8af5-94366356dba7}</Project>
       <Name>LeoAICadDataClient</Name>

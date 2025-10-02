@@ -342,7 +342,7 @@ namespace LeoAISwPdmAddIn
                 {
                     Console.WriteLine("Leo AI authentication configuration not found!\n\n" +
                         "Please place the auth.json file in one of the following locations:\n" +
-                        "1. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\auth.json\n" +
+                        "1. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\LeoAuthKey.json\n" +
                         "2. Custom location specified in LEO_AUTH_KEY environment variable\n\n" +
                         "The auth.json file should contain:\n" +
                         "{\n  \"ApiKey\": \"your-api-key\",\n  \"ProjectId\": \"your-project-id\"\n}\n\n" +

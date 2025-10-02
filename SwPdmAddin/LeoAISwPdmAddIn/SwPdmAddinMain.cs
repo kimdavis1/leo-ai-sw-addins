@@ -395,6 +395,7 @@ namespace LeoAISwPdmAddIn
 
                 // Add a hook for the installation event, which is a better place for one-time setup.
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_InstallAddIn);
+
                 LogFileWriter.LogDebug("All event hooks have been registered.");
                 #endregion
 
@@ -453,50 +454,72 @@ namespace LeoAISwPdmAddIn
             switch (poCmd.meCmdType)
             {
                 case EdmCmdType.EdmCmd_PostUnlock:
-                    LogFileWriter.LogMessage("PostUnlock event detected - after checkin");
-                    Task.Run(async () => await HandleFileCheckIn(cmd, data));
+                    LogFileWriter.LogMessage("PostUnlock event detected - executing upload task on server");
+                    ExecuteSyncTask(cmd, data, "Upload");
                     break;
 
                 case EdmCmdType.EdmCmd_PostUndoLock:
-                    LogFileWriter.LogMessage("PostUndoLock event detected - after undo checkout or new file added");
-                    Task.Run(async () => await HandleFileUndoCheckOut(cmd, data));
+                    LogFileWriter.LogMessage("PostUndoLock event detected - executing upload task on server");
+                    ExecuteSyncTask(cmd, data, "Upload");
                     break;
 
                 case EdmCmdType.EdmCmd_PostDelete:
-                    LogFileWriter.LogMessage("PostDelete event detected - after file deletion");
-                    Task.Run(async () => await HandleFileDeleted(cmd, data));
+                    LogFileWriter.LogMessage("PostDelete event detected - executing delete task on server");
+                    // For deletes, pass file paths in additional data
+                    var deleteData = new Dictionary<string, string>();
+                    var deletedPaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    deleteData["FilePaths"] = string.Join("|", deletedPaths);
+                    ExecuteSyncTask(cmd, data, "Delete", deleteData);
                     break;
 
                 case EdmCmdType.EdmCmd_PostMove:
-                    LogFileWriter.LogMessage("PostMove event detected - after file move");
-                    Task.Run(async () => await HandleFileMoved(cmd, data));
+                    LogFileWriter.LogMessage("PostMove event detected - executing move task on server");
+                    var moveData = new Dictionary<string, string>();
+                    var oldPaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    var newPaths = data.Select(d => d.mbsStrData2).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    moveData["OldPaths"] = string.Join("|", oldPaths);
+                    moveData["NewPaths"] = string.Join("|", newPaths);
+                    ExecuteSyncTask(cmd, data, "Move", moveData);
                     break;
 
                 case EdmCmdType.EdmCmd_PostCopy:
-                    LogFileWriter.LogMessage("PostCopy event detected - after file copy");
-                    // Handle copied files (similar to new files)
-                    Task.Run(async () => await HandleFileCopied(cmd, data));
+                    LogFileWriter.LogMessage("PostCopy event detected - executing upload task on server");
+                    ExecuteSyncTask(cmd, data, "Upload");
                     break;
 
                 case EdmCmdType.EdmCmd_PostAdd:
-                    LogFileWriter.LogMessage("PostAdd event detected - after file add");
-                    // Handle newly added files
-                    Task.Run(async () => await PerformLeoAIActions(cmd, data));
+                    LogFileWriter.LogMessage("PostAdd event detected - executing upload task on server");
+                    ExecuteSyncTask(cmd, data, "Upload");
                     break;
 
                 case EdmCmdType.EdmCmd_PostRename:
-                    LogFileWriter.LogMessage("PostRename event detected - after file rename");
-                    Task.Run(async () => await HandleFileRename(cmd, data));
+                    LogFileWriter.LogMessage("PostRename event detected - executing rename task on server");
+                    var renameData = new Dictionary<string, string>();
+                    var oldRenamePaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    var newRenamePaths = data.Select(d => d.mbsStrData2).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    renameData["OldPaths"] = string.Join("|", oldRenamePaths);
+                    renameData["NewPaths"] = string.Join("|", newRenamePaths);
+                    ExecuteSyncTask(cmd, data, "Rename", renameData);
                     break;
 
                 case EdmCmdType.EdmCmd_PostMoveFolder:
-                    LogFileWriter.LogMessage("PostMoveFolder event detected - after folder move");
-                    Task.Run(async () => await HandleFolderMove(cmd, data));
+                    LogFileWriter.LogMessage("PostMoveFolder event detected - executing move task on server (folder)");
+                    var moveFolderData = new Dictionary<string, string>();
+                    var oldFolderPaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    var newFolderPaths = data.Select(d => d.mbsStrData2).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    moveFolderData["OldPaths"] = string.Join("|", oldFolderPaths);
+                    moveFolderData["NewPaths"] = string.Join("|", newFolderPaths);
+                    ExecuteSyncTask(cmd, data, "Move", moveFolderData);
                     break;
 
                 case EdmCmdType.EdmCmd_PostRenameFolder:
-                    LogFileWriter.LogMessage("PostRenameFolder event detected - after folder rename");
-                    Task.Run(async () => await HandleFolderRename(cmd, data));
+                    LogFileWriter.LogMessage("PostRenameFolder event detected - executing rename task on server (folder)");
+                    var renameFolderData = new Dictionary<string, string>();
+                    var oldRenameFolderPaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    var newRenameFolderPaths = data.Select(d => d.mbsStrData2).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                    renameFolderData["OldPaths"] = string.Join("|", oldRenameFolderPaths);
+                    renameFolderData["NewPaths"] = string.Join("|", newRenameFolderPaths);
+                    ExecuteSyncTask(cmd, data, "Rename", renameFolderData);
                     break;
 
 
@@ -515,7 +538,7 @@ namespace LeoAISwPdmAddIn
 
                         // Perform initial sync using the safe method - wait for completion to prevent PDM unloading
                         LogFileWriter.LogMessage("Performing initial vault sync...");
-                        SafeUploadData(vault, waitForCompletion: true);
+                        // SafeUploadData(vault, waitForCompletion: true);
 
                     }
                     else
@@ -524,8 +547,6 @@ namespace LeoAISwPdmAddIn
                     }
                     break;
 
-
-
                 default:
                     LogFileWriter.LogMessage($"Unhandled command type: {poCmd.meCmdType} (value: {(int)poCmd.meCmdType})");
                     break;
@@ -533,6 +554,193 @@ namespace LeoAISwPdmAddIn
             LogFileWriter.LogDebug($"OnCmd method finished for command {poCmd.meCmdType}");
         }
 
+        #region Task Execution Methods (Client-Side)
+
+        /// <summary>
+        /// Executes a sync task on the task host (server) by calling IEdmTaskMgr.RunTask()
+        /// </summary>
+        private void ExecuteSyncTask(EdmCmd poCmd, EdmCmdData[] ppoData, string operation, Dictionary<string, string> additionalData = null)
+        {
+            LogFileWriter.LogMessage($"=== ExecuteSyncTask called - Operation: {operation}, Files: {ppoData?.Length ?? 0} ===");
+
+            try
+            {
+                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
+                LogFileWriter.LogMessage($"Getting IEdmTaskMgr from vault...");
+
+                IEdmTaskMgr taskMgr = (IEdmTaskMgr)vault.CreateUtility(EdmUtility.EdmUtil_TaskMgr);
+                if (taskMgr == null)
+                {
+                    LogFileWriter.LogError("Failed to create IEdmTaskMgr - CreateUtility returned null");
+                    return;
+                }
+
+                LogFileWriter.LogMessage("IEdmTaskMgr created successfully");
+
+                // Get all configured tasks
+                EdmTaskInfo[] tasks = taskMgr.GetTasks();
+                LogFileWriter.LogMessage($"Retrieved {tasks?.Length ?? 0} tasks from vault");
+
+                if (tasks == null || tasks.Length == 0)
+                {
+                    LogFileWriter.LogError("No tasks found in vault. Please configure 'Leo AI Sync Task' in PDM Administration.");
+                    return;
+                }
+
+                // Find the Leo AI Sync Task by name
+                EdmTaskInfo syncTask = new EdmTaskInfo();
+                bool foundTask = false;
+
+                foreach (EdmTaskInfo task in tasks)
+                {
+                    LogFileWriter.LogMessage($"Found task: {task.mbsTaskName} (ID: {task.mlTaskID})");
+                    if (task.mbsTaskName == "Leo AI Sync Task")
+                    {
+                        syncTask = task;
+                        foundTask = true;
+                        break;
+                    }
+                }
+
+                if (!foundTask || syncTask.mlTaskID == 0)
+                {
+                    LogFileWriter.LogError("Leo AI Sync Task not found. Please configure the task in PDM Administration.");
+                    LogFileWriter.LogMessage($"Available tasks: {string.Join(", ", tasks.Select(t => t.mbsTaskName))}");
+                    return;
+                }
+
+                LogFileWriter.LogMessage($"Found sync task: {syncTask.mbsTaskName} (ID: {syncTask.mlTaskID})");
+
+                // Prepare metadata to pass to task via vault hidden folder
+                List<string> filePaths = new List<string>();
+                List<int> fileIDs = new List<int>();
+                List<int> folderIDs = new List<int>();
+
+                foreach (EdmCmdData data in ppoData)
+                {
+                    filePaths.Add(data.mbsStrData1 ?? "");
+                    fileIDs.Add(data.mlObjectID1);
+                    folderIDs.Add(data.mlObjectID2);
+                }
+
+                // Create metadata JSON
+                var metadata = new
+                {
+                    Operation = operation,
+                    FilePaths = filePaths,
+                    FileIDs = fileIDs,
+                    FolderIDs = folderIDs,
+                    AdditionalData = additionalData,
+                    Timestamp = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")
+                };
+
+                string metadataJson = Newtonsoft.Json.JsonConvert.SerializeObject(metadata);
+                LogFileWriter.LogMessage($"Metadata JSON (length: {metadataJson.Length})");
+
+                // Store metadata in vault hidden folder with timestamp_trial naming
+                string vaultRoot = vault.RootFolderPath;
+                string metadataFolder = Path.Combine(vaultRoot, ".LeoAI_Metadata");
+
+                // Create hidden folder if it doesn't exist
+                if (!Directory.Exists(metadataFolder))
+                {
+                    Directory.CreateDirectory(metadataFolder);
+                    // Set as hidden
+                    DirectoryInfo dirInfo = new DirectoryInfo(metadataFolder);
+                    dirInfo.Attributes |= FileAttributes.Hidden;
+                    LogFileWriter.LogMessage($"Created hidden metadata folder: {metadataFolder}");
+                }
+
+                // Use Unix timestamp for ordering and trial number for retries
+                // Format: {unixTimestamp}_{trialNumber}.json
+                // Task will process earliest file and increment trial on failure
+                long unixTimestamp = DateTimeOffset.Now.ToUnixTimeSeconds();
+                int trialNumber = 0;
+                string metadataFileName = $"{unixTimestamp}_{trialNumber}.json";
+                string metadataPath = Path.Combine(metadataFolder, metadataFileName);
+
+                File.WriteAllText(metadataPath, metadataJson);
+                LogFileWriter.LogMessage($"Metadata written to vault: {metadataPath} (timestamp: {unixTimestamp}, trial: {trialNumber})");
+
+                // Convert ppoData to EdmSelItem2[] for task file list
+                LogFileWriter.LogMessage("Building file selection list...");
+                List<EdmSelItem2> fileList = new List<EdmSelItem2>();
+
+                foreach (EdmCmdData data in ppoData)
+                {
+                    EdmSelItem2 item = new EdmSelItem2();
+                    item.mlID = data.mlObjectID1;        // File/Document ID
+                    item.mlParentID = data.mlObjectID2;  // Parent Folder ID
+                    item.meType = EdmObjectType.EdmObject_File;
+                    item.mlVersion = 0;                  // Use latest version
+                    fileList.Add(item);
+
+                    LogFileWriter.LogMessage($"Added file to selection: ID={item.mlID}, ParentID={item.mlParentID}");
+                }
+
+                LogFileWriter.LogMessage($"File selection built: {fileList.Count} files");
+
+                // Execute the task on the task host
+                LogFileWriter.LogMessage($"Calling RunTask() with {fileList.Count} files...");
+                taskMgr.RunTask(syncTask, fileList.ToArray(), 0);
+
+                LogFileWriter.LogMessage($"=== ExecuteSyncTask: Task execution initiated successfully ===");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"ExecuteSyncTask failed: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+            }
+        }
+
+        /// <summary>
+        /// Creates a JSON metadata file with task parameters
+        /// </summary>
+        private string CreateTaskMetadataFile(string operation, EdmCmdData[] ppoData, Dictionary<string, string> additionalData)
+        {
+            LogFileWriter.LogMessage($"Creating metadata file for operation: {operation}");
+
+            try
+            {
+                // Extract file paths from ppoData for logging
+                List<string> filePaths = new List<string>();
+                foreach (EdmCmdData data in ppoData)
+                {
+                    if (!string.IsNullOrEmpty(data.mbsStrData1))
+                    {
+                        filePaths.Add(data.mbsStrData1);
+                    }
+                }
+
+                // Create metadata object
+                var metadata = new
+                {
+                    Operation = operation,
+                    Timestamp = DateTime.UtcNow.ToString("o"),
+                    FileCount = ppoData.Length,
+                    FilePaths = filePaths,
+                    FileIDs = ppoData.Select(d => d.mlObjectID1).ToList(),
+                    FolderIDs = ppoData.Select(d => d.mlObjectID2).ToList(),
+                    AdditionalData = additionalData ?? new Dictionary<string, string>()
+                };
+
+                string json = Newtonsoft.Json.JsonConvert.SerializeObject(metadata, Newtonsoft.Json.Formatting.Indented);
+                LogFileWriter.LogMessage($"Metadata JSON:\n{json}");
+
+                string metadataPath = Path.Combine(Path.GetTempPath(), $"LeoAI_TaskMeta_{Guid.NewGuid()}.json");
+                File.WriteAllText(metadataPath, json);
+
+                LogFileWriter.LogMessage($"Metadata file written: {metadataPath}");
+                return metadataPath;
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"CreateTaskMetadataFile failed: {ex.Message}");
+                throw;
+            }
+        }
+
+        #endregion
 
         /// <summary>
         /// Perform Leo AI actions on top of check-in files..
