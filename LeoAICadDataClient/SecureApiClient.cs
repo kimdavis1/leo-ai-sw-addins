@@ -18,6 +18,8 @@ namespace LeoAICadDataClient
         private readonly string _apiKey;
         private readonly string _projectId;
         private string _jwtToken;
+        private const int MaxRetries = 5;
+        private const int InitialRetryDelayMs = 1000;
 
         public SecureApiClient(string apiKey, string projectId)
         {
@@ -83,52 +85,145 @@ namespace LeoAICadDataClient
             }
         }
 
-        public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string filePath, Dictionary<string, string> childInfos = null)
+        /// <summary>
+        /// Executes an async function with retry logic for rate limit errors (HTTP 429)
+        /// </summary>
+        private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> operation, string operationName)
         {
-            await RefreshTokenIfRequiredAsync();
-            try
+            int retryDelay = InitialRetryDelayMs;
+
+            for (int attempt = 0; attempt <= MaxRetries; attempt++)
             {
-                Logger.Info($"Attempting to create file: {filePath} in directory: {directoryId}");
-                LeoFileInfo.LeoFileInformation fInfo = LeoFileInfo.GetFileInfo(filePath);
-                string relativePath = GetRelativePath(vaultPath, filePath);
-                string memeType = LeoAIMemeType.GetMemeType(filePath);
-
-                using (var content = new MultipartFormDataContent())
+                try
                 {
-                    content.Add(new StringContent(memeType), "mimeType");
-                    content.Add(new StringContent(fInfo.CheckSum), "checkSum");
-                    content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
+                    return await operation();
+                }
+                catch (Exception ex)
+                {
+                    // Check if it's a rate limit error (HTTP 429)
+                    bool isRateLimit = ex.Message.Contains("429") ||
+                                      ex.Message.ToLower().Contains("rate limit") ||
+                                      ex.Message.ToLower().Contains("too many requests");
 
-                    var fileBytes = Convert.FromBase64String(fInfo.Base64EncodedFile);
-                    content.Add(new ByteArrayContent(fileBytes), "file", Path.GetFileName(filePath));
-
-                    if (childInfos != null && childInfos.Count > 0)
+                    if (isRateLimit && attempt < MaxRetries)
                     {
-                        var childDatas = childInfos.Select(kvp => new ChildData(kvp.Key, kvp.Value)).ToList();
-                        content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
+                        // Exponential backoff for rate limits
+                        Logger.Info($"Rate limit hit for {operationName}, retrying in {retryDelay}ms (attempt {attempt + 1}/{MaxRetries})");
+                        await Task.Delay(retryDelay);
+                        retryDelay *= 2; // Exponential backoff
+                        continue;
                     }
 
-                    var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content);
-                    var responseString = await response.Content.ReadAsStringAsync();
-
-                    if (response.IsSuccessStatusCode)
-                    {
-                        Logger.Info($"Successfully created file: {filePath}");
-                        return JsonConvert.DeserializeObject<LeoAICadDataClient.Utilities.FileInfo>(responseString);
-                    }
-                    else
-                    {
-                        Logger.Error($"Failed to create file: {filePath}. Status: {response.StatusCode}, Response: {responseString}");
-                        return null;
-                    }
+                    // For all other errors or exhausted retries, re-throw
+                    throw;
                 }
             }
-            catch (Exception ex)
+
+            // Should never reach here, but compiler requires return
+            throw new Exception($"Failed to execute {operationName} after {MaxRetries} retries");
+        }
+
+        /// <summary>
+        /// Executes an async action with retry logic for rate limit errors (HTTP 429)
+        /// </summary>
+        private async Task ExecuteWithRetryAsync(Func<Task> operation, string operationName)
+        {
+            int retryDelay = InitialRetryDelayMs;
+
+            for (int attempt = 0; attempt <= MaxRetries; attempt++)
             {
-                Logger.Error($"An exception occurred in CreateFile: {ex.Message}");
-                Logger.Error($"StackTrace: {ex.StackTrace}");
-                return null;
+                try
+                {
+                    await operation();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // Check if it's a rate limit error (HTTP 429)
+                    bool isRateLimit = ex.Message.Contains("429") ||
+                                      ex.Message.ToLower().Contains("rate limit") ||
+                                      ex.Message.ToLower().Contains("too many requests");
+
+                    if (isRateLimit && attempt < MaxRetries)
+                    {
+                        // Exponential backoff for rate limits
+                        Logger.Info($"Rate limit hit for {operationName}, retrying in {retryDelay}ms (attempt {attempt + 1}/{MaxRetries})");
+                        await Task.Delay(retryDelay);
+                        retryDelay *= 2; // Exponential backoff
+                        continue;
+                    }
+
+                    // For all other errors or exhausted retries, re-throw
+                    throw;
+                }
             }
+        }
+
+        public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string filePath, Dictionary<string, string> childInfos = null)
+        {
+            // Default: read from same path as logical path
+            return await CreateFileAsync(directoryId, vaultPath, filePath, filePath, childInfos);
+        }
+
+        /// <summary>
+        /// Creates a file in Leo AI with separate logical and physical paths.
+        /// logicalFilePath: The path shown to user/API (relative path calculated from this)
+        /// actualFilePath: The actual file system path to read file content from (can be archive path or temp path)
+        /// </summary>
+        public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string logicalFilePath, string actualFilePath, Dictionary<string, string> childInfos = null)
+        {
+            await RefreshTokenIfRequiredAsync();
+
+            return await ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    Logger.Info($"Attempting to create file: {logicalFilePath} (reading from: {actualFilePath}) in directory: {directoryId}");
+                    LeoFileInfo.LeoFileInformation fInfo = LeoFileInfo.GetFileInfo(actualFilePath); // Read from actual path
+                    string relativePath = GetRelativePath(vaultPath, logicalFilePath); // Use logical path for API
+                    string memeType = LeoAIMemeType.GetMemeType(logicalFilePath); // Use logical path for extension
+
+                    using (var content = new MultipartFormDataContent())
+                    {
+                        content.Add(new StringContent(memeType), "mimeType");
+                        content.Add(new StringContent(fInfo.CheckSum), "checkSum");
+                        content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
+
+                        var fileBytes = Convert.FromBase64String(fInfo.Base64EncodedFile);
+                        content.Add(new ByteArrayContent(fileBytes), "file", Path.GetFileName(logicalFilePath));
+
+                        if (childInfos != null && childInfos.Count > 0)
+                        {
+                            var childDatas = childInfos.Select(kvp => new ChildData(kvp.Key, kvp.Value)).ToList();
+                            content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
+                        }
+
+                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content);
+                        var responseString = await response.Content.ReadAsStringAsync();
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            Logger.Info($"Successfully created file: {logicalFilePath}");
+                            return JsonConvert.DeserializeObject<LeoAICadDataClient.Utilities.FileInfo>(responseString);
+                        }
+                        else
+                        {
+                            Logger.Error($"Failed to create file: {logicalFilePath}. Status: {response.StatusCode}, Response: {responseString}");
+                            if ((int)response.StatusCode == 429)
+                            {
+                                throw new Exception($"Rate limit (429): {responseString}");
+                            }
+                            return null;
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"An exception occurred in CreateFile: {ex.Message}");
+                    Logger.Error($"StackTrace: {ex.StackTrace}");
+                    throw;
+                }
+            }, $"CreateFile({Path.GetFileName(logicalFilePath)})");
         }
 
         public static string GetRelativePath(string rootPath, string targetPath)
@@ -255,62 +350,78 @@ namespace LeoAICadDataClient
         public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId)
         {
             await RefreshTokenIfRequiredAsync();
-            try
-            {
-                Logger.Info($"GetSyncMetadata: Fetching sync metadata for directory {directoryId}");
-                var response = await _httpClient.GetAsync($"api/v1/synced-directories/{directoryId}/files/sync-metadata");
-                var responseString = await response.Content.ReadAsStringAsync();
 
-                if (response.IsSuccessStatusCode)
-                {
-                    // Log the raw JSON response to help diagnose parsing issues
-                    Logger.Info($"GetSyncMetadata: Raw JSON response: {responseString}");
-                    return JsonConvert.DeserializeObject<SyncMetadataResponse>(responseString);
-                }
-                else
-                {
-                    Logger.Error($"GetSyncMetadata failed. Status: {response.StatusCode}, Body: {responseString}");
-                    return null;
-                }
-            }
-            catch (Exception ex)
+            return await ExecuteWithRetryAsync(async () =>
             {
-                Logger.Error($"GetSyncMetadata: Exception occurred: {ex.Message}");
-                return null;
-            }
+                try
+                {
+                    Logger.Info($"GetSyncMetadata: Fetching sync metadata for directory {directoryId}");
+                    var response = await _httpClient.GetAsync($"api/v1/synced-directories/{directoryId}/files/sync-metadata");
+                    var responseString = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        // Log the raw JSON response to help diagnose parsing issues
+                        Logger.Info($"GetSyncMetadata: Raw JSON response: {responseString}");
+                        return JsonConvert.DeserializeObject<SyncMetadataResponse>(responseString);
+                    }
+                    else
+                    {
+                        Logger.Error($"GetSyncMetadata failed. Status: {response.StatusCode}, Body: {responseString}");
+                        if ((int)response.StatusCode == 429)
+                        {
+                            throw new Exception($"Rate limit (429): {responseString}");
+                        }
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"GetSyncMetadata: Exception occurred: {ex.Message}");
+                    throw;
+                }
+            }, $"GetSyncMetadata({directoryId})");
         }
 
-        public async Task<bool> DeleteFileAsync(string directoryId, string fileId, string filePathInDirectory)
+        public async Task<bool> DeleteFileAsync(string directoryId, string filePathInDirectory)
         {
             await RefreshTokenIfRequiredAsync();
-            try
+
+            return await ExecuteWithRetryAsync(async () =>
             {
-                string normalizedPath = NormalizeFilePathForApi(filePathInDirectory);
-                string encodedFilePath = Uri.EscapeDataString(normalizedPath);
-                string requestUri = $"api/v1/synced-directories/{directoryId}/files/{fileId}?filePathInDirectory={encodedFilePath}";
-
-                Logger.Info($"Sending DELETE request to: {requestUri}");
-
-                var response = await _httpClient.DeleteAsync(requestUri);
-
-                if (response.IsSuccessStatusCode)
+                try
                 {
-                    Logger.Info($"Successfully deleted file: {normalizedPath}");
-                    return true;
+                    string normalizedPath = NormalizeFilePathForApi(filePathInDirectory);
+                    string encodedFilePath = Uri.EscapeDataString(normalizedPath);
+                    string requestUri = $"api/v1/synced-directories/{directoryId}/files?filePathInDirectory={encodedFilePath}";
+
+                    Logger.Info($"Sending DELETE request to: {requestUri}");
+
+                    var response = await _httpClient.DeleteAsync(requestUri);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        Logger.Info($"Successfully deleted file: {normalizedPath}");
+                        return true;
+                    }
+                    else
+                    {
+                        var errorContent = await response.Content.ReadAsStringAsync();
+                        Logger.Error($"Failed to delete file: {normalizedPath}. Status: {response.StatusCode}, Response: {errorContent}");
+                        if ((int)response.StatusCode == 429)
+                        {
+                            throw new Exception($"Rate limit (429): {errorContent}");
+                        }
+                        return false;
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    Logger.Error($"Failed to delete file: {normalizedPath}. Status: {response.StatusCode}, Response: {errorContent}");
-                    return false;
+                    Logger.Error($"An exception occurred in DeleteFile: {ex.Message}");
+                    Logger.Error($"StackTrace: {ex.StackTrace}");
+                    throw;
                 }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"An exception occurred in DeleteFile: {ex.Message}");
-                Logger.Error($"StackTrace: {ex.StackTrace}");
-                return false;
-            }
+            }, $"DeleteFile({filePathInDirectory})");
         }
 
         public async Task<LeoAICadDataClient.Utilities.FileInfo> UpdateFileLocationAsync(string directoryId, string vaultPath, string filePath, Dictionary<string, string> childInfos = null)

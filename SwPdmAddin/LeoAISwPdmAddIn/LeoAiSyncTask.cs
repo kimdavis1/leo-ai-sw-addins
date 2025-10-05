@@ -30,8 +30,6 @@ namespace LeoAISwPdmAddIn
         private const string TASK_NAME = "Leo AI Sync Task";
         private SecureApiClient _leoClient;
         private string _directoryId;
-        private Dictionary<string, string> _pathToServerFileCache;
-        private readonly object _cacheLock = new object();
         private int _maxRetries = 3; // Default fallback, set from task config in OnTaskSetup
 
         public void GetAddInInfo(ref EdmAddInInfo poInfo, IEdmVault5 poVault, IEdmCmdMgr5 poCmdMgr)
@@ -145,7 +143,27 @@ namespace LeoAISwPdmAddIn
                 // Get vault
                 IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
                 LogFileWriter.LogMessage($"Vault: {vault.Name}");
-                LogFileWriter.LogMessage($"Vault Root: {vault.RootFolderPath}");
+                LogFileWriter.LogMessage($"Vault Root Path: {vault.RootFolderPath}");
+                LogFileWriter.LogMessage($"Vault Root Path Exists: {Directory.Exists(vault.RootFolderPath)}");
+
+                // Log sample file path to understand how GetLocalPath works on task host
+                if (ppoData != null && ppoData.Length > 0)
+                {
+                    try
+                    {
+                        IEdmFile5 sampleFile = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, ppoData[0].mlObjectID1);
+                        if (sampleFile != null)
+                        {
+                            string samplePath = sampleFile.GetLocalPath(ppoData[0].mlObjectID2);
+                            LogFileWriter.LogMessage($"Sample file GetLocalPath: {samplePath}");
+                            LogFileWriter.LogMessage($"Sample file exists at path: {File.Exists(samplePath)}");
+                        }
+                    }
+                    catch (Exception diagEx)
+                    {
+                        LogFileWriter.LogMessage($"Diagnostic logging error: {diagEx.Message}");
+                    }
+                }
 
                 // Read metadata from vault hidden folder
                 // Files are named: {unixTimestamp}_{trialNumber}.json
@@ -215,13 +233,7 @@ namespace LeoAISwPdmAddIn
                 _directoryId = GetOrCreateDirectoryId(vaultDir).Result;
                 LogFileWriter.LogMessage($"Directory ID: {_directoryId}");
 
-                taskInstance.SetProgressPos(30, "Refreshing cache...");
-
-                // Refresh cache
-                RefreshCache().Wait();
-                LogFileWriter.LogMessage($"Cache refreshed - {_pathToServerFileCache.Count} files cached");
-
-                taskInstance.SetProgressPos(40, $"Executing {operation} operation...");
+                taskInstance.SetProgressPos(30, $"Executing {operation} operation...");
 
                 // Build file data from task variables
                 List<EdmCmdData> fileDataList = new List<EdmCmdData>();
@@ -256,6 +268,10 @@ namespace LeoAISwPdmAddIn
 
                     case "Rename":
                         ExecuteRename(vault, taskInstance, actualFiles, additionalData).Wait();
+                        break;
+
+                    case "CompleteSync":
+                        ExecuteCompleteSync(vault, taskInstance, actualFiles).Wait();
                         break;
 
                     default:
@@ -359,7 +375,7 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"Relative path: {relativePath}");
 
                 // Upload to Leo AI (will throw on error to fail task)
-                await UpdateFilesToLeoAI(new[] { localPath }, vaultRootPath);
+                await UpdateFilesToLeoAI(vault, new[] { localPath }, vaultRootPath);
 
                 processed++;
                 int progress = 40 + (int)((processed / (float)total) * 50);
@@ -392,39 +408,25 @@ namespace LeoAISwPdmAddIn
 
                     string relativePath = GetRelativePath(vault.RootFolderPath, filePath);
 
-                    string componentId = null;
-                    lock (_cacheLock)
+                    // Call delete API with just directoryId and file path (no componentId needed)
+                    bool deleted = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                    if (deleted)
                     {
-                        if (_pathToServerFileCache.TryGetValue(relativePath, out componentId))
-                        {
-                            LogFileWriter.LogMessage($"Found component ID in cache: {componentId}");
-                        }
-                        else
-                        {
-                            LogFileWriter.LogMessage($"File not in cache, skipping: {relativePath}");
-                        }
+                        LogFileWriter.LogMessage($"Deleted from server: {relativePath}");
                     }
-
-                    if (componentId != null)
+                    else
                     {
-                        bool deleted = await _leoClient.DeleteFileAsync(_directoryId, componentId, relativePath);
-                        if (deleted)
-                        {
-                            lock (_cacheLock)
-                            {
-                                _pathToServerFileCache.Remove(relativePath);
-                            }
-                            LogFileWriter.LogMessage($"Deleted from server: {relativePath}");
-                        }
+                        LogFileWriter.LogMessage($"Delete returned false for: {relativePath}");
                     }
 
                     processed++;
-                    int progress = 40 + (int)((processed / (float)total) * 50);
+                    int progress = 30 + (int)((processed / (float)total) * 50);
                     taskInstance.SetProgressPos(progress, $"Deleted {processed}/{total} files");
                 }
                 catch (Exception ex)
                 {
                     LogFileWriter.LogError($"Failed to delete file {filePath}: {ex.Message}");
+                    throw; // Propagate exception to fail the task
                 }
             }
 
@@ -433,16 +435,31 @@ namespace LeoAISwPdmAddIn
 
         private async Task ExecuteMove(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, Dictionary<string, string> additionalData)
         {
-            LogFileWriter.LogMessage($"=== ExecuteMove: Processing {files.Length} files ===");
+            LogFileWriter.LogMessage($"=== ExecuteMove: Starting ===");
 
+            bool isFolder = additionalData.ContainsKey("IsFolder") && additionalData["IsFolder"] == "true";
+
+            if (isFolder)
+            {
+                // Folder move - expand and process all files
+                await ExecuteFolderMove(vault, taskInstance, files, additionalData);
+            }
+            else
+            {
+                // File move - process individual files
+                await ExecuteFileMove(vault, taskInstance, additionalData);
+            }
+
+            LogFileWriter.LogMessage($"=== ExecuteMove: Completed ===");
+        }
+
+        private async Task ExecuteFileMove(IEdmVault11 vault, IEdmTaskInstance taskInstance, Dictionary<string, string> additionalData)
+        {
             string oldPathsStr = additionalData.ContainsKey("OldPaths") ? additionalData["OldPaths"] : "";
             string newPathsStr = additionalData.ContainsKey("NewPaths") ? additionalData["NewPaths"] : "";
 
             string[] oldPaths = string.IsNullOrEmpty(oldPathsStr) ? new string[0] : oldPathsStr.Split('|');
             string[] newPaths = string.IsNullOrEmpty(newPathsStr) ? new string[0] : newPathsStr.Split('|');
-
-            LogFileWriter.LogMessage($"Old paths: {string.Join(", ", oldPaths)}");
-            LogFileWriter.LogMessage($"New paths: {string.Join(", ", newPaths)}");
 
             if (oldPaths.Length != newPaths.Length)
             {
@@ -450,7 +467,7 @@ namespace LeoAISwPdmAddIn
             }
 
             int processed = 0;
-            int total = oldPaths.Length;
+            int total = oldPaths.Length > 0 ? oldPaths.Length : 1; // Prevent division by zero
 
             for (int i = 0; i < oldPaths.Length; i++)
             {
@@ -464,59 +481,305 @@ namespace LeoAISwPdmAddIn
                     string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldPath);
                     string newRelativePath = GetRelativePath(vault.RootFolderPath, newPath);
 
-                    string componentId = null;
-                    lock (_cacheLock)
-                    {
-                        if (_pathToServerFileCache.TryGetValue(oldRelativePath, out componentId))
-                        {
-                            LogFileWriter.LogMessage($"Found component ID: {componentId}");
-                        }
-                        else
-                        {
-                            LogFileWriter.LogMessage($"Old file not in cache");
-                        }
-                    }
-
-                    if (componentId != null)
-                    {
-                        // Delete old file
-                        bool deleted = await _leoClient.DeleteFileAsync(_directoryId, componentId, oldRelativePath);
-                        if (deleted)
-                        {
-                            lock (_cacheLock)
-                            {
-                                _pathToServerFileCache.Remove(oldRelativePath);
-                            }
-                            LogFileWriter.LogMessage($"Deleted old file from server");
-                        }
-                    }
-
-                    // Upload new file
+                    // Upload file with new path first
                     if (File.Exists(newPath))
                     {
-                        await UpdateFilesToLeoAI(new[] { newPath }, vault.RootFolderPath);
-                        LogFileWriter.LogMessage($"Uploaded new file to server");
+                        await UpdateFilesToLeoAI(vault, new[] { newPath }, vault.RootFolderPath);
+                        LogFileWriter.LogMessage($"Uploaded file with new path: {newRelativePath}");
+                    }
+
+                    // Then delete old path
+                    bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
+                    if (deleted)
+                    {
+                        LogFileWriter.LogMessage($"Deleted old file path: {oldRelativePath}");
                     }
 
                     processed++;
                     int progress = 40 + (int)((processed / (float)total) * 50);
-                    taskInstance.SetProgressPos(progress, $"Moved {processed}/{total} files");
-
-                    LogFileWriter.LogMessage($"Move completed: {oldRelativePath} -> {newRelativePath}");
+                    taskInstance.SetProgressPos(progress, $"Moved {processed}/{oldPaths.Length} files");
                 }
                 catch (Exception ex)
                 {
                     LogFileWriter.LogError($"Failed to move file {oldPaths[i]}: {ex.Message}");
                 }
             }
+        }
 
-            LogFileWriter.LogMessage($"=== ExecuteMove: Completed - {processed}/{total} files moved ===");
+        private async Task ExecuteFolderMove(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, Dictionary<string, string> additionalData)
+        {
+            string oldFolderName = additionalData.ContainsKey("OldPaths") ? additionalData["OldPaths"] : "";
+            string newFolderName = additionalData.ContainsKey("NewPaths") ? additionalData["NewPaths"] : "";
+
+            LogFileWriter.LogMessage($"Folder move: {oldFolderName} -> {newFolderName}");
+
+            taskInstance.SetProgressPos(20, "Getting folder from vault...");
+
+            // Get folder from vault - use first file in dummy files array to find folder
+            IEdmFolder5 targetFolder = null;
+            if (files.Length > 0)
+            {
+                IEdmFile5 dummyFile = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, files[0].mlObjectID1);
+                if (dummyFile != null)
+                {
+                    targetFolder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, files[0].mlObjectID2);
+                }
+            }
+
+            if (targetFolder == null)
+            {
+                throw new Exception($"Could not get folder from dummy file");
+            }
+
+            string newFolderPath = targetFolder.LocalPath;
+            // Reconstruct old path by replacing new name with old name
+            string oldFolderPath = newFolderPath;
+            if (newFolderPath.EndsWith(newFolderName))
+            {
+                oldFolderPath = newFolderPath.Substring(0, newFolderPath.Length - newFolderName.Length) + oldFolderName;
+            }
+
+            LogFileWriter.LogMessage($"Folder paths - Old: {oldFolderPath}, New: {newFolderPath}");
+
+            taskInstance.SetProgressPos(30, "Enumerating files in folder...");
+
+            // Get all files recursively
+            List<string> oldFilePaths = new List<string>();
+            List<string> newFilePaths = new List<string>();
+            EnumerateFolderFilesRecursive(targetFolder, oldFolderPath, newFolderPath, oldFilePaths, newFilePaths);
+
+            LogFileWriter.LogMessage($"Found {oldFilePaths.Count} files to move");
+
+            // Process each file individually
+            int processed = 0;
+            int total = oldFilePaths.Count > 0 ? oldFilePaths.Count : 1; // Prevent division by zero
+
+            for (int i = 0; i < oldFilePaths.Count; i++)
+            {
+                try
+                {
+                    string oldFilePath = oldFilePaths[i];
+                    string newFilePath = newFilePaths[i];
+
+                    LogFileWriter.LogMessage($"Moving file: {oldFilePath} -> {newFilePath}");
+
+                    string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldFilePath);
+                    string newRelativePath = GetRelativePath(vault.RootFolderPath, newFilePath);
+
+                    // Upload with new path first
+                    if (File.Exists(newFilePath))
+                    {
+                        await UpdateFilesToLeoAI(vault, new[] { newFilePath }, vault.RootFolderPath);
+                        LogFileWriter.LogMessage($"Uploaded: {newRelativePath}");
+                    }
+
+                    // Delete old path
+                    bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
+                    if (deleted)
+                    {
+                        LogFileWriter.LogMessage($"Deleted old path: {oldRelativePath}");
+                    }
+
+                    processed++;
+                    int progress = 40 + (int)((processed / (float)total) * 50);
+                    taskInstance.SetProgressPos(progress, $"Moved {processed}/{oldFilePaths.Count} files");
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Failed to move file {oldFilePaths[i]}: {ex.Message}");
+                }
+            }
+        }
+
+        private void EnumerateFolderFilesRecursive(IEdmFolder5 folder, string oldBasePath, string newBasePath, List<string> oldFilePaths, List<string> newFilePaths)
+        {
+            // Get all files in current folder
+            IEdmPos5 pos = folder.GetFirstFilePosition();
+            while (!pos.IsNull)
+            {
+                IEdmFile5 file = folder.GetNextFile(pos);
+                string filePath = file.GetLocalPath(folder.ID);
+
+                // Only process SLDPRT, SLDASM, SLDDRW files
+                if (!string.IsNullOrEmpty(filePath) && IsProcessableFile(filePath))
+                {
+                    // Calculate old path by replacing new base with old base
+                    string relativePath = filePath.Substring(newBasePath.Length).TrimStart('\\', '/');
+                    string oldFilePath = Path.Combine(oldBasePath, relativePath);
+
+                    oldFilePaths.Add(oldFilePath);
+                    newFilePaths.Add(filePath);
+                }
+            }
+
+            // Process subfolders recursively
+            IEdmPos5 subPos = folder.GetFirstSubFolderPosition();
+            while (!subPos.IsNull)
+            {
+                IEdmFolder5 subFolder = folder.GetNextSubFolder(subPos);
+                EnumerateFolderFilesRecursive(subFolder, oldBasePath, newBasePath, oldFilePaths, newFilePaths);
+            }
+        }
+
+        private bool IsProcessableFile(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath))
+                return false;
+
+            string ext = Path.GetExtension(filePath).ToUpper();
+            return ext == ".SLDPRT" ||
+                   ext == ".SLDASM" ||
+                   ext == ".STEP" ||
+                   ext == ".STP" ||
+                   ext == ".PRT" ||
+                   ext == ".ASM" ||
+                   ext == ".IPT" ||
+                   ext == ".IAM" ||
+                   ext == ".X_T" ||
+                   ext == ".XT" ||
+                   ext == ".TXT" ||
+                   ext == ".PDF" ||
+                   ext == ".DOC" ||
+                   ext == ".DOCX";
         }
 
         private async Task ExecuteRename(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, Dictionary<string, string> additionalData)
         {
             LogFileWriter.LogMessage("=== ExecuteRename: Using same logic as Move ===");
             await ExecuteMove(vault, taskInstance, files, additionalData);
+        }
+
+        private async Task ExecuteCompleteSync(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files)
+        {
+            LogFileWriter.LogMessage("=== ExecuteCompleteSync: Starting full vault sync ===");
+
+            try
+            {
+                taskInstance.SetProgressPos(30, "Enumerating vault files...");
+
+                // Get all files from vault using SolidWorksPdmHelper
+                SolidWorksPdmHelper pdmHelper = new SolidWorksPdmHelper(vault);
+                pdmHelper.ProcessFolders(vault);
+                List<FileData> vaultFiles = pdmHelper.FilesInfo;
+                LogFileWriter.LogMessage($"Found {vaultFiles.Count} files in vault");
+
+                taskInstance.SetProgressPos(40, "Getting server state...");
+
+                // Get all files from server
+                var serverData = await _leoClient.GetSyncMetadataAsync(_directoryId);
+                Dictionary<string, SyncMetadataFile> serverFiles = new Dictionary<string, SyncMetadataFile>(StringComparer.OrdinalIgnoreCase);
+                if (serverData?.Files != null)
+                {
+                    foreach (var file in serverData.Files)
+                    {
+                        serverFiles[file.FilePathInDirectory] = file;
+                    }
+                }
+                LogFileWriter.LogMessage($"Found {serverFiles.Count} files on server");
+
+                taskInstance.SetProgressPos(50, "Comparing vault and server state...");
+
+                // Build sets for comparison
+                HashSet<string> vaultPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var vaultFile in vaultFiles)
+                {
+                    string relativePath = GetRelativePath(vault.RootFolderPath, vaultFile.file);
+                    vaultPaths.Add(relativePath);
+                }
+
+                // Find files to upload (in vault but not on server, or changed)
+                List<string> filesToUpload = new List<string>();
+                foreach (var vaultFile in vaultFiles)
+                {
+                    string relativePath = GetRelativePath(vault.RootFolderPath, vaultFile.file);
+                    if (!serverFiles.ContainsKey(relativePath))
+                    {
+                        filesToUpload.Add(vaultFile.file);
+                        LogFileWriter.LogMessage($"New file to upload: {relativePath}");
+                    }
+                    else
+                    {
+                        // Check if file changed (compare checksum)
+                        var serverFile = serverFiles[relativePath];
+                        if (serverFile.CheckSum != vaultFile.checkSum)
+                        {
+                            filesToUpload.Add(vaultFile.file);
+                            LogFileWriter.LogMessage($"Modified file to upload: {relativePath}");
+                        }
+                    }
+                }
+
+                // Find files to delete (on server but not in vault - vault is master)
+                List<string> filesToDelete = new List<string>();
+                foreach (var serverPath in serverFiles.Keys)
+                {
+                    if (!vaultPaths.Contains(serverPath))
+                    {
+                        filesToDelete.Add(serverPath);
+                        LogFileWriter.LogMessage($"File to delete from server: {serverPath}");
+                    }
+                }
+
+                LogFileWriter.LogMessage($"Files to upload: {filesToUpload.Count}, Files to delete: {filesToDelete.Count}");
+
+                // Upload files (using temp file copy approach)
+                taskInstance.SetProgressPos(60, $"Uploading {filesToUpload.Count} files...");
+                int uploaded = 0;
+                int uploadTotal = filesToUpload.Count > 0 ? filesToUpload.Count : 1; // Prevent division by zero
+                foreach (var filePath in filesToUpload)
+                {
+                    try
+                    {
+                        await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath);
+                        uploaded++;
+                        int progress = 60 + (int)((uploaded / (float)uploadTotal) * 20);
+                        taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{filesToUpload.Count} files");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+                        // Continue with next file instead of failing entire sync
+                    }
+                }
+                LogFileWriter.LogMessage($"Uploaded {uploaded} files");
+
+                // Delete files
+                taskInstance.SetProgressPos(80, $"Deleting {filesToDelete.Count} files from server...");
+                int deleted = 0;
+                int deleteTotal = filesToDelete.Count > 0 ? filesToDelete.Count : 1; // Prevent division by zero
+                foreach (var relativePath in filesToDelete)
+                {
+                    try
+                    {
+                        bool success = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                        if (success)
+                        {
+                            deleted++;
+                            LogFileWriter.LogMessage($"Deleted from server: {relativePath}");
+                        }
+                        else
+                        {
+                            LogFileWriter.LogMessage($"Failed to delete from server: {relativePath}");
+                        }
+                        int progress = 80 + (int)((deleted / (float)deleteTotal) * 10);
+                        taskInstance.SetProgressPos(progress, $"Deleted {deleted}/{filesToDelete.Count} files");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Error deleting file {relativePath}: {ex.Message}");
+                        // Continue with next file instead of failing entire sync
+                    }
+                }
+                LogFileWriter.LogMessage($"Deleted {deleted} files from server");
+
+                LogFileWriter.LogMessage($"=== ExecuteCompleteSync: Completed - {uploaded} uploaded, {deleted} deleted ===");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"ExecuteCompleteSync failed: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+                throw;
+            }
         }
 
         #endregion
@@ -594,36 +857,7 @@ namespace LeoAISwPdmAddIn
             return directoryId;
         }
 
-        private async Task RefreshCache()
-        {
-            LogFileWriter.LogMessage("Refreshing server file cache...");
-
-            lock (_cacheLock)
-            {
-                _pathToServerFileCache = new Dictionary<string, string>();
-            }
-
-            var syncData = await _leoClient.GetSyncMetadataAsync(_directoryId);
-            LogFileWriter.LogMessage($"Retrieved sync metadata from server");
-
-            if (syncData?.Files != null)
-            {
-                lock (_cacheLock)
-                {
-                    foreach (var file in syncData.Files)
-                    {
-                        _pathToServerFileCache[file.FilePathInDirectory] = file.ComponentId;
-                    }
-                }
-                LogFileWriter.LogMessage($"Cache refreshed with {_pathToServerFileCache.Count} entries");
-            }
-            else
-            {
-                LogFileWriter.LogMessage("No files found in sync metadata");
-            }
-        }
-
-        private async Task UpdateFilesToLeoAI(string[] filePaths, string vaultRootPath)
+        private async Task UpdateFilesToLeoAI(IEdmVault11 vault, string[] filePaths, string vaultRootPath)
         {
             LogFileWriter.LogMessage($"Updating {filePaths.Length} files to Leo AI");
 
@@ -632,56 +866,237 @@ namespace LeoAISwPdmAddIn
                 string relativePath = GetRelativePath(vaultRootPath, filePath);
                 LogFileWriter.LogMessage($"Processing: {relativePath}");
 
-                // Check cache first (outside lock to avoid deadlock)
-                string existingComponentId = null;
-                lock (_cacheLock)
+                string actualFilePath = null;
+                bool needsCleanup = false;
+
+                try
                 {
-                    _pathToServerFileCache.TryGetValue(relativePath, out existingComponentId);
+                    // Get readable file path (archive or temp copy)
+                    IEdmFolder5 folder;
+                    IEdmFile5 file = vault.GetFileFromPath(filePath, out folder);
+
+                    if (file != null && folder != null)
+                    {
+                        (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
+                        LogFileWriter.LogMessage($"File path for upload: {actualFilePath} (cleanup: {needsCleanup})");
+                    }
+                    else
+                    {
+                        // Fallback: use the provided path directly
+                        actualFilePath = filePath;
+                        LogFileWriter.LogMessage($"Could not get file from vault, using path directly: {actualFilePath}");
+                    }
+
+                    // CreateFileAsync handles both create and update (with automatic retry for rate limits)
+                    var fileInfo = await _leoClient.CreateFileAsync(_directoryId, vaultRootPath, filePath, actualFilePath, null);
+
+                    if (fileInfo != null)
+                    {
+                        LogFileWriter.LogMessage($"File synced to server: {relativePath} (ID: {fileInfo.ComponentId})");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Failed to update file {filePath}: {ex.Message}");
+                    throw new Exception($"Failed to sync file {relativePath}: {ex.Message}", ex);
+                }
+                finally
+                {
+                    // Clean up temp file if needed
+                    if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
+                    {
+                        DeleteTempFile(actualFilePath);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Gets the archive root path for the vault from:
+        /// 1. Environment variable LEOAI_PDM_ARCHIVE_ROOT (user override)
+        /// 2. Windows Registry (ArchiveServer\Vaults\{vaultName}\ArchiveTable - using ArchiveTable0 path, removing \0 suffix)
+        /// 3. Default location
+        /// All paths are validated for existence before returning
+        /// </summary>
+        private string GetArchiveRootPath(string vaultName)
+        {
+            try
+            {
+                // Option 1: Check environment variable first (allows user override for non-standard installs)
+                string envOverride = Environment.GetEnvironmentVariable("LEOAI_PDM_ARCHIVE_ROOT");
+                if (!string.IsNullOrEmpty(envOverride))
+                {
+                    string envPath = Path.Combine(envOverride, vaultName);
+                    if (Directory.Exists(envPath))
+                    {
+                        LogFileWriter.LogMessage($"Archive root from environment variable: {envPath}");
+                        return envPath;
+                    }
+                    else
+                    {
+                        LogFileWriter.LogMessage($"Environment variable path does not exist: {envPath}, trying next option");
+                    }
                 }
 
-                // Retry logic with exponential backoff for rate limits
-                int maxRetries = 5;
-                int retryDelay = 1000; // Start with 1 second
-
-                for (int attempt = 0; attempt <= maxRetries; attempt++)
+                // Option 2: Try reading from registry: ArchiveServer\Vaults\{vaultName}\ArchiveTable
+                string registryPath = $@"SOFTWARE\SolidWorks\Applications\PDMWorks Enterprise\ArchiveServer\Vaults\{vaultName}\ArchiveTable";
+                using (var key = Microsoft.Win32.Registry.LocalMachine.OpenSubKey(registryPath))
                 {
-                    try
+                    if (key != null)
                     {
-                        // CreateFileAsync handles both create and update
-                        var fileInfo = await _leoClient.CreateFileAsync(_directoryId, vaultRootPath, filePath, null);
-
-                        if (fileInfo != null)
+                        // Try ArchiveTable0 first (most common)
+                        object archiveTable0 = key.GetValue("ArchiveTable0");
+                        if (archiveTable0 != null)
                         {
-                            lock (_cacheLock)
+                            string archiveTablePath = archiveTable0.ToString();
+                            // Remove the \0 suffix to get the base archive path
+                            string archivePath = archiveTablePath.TrimEnd('\\', '0');
+
+                            if (Directory.Exists(archivePath))
                             {
-                                _pathToServerFileCache[relativePath] = fileInfo.ComponentId;
+                                LogFileWriter.LogMessage($"Archive root from registry ArchiveTable0: {archivePath}");
+                                return archivePath;
                             }
-                            LogFileWriter.LogMessage($"File synced to server: {relativePath} (ID: {fileInfo.ComponentId})");
+                            else
+                            {
+                                LogFileWriter.LogMessage($"Registry ArchiveTable0 path does not exist: {archivePath}, trying next option");
+                            }
                         }
-
-                        break; // Success - exit retry loop
-                    }
-                    catch (Exception ex)
-                    {
-                        // Check if it's a rate limit error (HTTP 429)
-                        bool isRateLimit = ex.Message.Contains("429") ||
-                                          ex.Message.ToLower().Contains("rate limit") ||
-                                          ex.Message.ToLower().Contains("too many requests");
-
-                        if (isRateLimit && attempt < maxRetries)
-                        {
-                            // Exponential backoff for rate limits
-                            LogFileWriter.LogMessage($"Rate limit hit for {relativePath}, retrying in {retryDelay}ms (attempt {attempt + 1}/{maxRetries})");
-                            await Task.Delay(retryDelay);
-                            retryDelay *= 2; // Exponential backoff
-                            continue;
-                        }
-
-                        // For all other errors or exhausted retries, log and re-throw to fail the task
-                        LogFileWriter.LogError($"Failed to update file {filePath}: {ex.Message}");
-                        throw new Exception($"Failed to sync file {relativePath}: {ex.Message}", ex);
                     }
                 }
+
+                // Option 3: Fallback to default location
+                string defaultPath = $@"C:\Program Files\SOLIDWORKS Corp\SOLIDWORKS PDM\Data\{vaultName}";
+                if (Directory.Exists(defaultPath))
+                {
+                    LogFileWriter.LogMessage($"Using default archive path: {defaultPath}");
+                    return defaultPath;
+                }
+                else
+                {
+                    LogFileWriter.LogMessage($"Default path does not exist: {defaultPath}");
+                    LogFileWriter.LogMessage($"WARNING: No valid archive path found. Files will be copied using GetFileCopy.");
+                    return null; // Return null to indicate no archive path found - will fall back to GetFileCopy
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error reading archive path from registry: {ex.Message}");
+                return null; // Return null to fall back to GetFileCopy
+            }
+        }
+
+        /// <summary>
+        /// Constructs the actual archive file path based on File ID and Version.
+        /// Archive structure: {ArchiveRoot}\{LastHexDigit}\{FileID_8DigitHex}\{Version_8DigitHex}.{Extension}
+        /// Example: test_pro\0\00000010\00000002.SLDPRT for FileID 16 version 2
+        /// </summary>
+        private string GetArchiveFilePath(IEdmVault11 vault, IEdmFile5 file, string logicalFilePath)
+        {
+            try
+            {
+                string archiveRoot = GetArchiveRootPath(vault.Name);
+                if (string.IsNullOrEmpty(archiveRoot))
+                {
+                    LogFileWriter.LogMessage("No archive root found, cannot construct archive path");
+                    return null;
+                }
+
+                int fileID = file.ID;
+                int currentVersion = file.CurrentVersion;
+
+                string hexID = fileID.ToString("X8"); // Convert to 8-digit hexadecimal (padded with zeros)
+                string hexVersion = currentVersion.ToString("X8"); // Version as 8-digit hex
+                string lastHexDigit = hexID.Substring(hexID.Length - 1); // Last hex digit determines subfolder
+                string extension = Path.GetExtension(logicalFilePath);
+
+                // Structure: {ArchiveRoot}\{LastHexDigit}\{FileID_8DigitHex}\{Version_8DigitHex}.{Extension}
+                string archivePath = Path.Combine(archiveRoot, lastHexDigit, hexID, $"{hexVersion}{extension}");
+
+                LogFileWriter.LogMessage($"Archive path construction:");
+                LogFileWriter.LogMessage($"  Logical file: {logicalFilePath}");
+                LogFileWriter.LogMessage($"  File ID: {fileID} (hex: {hexID})");
+                LogFileWriter.LogMessage($"  Current version: {currentVersion} (hex: {hexVersion})");
+                LogFileWriter.LogMessage($"  Archive root: {archiveRoot}");
+                LogFileWriter.LogMessage($"  Constructed path: {archivePath}");
+                LogFileWriter.LogMessage($"  File exists: {File.Exists(archivePath)}");
+
+                return archivePath;
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to construct archive path: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// Gets the best available file path for reading - tries archive path first, falls back to GetFileCopy if needed.
+        /// Returns: (actualFilePath, needsCleanup)
+        /// </summary>
+        private (string filePath, bool needsCleanup) GetReadableFilePath(IEdmVault11 vault, string logicalPath, int folderID)
+        {
+            try
+            {
+                // Get file object from vault
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(logicalPath, out folder);
+
+                if (file == null)
+                {
+                    throw new Exception($"Could not find file in vault: {logicalPath}");
+                }
+
+                // Try archive path first (best option - no copy needed)
+                string archivePath = GetArchiveFilePath(vault, file, logicalPath);
+                if (archivePath != null && File.Exists(archivePath))
+                {
+                    LogFileWriter.LogMessage($"File found in archive: {archivePath}");
+                    return (archivePath, false); // No cleanup needed
+                }
+
+                LogFileWriter.LogMessage($"File not in archive, using GetFileCopy to temp location");
+
+                // Fallback: Copy file to temp location using PDM API
+                string tempDir = Path.Combine(Path.GetTempPath(), "LeoAI_PDM_Temp");
+                if (!Directory.Exists(tempDir))
+                {
+                    Directory.CreateDirectory(tempDir);
+                }
+
+                string fileName = Path.GetFileName(logicalPath);
+                string tempFilePath = Path.Combine(tempDir, $"{Guid.NewGuid()}_{fileName}");
+
+                file.GetFileCopy(0, 0, folderID, (int)EdmGetCmdFlags.Egcf_Nothing, tempFilePath);
+
+                LogFileWriter.LogMessage($"Copied to temp: {tempFilePath}");
+                return (tempFilePath, true); // Cleanup needed
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to get readable file path for {logicalPath}: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Safely deletes a temporary file
+        /// </summary>
+        private void DeleteTempFile(string tempFilePath)
+        {
+            try
+            {
+                if (File.Exists(tempFilePath))
+                {
+                    File.Delete(tempFilePath);
+                    LogFileWriter.LogMessage($"Deleted temp file: {tempFilePath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogMessage($"Warning: Could not delete temp file {tempFilePath}: {ex.Message}");
+                // Don't throw - temp file cleanup failure is not critical
             }
         }
 

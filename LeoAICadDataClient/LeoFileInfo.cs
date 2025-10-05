@@ -75,13 +75,37 @@ namespace LeoAICadDataClient
 						memeType = "model/step";
 						break;
 					}
+				// Creo part files
+				case ".prt":
+					{
+						memeType = "application/x-creo-part";
+						break;
+					}
+				// Creo assembly files
+				case ".asm":
+					{
+						memeType = "application/x-creo-assembly";
+						break;
+					}
+				// Inventor part files
+				case ".ipt":
+					{
+						memeType = "application/vnd.autodesk.inventor.part";
+						break;
+					}
+				// Inventor assembly files
+				case ".iam":
+					{
+						memeType = "application/vnd.autodesk.inventor.assembly";
+						break;
+					}
 				// Parasolid files - MIME type not confirmed by API yet
-				// case ".x_t":
-				// case ".xt":
-				// 	{
-				// 		memeType = "application/x-parasolid";
-				// 		break;
-				// 	}
+				case ".x_t":
+				case ".xt":
+					{
+						memeType = "application/x-parasolid";
+						break;
+					}
 				case ".txt":
 					{
 						memeType = "text/plain";

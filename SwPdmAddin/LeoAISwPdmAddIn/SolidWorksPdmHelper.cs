@@ -126,10 +126,18 @@ namespace LeoAISwPdmAddIn
                     children = new List<ChildData>()
                 };
 
-                IEdmReference10 reference = (IEdmReference10)file;
-                if (reference != null)
+                try
                 {
-                    assemblyFileData.children = GetReferencedFiles(reference);
+                    // Use as operator for safer casting - returns null if interface not supported
+                    IEdmReference10 reference = file as IEdmReference10;
+                    if (reference != null)
+                    {
+                        assemblyFileData.children = GetReferencedFiles(reference);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Error listing folder contents: {ex.Message}");
                 }
 
                 FilesInfo.Add(assemblyFileData);
@@ -163,14 +171,19 @@ namespace LeoAISwPdmAddIn
                 return false;
 
             string extension = Path.GetExtension(filePath).ToLower();
-            return extension == ".sldprt" || 
-                   extension == ".sldasm" || 
-                   extension == ".slddrw" || 
-                   extension == ".step" || 
-                   extension == ".stp" || 
-                   extension == ".txt" || 
-                   extension == ".pdf" || 
-                   extension == ".doc" || 
+            return extension == ".sldprt" ||
+                   extension == ".sldasm" ||
+                   extension == ".step" ||
+                   extension == ".stp" ||
+                   extension == ".prt" ||
+                   extension == ".asm" ||
+                   extension == ".ipt" ||
+                   extension == ".iam" ||
+                   extension == ".x_t" ||
+                   extension == ".xt" ||
+                   extension == ".txt" ||
+                   extension == ".pdf" ||
+                   extension == ".doc" ||
                    extension == ".docx";
         }
 
@@ -232,19 +245,40 @@ namespace LeoAISwPdmAddIn
 
                     if (!string.IsNullOrEmpty(filePath) && IsProcessableFile(filePath))
                     {
+                        // Compute checksum for comparison with server
+                        string checkSum = null;
+                        try
+                        {
+                            var fileInfo = LeoFileInfo.GetFileInfo(filePath);
+                            checkSum = fileInfo.CheckSum;
+                        }
+                        catch (Exception csEx)
+                        {
+                            LogFileWriter.LogError($"Failed to compute checksum for {filePath}: {csEx.Message}");
+                        }
+
                         var fileData = new FileData
                         {
                             file = filePath,
                             mimeType = LeoAIMemeType.GetMemeType(filePath),
+                            checkSum = checkSum,
                             children = new List<ChildData>()
                         };
 
                         if (GetDocType(filePath).ToUpper() == "ASSEMBLY")
                         {
-                            IEdmReference10 reference = (IEdmReference10)file;
-                            if (reference != null)
+                            try
                             {
-                                fileData.children = GetReferencedFiles(reference);
+                                // Use as operator for safer casting - returns null if interface not supported
+                                IEdmReference10 reference = file as IEdmReference10;
+                                if (reference != null)
+                                {
+                                    fileData.children = GetReferencedFiles(reference);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogFileWriter.LogError($"Error getting references for {file.Name}: {ex.Message}");
                             }
                         }
 
