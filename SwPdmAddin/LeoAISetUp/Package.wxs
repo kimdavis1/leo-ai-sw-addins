@@ -110,8 +110,9 @@
 			<Custom Action="PrepareCopySelectedJsonData" Before="CopySelectedJson" Condition="NOT Installed" />
 
 			<Custom Action="CopySelectedJson" After="InstallFiles" Condition="NOT Installed" />
-			
-			<Custom Action="LaunchInteractiveApp" After="InstallFinalize" Condition="NOT REMOVE"></Custom>
+
+			<!-- Disabled automatic add-in loading - user must manually add via PDM Administration -->
+			<!--<Custom Action="LaunchInteractiveApp" After="InstallFinalize" Condition="NOT REMOVE"></Custom>-->
 
 			<Custom Action="Data_Ceanup" Before="ShowCleanupInstructions" />
 			<Custom Action="ShowCleanupInstructions" After="InstallInitialize" Condition="REMOVE=&quot;ALL&quot;"></Custom>

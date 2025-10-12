@@ -20,6 +20,32 @@ namespace LeoAISwPdmAddIn
     }
 
     /// <summary>
+    /// Operation metadata for tracking file operations (from client add-in)
+    /// </summary>
+    public class OperationMetadata
+    {
+        public string Id { get; set; }
+        public string Operation { get; set; }      // "Rename", "Move", "Upload", "Delete"
+        public string OldPath { get; set; }
+        public string NewPath { get; set; }
+        public int FileID { get; set; }
+        public int FolderID { get; set; }
+        public string Status { get; set; }         // "in-work" or "ready"
+        public long Timestamp { get; set; }
+        public Dictionary<string, string> AdditionalData { get; set; }
+    }
+
+    /// <summary>
+    /// User session metadata containing all operations for a user session
+    /// </summary>
+    public class UserSessionMetadata
+    {
+        public string SessionId { get; set; }
+        public List<OperationMetadata> Operations { get; set; }
+        public long LastModified { get; set; }
+    }
+
+    /// <summary>
     /// Leo AI Sync Task Add-in - Executes sync operations on task host (server)
     /// This add-in runs on the designated task host and has access to API keys
     /// </summary>
@@ -119,16 +145,65 @@ namespace LeoAISwPdmAddIn
             }
         }
 
+        private void OnTaskLaunch(ref EdmCmd poCmd, ref EdmCmdData[] ppoData)
+        {
+            LogFileWriter.LogMessage("=== OnTaskLaunch: Task launched on client, storing operation metadata ===");
+
+            try
+            {
+                IEdmTaskInstance taskInstance = (IEdmTaskInstance)poCmd.mpoExtra;
+                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
+
+                LogFileWriter.LogMessage($"Task Instance ID: {taskInstance.ID}");
+                LogFileWriter.LogMessage($"Task Instance GUID: {taskInstance.InstanceGUID}");
+
+                // Read operation metadata from temp file written by client add-in
+                // File name pattern: LeoAI_TaskData_{timestamp}.json in vault root/LeoAI_TaskData folder
+                string vaultRoot = vault.RootFolderPath;
+                string tempDataFolder = Path.Combine(vaultRoot, "LeoAI_TaskData");
+
+                if (!Directory.Exists(tempDataFolder))
+                {
+                    LogFileWriter.LogMessage("No LeoAI_TaskData folder found - no operations to process");
+                    return;
+                }
+
+                // Find the most recent task data file
+                string[] jsonFiles = Directory.GetFiles(tempDataFolder, "*.json");
+                if (jsonFiles.Length == 0)
+                {
+                    LogFileWriter.LogMessage("No task data files found - no operations to process");
+                    return;
+                }
+
+                // Sort by timestamp in filename (descending) and take the most recent
+                string taskDataFile = jsonFiles.OrderByDescending(f => f).FirstOrDefault();
+                LogFileWriter.LogMessage($"Reading task data from: {Path.GetFileName(taskDataFile)}");
+
+                string operationsJson = File.ReadAllText(taskDataFile);
+                LogFileWriter.LogMessage($"Read operation metadata JSON ({operationsJson.Length} chars)");
+
+                // Store filename in task variable so OnTaskRun knows which file to read
+                string filename = Path.GetFileName(taskDataFile);
+                taskInstance.SetVar("LeoAI_TaskDataFile", filename);
+                LogFileWriter.LogMessage($"Stored task data filename in task variable: {filename}");
+
+                // Don't delete the temp file yet - TaskRun will read and delete it
+                LogFileWriter.LogMessage("Temp file will be read and deleted by TaskRun on server");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"OnTaskLaunch failed: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+                throw;
+            }
+        }
+
         private void OnTaskRun(ref EdmCmd poCmd, ref EdmCmdData[] ppoData)
         {
             LogFileWriter.LogMessage("=== OnTaskRun: Starting sync operation ===");
 
             IEdmTaskInstance taskInstance = null;
-            string metadataPath = null;
-            string metadataFolder = null;
-            string metadataFileName = null;
-            long timestamp = 0;
-            int currentTrial = 0;
 
             try
             {
@@ -146,75 +221,104 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"Vault Root Path: {vault.RootFolderPath}");
                 LogFileWriter.LogMessage($"Vault Root Path Exists: {Directory.Exists(vault.RootFolderPath)}");
 
-                // Log sample file path to understand how GetLocalPath works on task host
+                taskInstance.SetProgressPos(5, "Reading task metadata file from vault...");
+
+                // CRITICAL: Process only the metadata file that was passed to this task
+                // Each task processes its own unique metadata file to avoid conflicts
+                IEdmFile5 metadataFile = null;
+                IEdmFolder5 metadataFolder = null;
+                string metadataFilePath = null;
+
+                // Check if we have file data passed to the task
                 if (ppoData != null && ppoData.Length > 0)
                 {
-                    try
+                    // Get the metadata file from the first EdmCmdData
+                    EdmCmdData fileData = ppoData[0];
+                    metadataFile = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, fileData.mlObjectID1);
+                    metadataFolder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, fileData.mlObjectID2);
+
+                    if (metadataFile != null && metadataFile.Name.StartsWith("Task_") && metadataFile.Name.EndsWith(".json"))
                     {
-                        IEdmFile5 sampleFile = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, ppoData[0].mlObjectID1);
-                        if (sampleFile != null)
-                        {
-                            string samplePath = sampleFile.GetLocalPath(ppoData[0].mlObjectID2);
-                            LogFileWriter.LogMessage($"Sample file GetLocalPath: {samplePath}");
-                            LogFileWriter.LogMessage($"Sample file exists at path: {File.Exists(samplePath)}");
-                        }
+                        // This is our task metadata file
+                        metadataFilePath = metadataFile.GetLocalPath(metadataFolder.ID);
+                        LogFileWriter.LogMessage($"Processing task metadata file: {metadataFile.Name} (ID: {metadataFile.ID})");
                     }
-                    catch (Exception diagEx)
+                    else
                     {
-                        LogFileWriter.LogMessage($"Diagnostic logging error: {diagEx.Message}");
+                        LogFileWriter.LogError($"Invalid metadata file passed to task: {metadataFile?.Name ?? "null"}");
+                        taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneFailed, 0, "Invalid metadata file");
+                        return;
                     }
                 }
-
-                // Read metadata from vault hidden folder
-                // Files are named: {unixTimestamp}_{trialNumber}.json
-                LogFileWriter.LogMessage("Looking for metadata files in vault...");
-                string vaultRoot = vault.RootFolderPath;
-                metadataFolder = Path.Combine(vaultRoot, ".LeoAI_Metadata");
-
-                if (!Directory.Exists(metadataFolder))
+                else
                 {
-                    throw new Exception($"Metadata folder not found in vault: {metadataFolder}");
+                    LogFileWriter.LogError("No file data passed to task");
+                    taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneFailed, 0, "No metadata file specified");
+                    return;
                 }
 
-                // Find the earliest metadata file (lowest timestamp)
-                string[] metadataFiles = Directory.GetFiles(metadataFolder, "*.json")
-                    .OrderBy(f => Path.GetFileName(f))
-                    .ToArray();
-
-                if (metadataFiles.Length == 0)
+                if (string.IsNullOrEmpty(metadataFilePath))
                 {
-                    throw new Exception($"No metadata files found in: {metadataFolder}");
+                    LogFileWriter.LogError("Could not get metadata file path");
+                    taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneFailed, 0, "Could not access metadata file");
+                    return;
                 }
 
-                metadataPath = metadataFiles[0]; // Earliest file
-                metadataFileName = Path.GetFileName(metadataPath);
-                LogFileWriter.LogMessage($"Processing earliest metadata file: {metadataFileName}");
+                LogFileWriter.LogMessage($"Metadata file path: {metadataFilePath}");
 
-                // Parse filename to get timestamp and trial number
-                string fileNameWithoutExt = Path.GetFileNameWithoutExtension(metadataFileName);
-                string[] parts = fileNameWithoutExt.Split('_');
-                timestamp = long.Parse(parts[0]);
-                currentTrial = int.Parse(parts[1]);
-                LogFileWriter.LogMessage($"Timestamp: {timestamp}, Current trial: {currentTrial}");
+                // Read and process the single task metadata file
+                UserSessionMetadata taskMetadata = null;
+                List<OperationMetadata> allOperations = new List<OperationMetadata>();
 
-                // Read metadata
-                string metadataJson = File.ReadAllText(metadataPath);
-                dynamic metadataObj = Newtonsoft.Json.JsonConvert.DeserializeObject(metadataJson);
-
-                string operation = metadataObj.Operation;
-                List<string> filePaths = metadataObj.FilePaths.ToObject<List<string>>();
-                List<int> fileIDs = metadataObj.FileIDs.ToObject<List<int>>();
-                List<int> folderIDs = metadataObj.FolderIDs.ToObject<List<int>>();
-                Dictionary<string, string> additionalData = metadataObj.AdditionalData != null
-                    ? metadataObj.AdditionalData.ToObject<Dictionary<string, string>>()
-                    : new Dictionary<string, string>();
-
-                LogFileWriter.LogMessage($"Operation: {operation}");
-                LogFileWriter.LogMessage($"File count: {filePaths.Count}");
-                if (additionalData.Count > 0)
+                try
                 {
-                    LogFileWriter.LogMessage($"Additional data keys: {string.Join(", ", additionalData.Keys)}");
+                    LogFileWriter.LogMessage($"Reading metadata file: {Path.GetFileName(metadataFilePath)}");
+
+                    // Read the task metadata file
+                    string json = File.ReadAllText(metadataFilePath);
+
+                    // Deserialize as UserSessionMetadata
+                    taskMetadata = Newtonsoft.Json.JsonConvert.DeserializeObject<UserSessionMetadata>(json);
+
+                    if (taskMetadata != null && taskMetadata.Operations != null && taskMetadata.Operations.Count > 0)
+                    {
+                        // All operations in task file should be ready (already filtered by client)
+                        allOperations = taskMetadata.Operations;
+                        LogFileWriter.LogMessage($"Task {taskMetadata.SessionId}: {allOperations.Count} operations to process");
+                    }
+                    else
+                    {
+                        LogFileWriter.LogMessage("No operations in task metadata file");
+                        taskInstance.SetProgressPos(100, "No operations");
+                        taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneOK, 0, "", null, "No operations in metadata");
+
+                        // Delete the empty task file
+                        DeleteMetadataFile(vault, metadataFile, metadataFolder);
+                        return;
+                    }
                 }
+                catch (Exception fileEx)
+                {
+                    LogFileWriter.LogError($"Error reading metadata file: {fileEx.Message}");
+                    taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneFailed, 0, $"Failed to read metadata: {fileEx.Message}");
+                    return;
+                }
+
+                if (allOperations.Count == 0)
+                {
+                    LogFileWriter.LogMessage("No operations to process");
+                    taskInstance.SetProgressPos(100, "No operations");
+                    taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneOK, 0, "", null, "No operations to process");
+
+                    // Delete the empty task file
+                    DeleteMetadataFile(vault, metadataFile, metadataFolder);
+                    return;
+                }
+
+                LogFileWriter.LogMessage($"Processing {allOperations.Count} operations");
+
+                // Sort operations by timestamp (oldest first)
+                allOperations = allOperations.OrderBy(op => op.Timestamp).ToList();
 
                 taskInstance.SetProgressPos(10, "Initializing Leo AI client...");
 
@@ -226,79 +330,88 @@ namespace LeoAISwPdmAddIn
                 _leoClient = new SecureApiClient(authConfig.ApiKey, authConfig.ProjectId);
                 LogFileWriter.LogMessage("SecureApiClient initialized");
 
-                taskInstance.SetProgressPos(20, "Getting directory ID...");
+                taskInstance.SetProgressPos(15, "Getting directory ID...");
 
                 // Get or create directory
-                string vaultDir = vault.RootFolderPath;
-                _directoryId = GetOrCreateDirectoryId(vaultDir).Result;
+                _directoryId = GetOrCreateDirectoryId(vault.RootFolderPath).Result;
                 LogFileWriter.LogMessage($"Directory ID: {_directoryId}");
 
-                taskInstance.SetProgressPos(30, $"Executing {operation} operation...");
+                taskInstance.SetProgressPos(20, "Processing operations...");
 
-                // Build file data from task variables
-                List<EdmCmdData> fileDataList = new List<EdmCmdData>();
+                // Process each operation in order
+                int processed = 0;
+                int total = allOperations.Count;
 
-                for (int i = 0; i < filePaths.Count; i++)
-                {
-                    EdmCmdData cmdData = new EdmCmdData();
-                    cmdData.mbsStrData1 = filePaths[i];
-                    cmdData.mlObjectID1 = fileIDs[i];
-                    cmdData.mlObjectID2 = folderIDs[i];
-                    fileDataList.Add(cmdData);
-                    LogFileWriter.LogMessage($"File {i + 1}: {filePaths[i]} (FileID: {fileIDs[i]}, FolderID: {folderIDs[i]})");
-                }
-
-                EdmCmdData[] actualFiles = fileDataList.ToArray();
-                LogFileWriter.LogMessage($"Processing {actualFiles.Length} files");
-
-                // Execute operation
-                switch (operation)
-                {
-                    case "Upload":
-                        ExecuteUpload(vault, taskInstance, actualFiles, vaultDir).Wait();
-                        break;
-
-                    case "Delete":
-                        ExecuteDelete(vault, taskInstance, actualFiles, additionalData).Wait();
-                        break;
-
-                    case "Move":
-                        ExecuteMove(vault, taskInstance, actualFiles, additionalData).Wait();
-                        break;
-
-                    case "Rename":
-                        ExecuteRename(vault, taskInstance, actualFiles, additionalData).Wait();
-                        break;
-
-                    case "CompleteSync":
-                        ExecuteCompleteSync(vault, taskInstance, actualFiles).Wait();
-                        break;
-
-                    default:
-                        throw new Exception($"Unknown operation: {operation}");
-                }
-
-                taskInstance.SetProgressPos(90, "Finalizing...");
-                LogFileWriter.LogMessage("Task execution completed");
-
-                // Delete metadata file on success
-                if (!string.IsNullOrEmpty(metadataPath) && File.Exists(metadataPath))
+                foreach (var operation in allOperations)
                 {
                     try
                     {
-                        File.Delete(metadataPath);
-                        LogFileWriter.LogMessage($"Deleted metadata file on success: {metadataFileName}");
+                        int progressBase = 20 + (int)((processed / (float)total) * 70);
+                        taskInstance.SetProgressPos(progressBase, $"Processing operation {processed + 1}/{total}: {operation.Operation}");
+
+                        LogFileWriter.LogMessage($"=== Processing operation {processed + 1}/{total} ===");
+                        LogFileWriter.LogMessage($"  Type: {operation.Operation}");
+                        LogFileWriter.LogMessage($"  ID: {operation.Id}");
+                        LogFileWriter.LogMessage($"  OldPath: {operation.OldPath ?? "N/A"}");
+                        LogFileWriter.LogMessage($"  NewPath: {operation.NewPath ?? "N/A"}");
+                        LogFileWriter.LogMessage($"  Timestamp: {operation.Timestamp}");
+
+                        // Execute operation
+                        switch (operation.Operation)
+                        {
+                            case "Upload":
+                                ProcessUploadOperation(vault, operation).Wait();
+                                break;
+
+                            case "Delete":
+                                ProcessDeleteOperation(vault, operation).Wait();
+                                break;
+
+                            case "Move":
+                                ProcessMoveOperation(vault, operation).Wait();
+                                break;
+
+                            case "Rename":
+                                ProcessRenameOperation(vault, operation).Wait();
+                                break;
+
+                            case "CompleteSync":
+                                ProcessCompleteSyncOperation(vault, taskInstance).Wait();
+                                break;
+
+                            default:
+                                LogFileWriter.LogMessage($"Unknown operation type: {operation.Operation} - skipping");
+                                break;
+                        }
+
+                        processed++;
+                        LogFileWriter.LogMessage($"Operation completed successfully");
                     }
-                    catch (Exception deleteEx)
+                    catch (Exception opEx)
                     {
-                        LogFileWriter.LogMessage($"Warning: Could not delete metadata file: {deleteEx.Message}");
+                        LogFileWriter.LogError($"Operation failed: {opEx.Message}");
+                        // Continue with next operation instead of failing entire task
                     }
                 }
 
-                taskInstance.SetProgressPos(100, "Sync completed successfully");
-                taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneOK, 0, "", null, "Leo AI sync completed successfully");
+                // Delete the task metadata file after successful processing
+                taskInstance.SetProgressPos(90, "Cleaning up task metadata...");
 
-                LogFileWriter.LogMessage("=== OnTaskRun: Sync completed successfully ===");
+                try
+                {
+                    DeleteMetadataFile(vault, metadataFile, metadataFolder);
+                    LogFileWriter.LogMessage($"Deleted task metadata file: {metadataFile.Name}");
+                }
+                catch (Exception delEx)
+                {
+                    LogFileWriter.LogError($"Failed to delete task metadata file: {delEx.Message}");
+                    // Don't fail the task just because we couldn't delete the metadata file
+                }
+
+                taskInstance.SetProgressPos(100, $"Completed {processed}/{total} operations");
+                taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneOK, 0, "", null, $"Processed {processed} operations successfully");
+
+                LogFileWriter.LogMessage($"=== OnTaskRun: Completed successfully - processed {processed}/{total} operations ===");
             }
             catch (Exception ex)
             {
@@ -309,41 +422,287 @@ namespace LeoAISwPdmAddIn
                 {
                     taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneFailed, 0, $"Sync failed: {ex.Message}");
                 }
-
-                // Handle metadata file on failure - increment trial or delete if max reached
-                if (!string.IsNullOrEmpty(metadataPath) && File.Exists(metadataPath))
-                {
-                    try
-                    {
-                        // Use retry count from task configuration (set in OnTaskSetup)
-                        LogFileWriter.LogMessage($"Using max retries from task config: {_maxRetries}");
-
-                        // Check if we've exhausted retries
-                        if (currentTrial >= _maxRetries)
-                        {
-                            // Max trials reached - delete file and let next one run
-                            File.Delete(metadataPath);
-                            LogFileWriter.LogMessage($"Max retries ({_maxRetries}) reached for {metadataFileName} - deleted file");
-                        }
-                        else
-                        {
-                            // Increment trial number for next retry
-                            int nextTrial = currentTrial + 1;
-                            string newFileName = $"{timestamp}_{nextTrial}.json";
-                            string newPath = Path.Combine(metadataFolder, newFileName);
-                            File.Move(metadataPath, newPath);
-                            LogFileWriter.LogMessage($"Incremented trial: {metadataFileName} → {newFileName} (will retry)");
-                        }
-                    }
-                    catch (Exception retryEx)
-                    {
-                        LogFileWriter.LogError($"Error handling metadata file retry logic: {retryEx.Message}");
-                    }
-                }
             }
         }
 
-        #region Sync Operations
+        #region Sync Operations (New Format - OperationMetadata)
+
+        /// <summary>
+        /// Process an Upload operation from metadata
+        /// </summary>
+        private async Task ProcessUploadOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessUploadOperation: {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("Upload operation missing NewPath");
+            }
+
+            if (!File.Exists(operation.NewPath))
+            {
+                throw new FileNotFoundException($"File not found: {operation.NewPath}");
+            }
+
+            string relativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
+            LogFileWriter.LogMessage($"Uploading: {relativePath}");
+
+            await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
+
+            LogFileWriter.LogMessage($"Upload completed: {relativePath}");
+        }
+
+        /// <summary>
+        /// Process a Delete operation from metadata
+        /// </summary>
+        private async Task ProcessDeleteOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessDeleteOperation: {operation.OldPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath))
+            {
+                throw new Exception("Delete operation missing OldPath");
+            }
+
+            string relativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
+            LogFileWriter.LogMessage($"Deleting from server: {relativePath}");
+
+            bool deleted = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+            if (deleted)
+            {
+                LogFileWriter.LogMessage($"Delete completed: {relativePath}");
+            }
+            else
+            {
+                LogFileWriter.LogMessage($"Delete returned false: {relativePath}");
+            }
+        }
+
+        /// <summary>
+        /// Process a Rename operation from metadata
+        /// Upload new path first, then delete old path
+        /// </summary>
+        private async Task ProcessRenameOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessRenameOperation: {operation.OldPath} → {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("Rename operation missing OldPath or NewPath");
+            }
+
+            string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
+            string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
+
+            // Step 1: Upload file with new path
+            if (File.Exists(operation.NewPath))
+            {
+                LogFileWriter.LogMessage($"Uploading renamed file: {newRelativePath}");
+                await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
+                LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
+            }
+            else
+            {
+                LogFileWriter.LogMessage($"Warning: New path does not exist: {operation.NewPath}");
+            }
+
+            // Step 2: Delete old path from server
+            LogFileWriter.LogMessage($"Deleting old path: {oldRelativePath}");
+            bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
+            if (deleted)
+            {
+                LogFileWriter.LogMessage($"Deleted old path: {oldRelativePath}");
+            }
+            else
+            {
+                LogFileWriter.LogMessage($"Delete returned false for old path: {oldRelativePath}");
+            }
+
+            LogFileWriter.LogMessage($"Rename completed: {oldRelativePath} → {newRelativePath}");
+        }
+
+        /// <summary>
+        /// Process a Move operation from metadata
+        /// Upload new path first, then delete old path
+        /// </summary>
+        private async Task ProcessMoveOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessMoveOperation: {operation.OldPath} → {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("Move operation missing OldPath or NewPath");
+            }
+
+            string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
+            string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
+
+            // Step 1: Upload file with new path
+            if (File.Exists(operation.NewPath))
+            {
+                LogFileWriter.LogMessage($"Uploading moved file: {newRelativePath}");
+                await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
+                LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
+            }
+            else
+            {
+                LogFileWriter.LogMessage($"Warning: New path does not exist: {operation.NewPath}");
+            }
+
+            // Step 2: Delete old path from server
+            LogFileWriter.LogMessage($"Deleting old path: {oldRelativePath}");
+            bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
+            if (deleted)
+            {
+                LogFileWriter.LogMessage($"Deleted old path: {oldRelativePath}");
+            }
+            else
+            {
+                LogFileWriter.LogMessage($"Delete returned false for old path: {oldRelativePath}");
+            }
+
+            LogFileWriter.LogMessage($"Move completed: {oldRelativePath} → {newRelativePath}");
+        }
+
+        /// <summary>
+        /// Process a CompleteSync operation - syncs entire vault with server
+        /// </summary>
+        private async Task ProcessCompleteSyncOperation(IEdmVault11 vault, IEdmTaskInstance taskInstance)
+        {
+            LogFileWriter.LogMessage("ProcessCompleteSyncOperation: Starting full vault sync");
+
+            try
+            {
+                taskInstance.SetProgressPos(30, "Enumerating vault files...");
+
+                // Get all files from vault using SolidWorksPdmHelper
+                SolidWorksPdmHelper pdmHelper = new SolidWorksPdmHelper(vault);
+                pdmHelper.ProcessFolders(vault);
+                List<FileData> vaultFiles = pdmHelper.FilesInfo;
+                LogFileWriter.LogMessage($"Found {vaultFiles.Count} files in vault");
+
+                taskInstance.SetProgressPos(40, "Getting server state...");
+
+                // Get all files from server
+                var serverData = await _leoClient.GetSyncMetadataAsync(_directoryId);
+                Dictionary<string, SyncMetadataFile> serverFiles = new Dictionary<string, SyncMetadataFile>(StringComparer.OrdinalIgnoreCase);
+                if (serverData?.Files != null)
+                {
+                    foreach (var file in serverData.Files)
+                    {
+                        serverFiles[file.FilePathInDirectory] = file;
+                    }
+                }
+                LogFileWriter.LogMessage($"Found {serverFiles.Count} files on server");
+
+                taskInstance.SetProgressPos(50, "Comparing vault and server state...");
+
+                // Build sets for comparison
+                HashSet<string> vaultPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (var vaultFile in vaultFiles)
+                {
+                    string relativePath = GetRelativePath(vault.RootFolderPath, vaultFile.file);
+                    vaultPaths.Add(relativePath);
+                }
+
+                // Find files to upload (in vault but not on server, or changed)
+                List<string> filesToUpload = new List<string>();
+                foreach (var vaultFile in vaultFiles)
+                {
+                    string relativePath = GetRelativePath(vault.RootFolderPath, vaultFile.file);
+                    if (!serverFiles.ContainsKey(relativePath))
+                    {
+                        filesToUpload.Add(vaultFile.file);
+                        LogFileWriter.LogMessage($"New file to upload: {relativePath}");
+                    }
+                    else
+                    {
+                        // Check if file changed (compare checksum)
+                        var serverFile = serverFiles[relativePath];
+                        if (serverFile.CheckSum != vaultFile.checkSum)
+                        {
+                            filesToUpload.Add(vaultFile.file);
+                            LogFileWriter.LogMessage($"Modified file to upload: {relativePath}");
+                        }
+                    }
+                }
+
+                // Find files to delete (on server but not in vault - vault is master)
+                List<string> filesToDelete = new List<string>();
+                foreach (var serverPath in serverFiles.Keys)
+                {
+                    if (!vaultPaths.Contains(serverPath))
+                    {
+                        filesToDelete.Add(serverPath);
+                        LogFileWriter.LogMessage($"File to delete from server: {serverPath}");
+                    }
+                }
+
+                LogFileWriter.LogMessage($"Files to upload: {filesToUpload.Count}, Files to delete: {filesToDelete.Count}");
+
+                // Upload files
+                taskInstance.SetProgressPos(60, $"Uploading {filesToUpload.Count} files...");
+                int uploaded = 0;
+                int uploadTotal = filesToUpload.Count > 0 ? filesToUpload.Count : 1;
+                foreach (var filePath in filesToUpload)
+                {
+                    try
+                    {
+                        await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath);
+                        uploaded++;
+                        int progress = 60 + (int)((uploaded / (float)uploadTotal) * 20);
+                        taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{filesToUpload.Count} files");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+                        // Continue with next file instead of failing entire sync
+                    }
+                }
+                LogFileWriter.LogMessage($"Uploaded {uploaded} files");
+
+                // Delete files
+                taskInstance.SetProgressPos(80, $"Deleting {filesToDelete.Count} files from server...");
+                int deleted = 0;
+                int deleteTotal = filesToDelete.Count > 0 ? filesToDelete.Count : 1;
+                foreach (var relativePath in filesToDelete)
+                {
+                    try
+                    {
+                        bool success = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                        if (success)
+                        {
+                            deleted++;
+                            LogFileWriter.LogMessage($"Deleted from server: {relativePath}");
+                        }
+                        else
+                        {
+                            LogFileWriter.LogMessage($"Failed to delete from server: {relativePath}");
+                        }
+                        int progress = 80 + (int)((deleted / (float)deleteTotal) * 10);
+                        taskInstance.SetProgressPos(progress, $"Deleted {deleted}/{filesToDelete.Count} files");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Error deleting file {relativePath}: {ex.Message}");
+                        // Continue with next file instead of failing entire sync
+                    }
+                }
+                LogFileWriter.LogMessage($"Deleted {deleted} files from server");
+
+                LogFileWriter.LogMessage($"ProcessCompleteSyncOperation: Completed - {uploaded} uploaded, {deleted} deleted");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"ProcessCompleteSyncOperation failed: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+                throw;
+            }
+        }
+
+        #endregion
+
+        #region Sync Operations (Old Format - Legacy)
 
         private async Task ExecuteUpload(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, string vaultRootPath)
         {
@@ -785,6 +1144,30 @@ namespace LeoAISwPdmAddIn
         #endregion
 
         #region Helper Methods (copied from SwPdmAddinMain)
+
+        /// <summary>
+        /// Deletes a metadata file from vault
+        /// </summary>
+        private void DeleteMetadataFile(IEdmVault11 vault, IEdmFile5 file, IEdmFolder5 folder)
+        {
+            try
+            {
+                if (file == null || folder == null)
+                {
+                    LogFileWriter.LogError("Cannot delete metadata file: file or folder is null");
+                    return;
+                }
+
+                // Delete the file from vault using folder.DeleteFile
+                folder.DeleteFile(0, file.ID, true); // window handle, file ID, permanently delete
+                LogFileWriter.LogMessage($"Deleted metadata file from vault: {file.Name}");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error deleting metadata file: {ex.Message}");
+                throw;
+            }
+        }
 
         private LeoAuthConfig ReadAuthConfig()
         {

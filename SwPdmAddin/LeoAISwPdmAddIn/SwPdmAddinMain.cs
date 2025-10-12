@@ -19,6 +19,43 @@ namespace LeoAISwPdmAddIn
         public string ProjectId { get; set; }
     }
 
+    /// <summary>
+    /// Represents a single file operation with its status
+    /// </summary>
+    public class OperationMetadata
+    {
+        public string Id { get; set; }
+        public string Operation { get; set; }  // "Rename", "Move", "Upload", "Delete", "CompleteSync"
+        public string OldPath { get; set; }
+        public string NewPath { get; set; }
+        public int FileID { get; set; }
+        public int FolderID { get; set; }
+        public string Status { get; set; }     // "in-work" or "ready"
+        public long Timestamp { get; set; }
+        public Dictionary<string, string> AdditionalData { get; set; }
+
+        public OperationMetadata()
+        {
+            Id = Guid.NewGuid().ToString();
+            AdditionalData = new Dictionary<string, string>();
+        }
+    }
+
+    /// <summary>
+    /// Per-user session metadata file
+    /// </summary>
+    public class UserSessionMetadata
+    {
+        public string SessionId { get; set; }
+        public List<OperationMetadata> Operations { get; set; }
+        public long LastModified { get; set; }
+
+        public UserSessionMetadata()
+        {
+            Operations = new List<OperationMetadata>();
+        }
+    }
+
     [ComVisible(true)]
     [Guid("5C9C2B58-C7E9-4052-9321-00433F32A479")]
     public class SwPdmAddinMain : IEdmAddIn5
@@ -53,13 +90,13 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogDebug("Registering event hooks...");
 
                 // File events that require processing
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUnlock);     // Check-in - file is on server
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUndoLock);   // Undo checkout - file is on server
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDelete);     // Delete - file removed
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMove);       // Move - file relocated
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostCopy);       // Copy - new file created
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUnlock);     // Check-in - marks operations ready
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUndoLock);   // Undo checkout - marks operations ready
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDelete);     // Delete - immediate ready operation
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMove);       // Move - creates in-work operation
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRename);     // Rename - creates in-work operation
+                // Note: PostCopy removed - copy creates new file that will be handled by PostUnlock
                 // Note: PostAdd removed - fires during Ctrl+S before check-in when file is still locked
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRename);     // Rename - file name changed
 
                 // Folder events that require processing
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRenameFolder);
@@ -123,8 +160,40 @@ namespace LeoAISwPdmAddIn
                 if (poCmd.mlCmdID == CMD_COMPLETE_SYNC)
                 {
                     LogFileWriter.LogMessage("Complete Sync menu command triggered");
-                    EdmCmdData[] emptyData = new EdmCmdData[0]; // CompleteSync doesn't need file list
-                    ExecuteSyncTask(poCmd, emptyData, "CompleteSync");
+
+                    IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                    if (vault == null) return;
+
+                    // Load existing metadata
+                    string metadataPath = GetMetadataFilePath(vault);
+                    UserSessionMetadata metadata = LoadMetadataFile(metadataPath);
+
+                    // Create a "CompleteSync" operation
+                    var completeSyncOp = new OperationMetadata
+                    {
+                        Id = Guid.NewGuid().ToString(),
+                        Operation = "CompleteSync",
+                        OldPath = null,
+                        NewPath = null,
+                        FileID = 0,
+                        FolderID = 0,
+                        Status = "ready",  // Immediately ready
+                        Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds(),
+                        AdditionalData = new Dictionary<string, string>()
+                    };
+
+                    LogFileWriter.LogMessage($"Created CompleteSync operation: {completeSyncOp.Id}");
+
+                    // Add to metadata and save
+                    metadata.Operations.Add(completeSyncOp);
+                    SaveMetadataFile(metadataPath, metadata, vault);
+
+                    // Create task metadata file with CompleteSync operation
+                    string taskMetadataPath = CreateTaskMetadataFile(vault, new List<OperationMetadata> { completeSyncOp });
+
+                    // Pass the metadata file to the task
+                    LogFileWriter.LogMessage("Triggering task for CompleteSync operation with metadata file");
+                    ExecuteSyncTaskWithMetadataFile(poCmd, taskMetadataPath);
                     return;
                 }
             }
@@ -132,46 +201,28 @@ namespace LeoAISwPdmAddIn
             switch (poCmd.meCmdType)
             {
                 case EdmCmdType.EdmCmd_PostUnlock:
-                    LogFileWriter.LogMessage("PostUnlock event detected - executing upload task on server");
-                    ExecuteSyncTask(cmd, data, "Upload");
+                    LogFileWriter.LogMessage("PostUnlock event detected - marking operations ready");
+                    HandleUnlockOperation(cmd, data);
                     break;
 
                 case EdmCmdType.EdmCmd_PostUndoLock:
-                    LogFileWriter.LogMessage("PostUndoLock event detected - executing upload task on server");
-                    ExecuteSyncTask(cmd, data, "Upload");
+                    LogFileWriter.LogMessage("PostUndoLock event detected - marking operations ready");
+                    HandleUnlockOperation(cmd, data);
                     break;
 
                 case EdmCmdType.EdmCmd_PostDelete:
-                    LogFileWriter.LogMessage("PostDelete event detected - executing delete task on server");
-                    var deleteData = new Dictionary<string, string>();
-                    var deletedPaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
-                    deleteData["FilePaths"] = string.Join("|", deletedPaths);
-                    ExecuteSyncTask(cmd, data, "Delete", deleteData);
+                    LogFileWriter.LogMessage("PostDelete event detected - creating delete operations");
+                    HandleDeleteOperation(cmd, data);
                     break;
 
                 case EdmCmdType.EdmCmd_PostMove:
-                    LogFileWriter.LogMessage("PostMove event detected - executing move task on server");
-                    var moveData = new Dictionary<string, string>();
-                    var oldPaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
-                    var newPaths = data.Select(d => d.mbsStrData2).Where(p => !string.IsNullOrEmpty(p)).ToArray();
-                    moveData["OldPaths"] = string.Join("|", oldPaths);
-                    moveData["NewPaths"] = string.Join("|", newPaths);
-                    ExecuteSyncTask(cmd, data, "Move", moveData);
-                    break;
-
-                case EdmCmdType.EdmCmd_PostCopy:
-                    LogFileWriter.LogMessage("PostCopy event detected - executing upload task on server");
-                    ExecuteSyncTask(cmd, data, "Upload");
+                    LogFileWriter.LogMessage("PostMove event detected - tracking move operation");
+                    HandleMoveOperation(cmd, data);
                     break;
 
                 case EdmCmdType.EdmCmd_PostRename:
-                    LogFileWriter.LogMessage("PostRename event detected - executing rename task on server");
-                    var renameData = new Dictionary<string, string>();
-                    var oldRenamePaths = data.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
-                    var newRenamePaths = data.Select(d => d.mbsStrData2).Where(p => !string.IsNullOrEmpty(p)).ToArray();
-                    renameData["OldPaths"] = string.Join("|", oldRenamePaths);
-                    renameData["NewPaths"] = string.Join("|", newRenamePaths);
-                    ExecuteSyncTask(cmd, data, "Rename", renameData);
+                    LogFileWriter.LogMessage("PostRename event detected - tracking rename operation");
+                    HandleRenameOperation(cmd, data);
                     break;
 
                 case EdmCmdType.EdmCmd_PostMoveFolder:
@@ -213,6 +264,494 @@ namespace LeoAISwPdmAddIn
             }
             LogFileWriter.LogDebug($"OnCmd method finished for command {poCmd.meCmdType}");
         }
+
+        #region Metadata File Management
+
+        /// <summary>
+        /// Gets the user's session ID (username_PID)
+        /// </summary>
+        private string GetUserSessionId()
+        {
+            string username = Environment.UserName.Replace(" ", "_");
+            int processId = System.Diagnostics.Process.GetCurrentProcess().Id;
+            return $"{username}_{processId}";
+        }
+
+        /// <summary>
+        /// Gets the path to the user's session metadata file
+        /// </summary>
+        private string GetMetadataFilePath(IEdmVault5 vault)
+        {
+            string sessionId = GetUserSessionId();
+            string vaultRoot = vault.RootFolderPath;
+            string metadataFolder = Path.Combine(vaultRoot, "LeoAI_TaskData");
+
+            if (!Directory.Exists(metadataFolder))
+            {
+                Directory.CreateDirectory(metadataFolder);
+            }
+
+            return Path.Combine(metadataFolder, $"{sessionId}.json");
+        }
+
+        /// <summary>
+        /// Loads or creates the metadata file
+        /// </summary>
+        private UserSessionMetadata LoadMetadataFile(string filePath)
+        {
+            try
+            {
+                if (File.Exists(filePath))
+                {
+                    string json = File.ReadAllText(filePath);
+                    var metadata = Newtonsoft.Json.JsonConvert.DeserializeObject<UserSessionMetadata>(json);
+                    if (metadata != null)
+                        return metadata;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error loading metadata file: {ex.Message}");
+            }
+
+            // Return new metadata if file doesn't exist or couldn't be loaded
+            return new UserSessionMetadata
+            {
+                SessionId = GetUserSessionId(),
+                Operations = new List<OperationMetadata>(),
+                LastModified = DateTimeOffset.Now.ToUnixTimeSeconds()
+            };
+        }
+
+        /// <summary>
+        /// Saves user metadata file locally (NOT checked into vault - just for tracking)
+        /// </summary>
+        private void SaveMetadataFile(string metadataPath, UserSessionMetadata metadata, IEdmVault5 vault)
+        {
+            try
+            {
+                metadata.LastModified = DateTimeOffset.Now.ToUnixTimeSeconds();
+                string json = Newtonsoft.Json.JsonConvert.SerializeObject(metadata, Newtonsoft.Json.Formatting.Indented);
+
+                // Write with proper disposal
+                using (FileStream fs = new FileStream(metadataPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (StreamWriter writer = new StreamWriter(fs))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                }
+
+                LogFileWriter.LogDebug($"User metadata file saved locally: {metadataPath}");
+
+                // DO NOT add user metadata files to vault - they're just for local tracking
+                // Only Task_*.json files should be in vault
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error saving user metadata file: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Creates a task-specific metadata file with only ready operations
+        /// </summary>
+        private string CreateTaskMetadataFile(IEdmVault5 vault, List<OperationMetadata> readyOperations)
+        {
+            try
+            {
+                string vaultRoot = vault.RootFolderPath;
+                string metadataFolder = Path.Combine(vaultRoot, "LeoAI_TaskData");
+
+                if (!Directory.Exists(metadataFolder))
+                {
+                    Directory.CreateDirectory(metadataFolder);
+                }
+
+                // Create unique task file name
+                string taskId = Guid.NewGuid().ToString("N").Substring(0, 8);
+                string timestamp = DateTimeOffset.Now.ToUnixTimeSeconds().ToString();
+                string taskFileName = $"Task_{timestamp}_{taskId}.json";
+                string taskFilePath = Path.Combine(metadataFolder, taskFileName);
+
+                // Create task-specific metadata
+                var taskMetadata = new UserSessionMetadata
+                {
+                    SessionId = $"Task_{taskId}",
+                    Operations = readyOperations,
+                    LastModified = DateTimeOffset.Now.ToUnixTimeSeconds()
+                };
+
+                // Write task metadata file
+                string json = Newtonsoft.Json.JsonConvert.SerializeObject(taskMetadata, Newtonsoft.Json.Formatting.Indented);
+                using (FileStream fs = new FileStream(taskFilePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (StreamWriter writer = new StreamWriter(fs))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                }
+
+                LogFileWriter.LogMessage($"Created task metadata file: {taskFileName}");
+
+                // Add to vault and check in
+                AddFileToVault(vault, taskFilePath);
+
+                return taskFilePath;
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error creating task metadata file: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Executes sync task by passing metadata file to the task
+        /// </summary>
+        private void ExecuteSyncTaskWithMetadataFile(EdmCmd poCmd, string metadataFilePath)
+        {
+            try
+            {
+                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
+                IEdmFolder5 folder;
+                IEdmFile5 metadataFile = vault.GetFileFromPath(metadataFilePath, out folder);
+
+                if (metadataFile == null)
+                {
+                    LogFileWriter.LogError($"Metadata file not found in vault: {metadataFilePath}");
+                    return;
+                }
+
+                // Create EdmCmdData for the metadata file
+                EdmCmdData metadataData = new EdmCmdData();
+                metadataData.mlObjectID1 = metadataFile.ID;
+                metadataData.mlObjectID2 = folder.ID;
+
+                // Execute task with metadata file
+                ExecuteSyncTask(poCmd, new EdmCmdData[] { metadataData }, "ProcessMetadata");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error executing sync task with metadata file: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Adds file to vault if not already present
+        /// </summary>
+        private void AddFileToVault(IEdmVault5 vault, string filePath)
+        {
+            try
+            {
+                string folderPath = Path.GetDirectoryName(filePath);
+                string fileName = Path.GetFileName(filePath);
+
+                IEdmFolder5 folder = vault.GetFolderFromPath(folderPath);
+                if (folder == null)
+                {
+                    // Create the folder if it doesn't exist
+                    string parentPath = Path.GetDirectoryName(folderPath);
+                    string folderName = Path.GetFileName(folderPath);
+
+                    IEdmFolder5 parentFolder = vault.GetFolderFromPath(parentPath);
+                    if (parentFolder != null)
+                    {
+                        parentFolder.AddFolder(0, folderName);
+                        LogFileWriter.LogMessage($"Added folder to vault: {folderName}");
+                        folder = vault.GetFolderFromPath(folderPath);
+                    }
+                }
+
+                if (folder == null)
+                {
+                    LogFileWriter.LogError($"Failed to get/create folder: {folderPath}");
+                    return;
+                }
+
+                // Check if file already in vault
+                IEdmFile5 file = null;
+                IEdmFolder5 fileFolder = null;
+
+                try
+                {
+                    file = vault.GetFileFromPath(filePath, out fileFolder);
+                }
+                catch
+                {
+                    // File not in vault yet
+                }
+
+                if (file == null)
+                {
+                    LogFileWriter.LogMessage($"Starting add file to vault process in path: {filePath}");
+                    folder.AddFile(0, filePath);
+                    LogFileWriter.LogMessage($"File added to vault");
+
+                    // Get file and check it in
+                    file = vault.GetFileFromPath(filePath, out fileFolder);
+                    if (file != null)
+                    {
+                        LogFileWriter.LogMessage($"Checking in file: {fileName}");
+                        file.UnlockFile(0, "Added by Leo AI PDM Add-in", (int)EdmUnlockFlag.EdmUnlock_IgnoreReferences);
+                        LogFileWriter.LogMessage($"File checked in successfully: {fileName}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error adding file to vault: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+            }
+        }
+
+        #endregion
+
+        #region Operation Handlers
+
+        /// <summary>
+        /// Handles PostUnlock/PostUndoLock - marks pending operations as ready
+        /// </summary>
+        private void HandleUnlockOperation(EdmCmd poCmd, EdmCmdData[] ppoData)
+        {
+            try
+            {
+                IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
+
+                string metadataPath = GetMetadataFilePath(vault);
+                UserSessionMetadata metadata = LoadMetadataFile(metadataPath);
+
+                bool hasChanges = false;
+                foreach (EdmCmdData cmdData in ppoData)
+                {
+                    string filePath = cmdData.mbsStrData1;
+                    if (string.IsNullOrEmpty(filePath))
+                        continue;
+
+                    // Skip metadata files
+                    if (filePath.Contains("\\LeoAI_TaskData\\"))
+                    {
+                        LogFileWriter.LogDebug($"Skipping metadata file: {filePath}");
+                        continue;
+                    }
+
+                    // Check if there's a pending operation for this file
+                    var pendingOp = metadata.Operations.FirstOrDefault(
+                        op => op.Status == "in-work" &&
+                        (op.NewPath?.Equals(filePath, StringComparison.OrdinalIgnoreCase) ?? false));
+
+                    if (pendingOp != null)
+                    {
+                        // Mark existing operation as ready
+                        pendingOp.Status = "ready";
+                        pendingOp.FileID = cmdData.mlObjectID1;
+                        pendingOp.FolderID = cmdData.mlObjectID2;
+                        LogFileWriter.LogMessage($"Marked operation ready: {pendingOp.Operation} - {filePath}");
+                        hasChanges = true;
+                    }
+                    else
+                    {
+                        // Create new upload operation
+                        var uploadOp = new OperationMetadata
+                        {
+                            Operation = "Upload",
+                            NewPath = filePath,
+                            FileID = cmdData.mlObjectID1,
+                            FolderID = cmdData.mlObjectID2,
+                            Status = "ready",
+                            Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                        };
+                        metadata.Operations.Add(uploadOp);
+                        LogFileWriter.LogMessage($"Created upload operation for: {filePath}");
+                        hasChanges = true;
+                    }
+                }
+
+                if (hasChanges)
+                {
+                    SaveMetadataFile(metadataPath, metadata, vault);
+
+                    // Trigger task if there are ready operations
+                    var readyOps = metadata.Operations.Where(op => op.Status == "ready").ToList();
+                    if (readyOps.Count > 0)
+                    {
+                        // Create a new task-specific metadata file with only ready operations
+                        string taskMetadataPath = CreateTaskMetadataFile(vault, readyOps);
+
+                        // Pass the metadata file itself to the task
+                        LogFileWriter.LogMessage($"Triggering task for {readyOps.Count} ready operations with metadata file: {Path.GetFileName(taskMetadataPath)}");
+                        ExecuteSyncTaskWithMetadataFile(poCmd, taskMetadataPath);
+
+                        // Mark operations as processing in original metadata
+                        foreach (var op in readyOps)
+                        {
+                            op.Status = "processing";
+                        }
+                        SaveMetadataFile(metadataPath, metadata, vault);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error in HandleUnlockOperation: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handles PostDelete - creates ready delete operations
+        /// </summary>
+        private void HandleDeleteOperation(EdmCmd poCmd, EdmCmdData[] ppoData)
+        {
+            try
+            {
+                IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
+
+                string metadataPath = GetMetadataFilePath(vault);
+                UserSessionMetadata metadata = LoadMetadataFile(metadataPath);
+
+                foreach (EdmCmdData cmdData in ppoData)
+                {
+                    string filePath = cmdData.mbsStrData1;
+                    if (string.IsNullOrEmpty(filePath))
+                        continue;
+
+                    // Skip metadata files
+                    if (filePath.Contains("\\LeoAI_TaskData\\"))
+                    {
+                        LogFileWriter.LogDebug($"Skipping metadata file: {filePath}");
+                        continue;
+                    }
+
+                    var deleteOp = new OperationMetadata
+                    {
+                        Operation = "Delete",
+                        OldPath = filePath,
+                        NewPath = filePath,
+                        FileID = cmdData.mlObjectID1,
+                        FolderID = cmdData.mlObjectID2,
+                        Status = "ready",  // Delete is immediately ready
+                        Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                    };
+                    metadata.Operations.Add(deleteOp);
+                    LogFileWriter.LogMessage($"Created delete operation for: {filePath}");
+                }
+
+                SaveMetadataFile(metadataPath, metadata, vault);
+
+                // Trigger task
+                LogFileWriter.LogMessage("Triggering task for delete operations");
+                var deleteData = new Dictionary<string, string>();
+                var deletedPaths = ppoData.Select(d => d.mbsStrData1).Where(p => !string.IsNullOrEmpty(p)).ToArray();
+                deleteData["FilePaths"] = string.Join("|", deletedPaths);
+                ExecuteSyncTask(poCmd, ppoData, "Delete", deleteData);
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error in HandleDeleteOperation: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handles PostRename - tracks operation as in-work until check-in
+        /// </summary>
+        private void HandleRenameOperation(EdmCmd poCmd, EdmCmdData[] ppoData)
+        {
+            try
+            {
+                IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
+
+                string metadataPath = GetMetadataFilePath(vault);
+                UserSessionMetadata metadata = LoadMetadataFile(metadataPath);
+
+                foreach (EdmCmdData cmdData in ppoData)
+                {
+                    string oldPath = cmdData.mbsStrData1;
+                    string newPath = cmdData.mbsStrData2;
+
+                    if (string.IsNullOrEmpty(oldPath) || string.IsNullOrEmpty(newPath))
+                        continue;
+
+                    // Skip metadata files
+                    if (oldPath.Contains("\\LeoAI_TaskData\\") || newPath.Contains("\\LeoAI_TaskData\\"))
+                    {
+                        LogFileWriter.LogDebug($"Skipping metadata file rename: {oldPath} -> {newPath}");
+                        continue;
+                    }
+
+                    var renameOp = new OperationMetadata
+                    {
+                        Operation = "Rename",
+                        OldPath = oldPath,
+                        NewPath = newPath,
+                        FileID = cmdData.mlObjectID1,
+                        FolderID = cmdData.mlObjectID2,
+                        Status = "in-work",  // Will be ready on check-in
+                        Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                    };
+                    metadata.Operations.Add(renameOp);
+                    LogFileWriter.LogMessage($"Created rename operation (in-work): {oldPath} -> {newPath}");
+                }
+
+                SaveMetadataFile(metadataPath, metadata, vault);
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error in HandleRenameOperation: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Handles PostMove - tracks operation as in-work until check-in
+        /// </summary>
+        private void HandleMoveOperation(EdmCmd poCmd, EdmCmdData[] ppoData)
+        {
+            try
+            {
+                IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
+
+                string metadataPath = GetMetadataFilePath(vault);
+                UserSessionMetadata metadata = LoadMetadataFile(metadataPath);
+
+                foreach (EdmCmdData cmdData in ppoData)
+                {
+                    string oldPath = cmdData.mbsStrData1;
+                    string newPath = cmdData.mbsStrData2;
+
+                    if (string.IsNullOrEmpty(oldPath) || string.IsNullOrEmpty(newPath))
+                        continue;
+
+                    // Skip metadata files
+                    if (oldPath.Contains("\\LeoAI_TaskData\\") || newPath.Contains("\\LeoAI_TaskData\\"))
+                    {
+                        LogFileWriter.LogDebug($"Skipping metadata file move: {oldPath} -> {newPath}");
+                        continue;
+                    }
+
+                    var moveOp = new OperationMetadata
+                    {
+                        Operation = "Move",
+                        OldPath = oldPath,
+                        NewPath = newPath,
+                        FileID = cmdData.mlObjectID1,
+                        FolderID = cmdData.mlObjectID2,
+                        Status = "in-work",  // Will be ready on check-in
+                        Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                    };
+                    metadata.Operations.Add(moveOp);
+                    LogFileWriter.LogMessage($"Created move operation (in-work): {oldPath} -> {newPath}");
+                }
+
+                SaveMetadataFile(metadataPath, metadata, vault);
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error in HandleMoveOperation: {ex.Message}");
+            }
+        }
+
+        #endregion
 
         #region Folder Event Handling
 
@@ -376,9 +915,9 @@ namespace LeoAISwPdmAddIn
                 string metadataJson = Newtonsoft.Json.JsonConvert.SerializeObject(metadata);
                 LogFileWriter.LogMessage($"Metadata JSON (length: {metadataJson.Length})");
 
-                // Store metadata in vault hidden folder with timestamp_trial naming
+                // Store metadata in vault folder
                 string vaultRoot = vault.RootFolderPath;
-                string metadataFolder = Path.Combine(vaultRoot, ".LeoAI_Metadata");
+                string metadataFolder = Path.Combine(vaultRoot, "LeoAI_TaskData");
 
                 // Create hidden folder if it doesn't exist
                 if (!Directory.Exists(metadataFolder))

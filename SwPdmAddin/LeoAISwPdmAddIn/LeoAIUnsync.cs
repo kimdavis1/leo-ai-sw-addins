@@ -125,10 +125,23 @@ namespace LeoAISwPdmAddIn
             for (int i = 0; i < vaultNames.Count; i++)
                 Console.WriteLine($"  {i + 1}. {vaultNames[i]}");
             Console.WriteLine("  0. UNSYNC ALL vaults");
+            Console.WriteLine("  c. Cancel (exit without unsyncing)");
             Console.WriteLine();
-            Console.Write("Enter vault numbers to unsync (comma-separated, or 0 for all): ");
+            Console.Write("Enter vault numbers to unsync (comma-separated, 0 for all, or 'c' to cancel): ");
             var input = Console.ReadLine();
             var selectedVaults = new List<string>();
+
+            // Check for cancel
+            if (input?.Trim().ToLower() == "c")
+            {
+                Console.WriteLine();
+                Console.WriteLine("Operation cancelled. No vaults were unsynced.");
+                Console.WriteLine();
+                Console.WriteLine("You can unsync vaults later from the Leo AI Admin Dashboard");
+                Console.WriteLine("in the Leo AI application if needed.");
+                return selectedVaults; // Return empty list
+            }
+
             if (input.Trim() == "0")
             {
                 selectedVaults.AddRange(vaultNames);

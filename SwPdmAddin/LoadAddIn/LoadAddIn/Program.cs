@@ -60,18 +60,28 @@ namespace LoadAddIn
                     return;
                 }
 
-                // Hard-coded add-in DLL paths
-                //basePath = @"C:\Program Files\LeoAISwPdmAddIn\";
-                var addinFiles = new List<string>
+                // Task add-in files (installed first)
+                // NOTE: COM DLL must be FIRST in the list!
+                // PDM scans the first DLL for IEdmAddIn5 interface
+                var taskAddinFiles = new List<string>
+                {
+                    Path.Combine(basePath, "LeoAISwPdmTaskAddIn.dll"),
+                    Path.Combine(basePath, "LeoAICadDataClient.dll"),
+                    Path.Combine(basePath, "EPDM.Interop.epdm.dll")
+                };
+
+                // Client add-in files (installed last)
+                // NOTE: COM DLL must be FIRST in the list!
+                var clientAddinFiles = new List<string>
                 {
                     Path.Combine(basePath, "LeoAISwPdmAddIn.dll"),
                     Path.Combine(basePath, "LeoAICadDataClient.dll"),
-                    Path.Combine(basePath, "EPDM.Interop.epdm.dll"),
-
+                    Path.Combine(basePath, "EPDM.Interop.epdm.dll")
                 };
 
-                // Verify all files exist
-                foreach (var file in addinFiles)
+                // Verify all required files exist
+                var allFiles = taskAddinFiles.Concat(clientAddinFiles).Distinct();
+                foreach (var file in allFiles)
                 {
                     if (!File.Exists(file))
                     {
@@ -80,18 +90,14 @@ namespace LoadAddIn
                     }
                 }
 
-                // Show sync process information
+                // Show installation information
                 Console.WriteLine("\n" + new string('=', 60));
-                Console.WriteLine("IMPORTANT: Sync Process Information");
+                Console.WriteLine("IMPORTANT: Installation Process");
                 Console.WriteLine(new string('=', 60));
-                Console.WriteLine("After confirming to SolidWorks PDM to add the Leo AI add-in,");
-                Console.WriteLine("it will immediately start a sync process for all files.");
+                Console.WriteLine("This installer will add both the client and task add-ins.");
                 Console.WriteLine();
-                Console.WriteLine("In large systems with many files, this could take even a few hours.");
-                Console.WriteLine("Please don't close this window until it finishes.");
-                Console.WriteLine();
-                Console.WriteLine("You can keep track of the progress in the Leo Admin Dashboard");
-                Console.WriteLine("in the Leo AI application.");
+                Console.WriteLine("After installation, you MUST complete the task setup in");
+                Console.WriteLine("PDM Administration before triggering the initial sync.");
                 Console.WriteLine(new string('=', 60));
                 Console.WriteLine("\nPress Enter to continue with the installation...");
                 Console.ReadLine();
@@ -105,13 +111,63 @@ namespace LoadAddIn
                     Console.WriteLine("✅ Login successful.");
                     Console.WriteLine($"Vault root path: {vaultObj.RootFolderPath}");
 
-                    string fileList = string.Join("\n", addinFiles);
-                    var addinMgr = (IEdmAddInMgr8)vaultObj;
-                    addinMgr.AddAddIns(fileList,
+                    var addinMgr = (IEdmAddInMgr5)vaultObj;
+
+                    // Step 1: Install TASK add-in FIRST
+                    Console.WriteLine( $"\n[1/2] Installing task add-in... from files: " + string.Join(", ", taskAddinFiles));
+                    string taskFileList = string.Join("\n", taskAddinFiles);
+                    Console.WriteLine($"DEBUG: File list being sent to AddAddIns (separated by newlines):");
+                    Console.WriteLine($"---START---");
+                    Console.WriteLine(taskFileList);
+                    Console.WriteLine($"---END---");
+                    Console.WriteLine($"DEBUG: Flag value: {(int)EdmAddAddInFlags.EdmAddin_AddAllFilesToOneAddIn}");
+
+                    // Try with empty string instead of null for third parameter
+                    Console.WriteLine("DEBUG: Attempting AddAddIns call...");
+                    try
+                    {
+                        addinMgr.AddAddIns(taskFileList,
+                            (int)EdmAddAddInFlags.EdmAddin_AddAllFilesToOneAddIn,
+                            "");
+                        Console.WriteLine("✅ Task add-in installed: LeoAISwPdmTaskAddIn");
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"DEBUG: Exception details: {ex.GetType().Name}");
+                        Console.WriteLine($"DEBUG: Message: {ex.Message}");
+                        if (ex is COMException comEx)
+                        {
+                            Console.WriteLine($"DEBUG: HRESULT: 0x{comEx.ErrorCode:X}");
+                        }
+                        throw;
+                    }
+
+                    // Step 2: Install CLIENT add-in LAST
+                    Console.WriteLine( $"\n[2/2] Installing client add-in... from files: " + string.Join(", ", clientAddinFiles));
+                    string clientFileList = string.Join("\n", clientAddinFiles);
+                    addinMgr.AddAddIns(clientFileList,
                         (int)EdmAddAddInFlags.EdmAddin_AddAllFilesToOneAddIn,
                         null);
+                    Console.WriteLine("✅ Client add-in installed: LeoAISwPdmAddIn");
 
-                    Console.WriteLine("✅ Add-in installed successfully.");
+                    Console.WriteLine($"\n🎉 Add-ins installed successfully for vault: {vName}");
+                    Console.WriteLine("\n" + new string('=', 70));
+                    Console.WriteLine("⚠️  MANUAL STEPS REQUIRED:");
+                    Console.WriteLine(new string('=', 70));
+                    Console.WriteLine("STEP 1 - Configure Task in PDM Administration:");
+                    Console.WriteLine("  1. Open PDM Administration and connect to the vault");
+                    Console.WriteLine("  2. Navigate to: Task Host Computers");
+                    Console.WriteLine($"  3. Add this computer as a task host: {Environment.MachineName}");
+                    Console.WriteLine("  4. Navigate to: Tasks");
+                    Console.WriteLine("  5. You should see 'Leo AI Sync Task' - open it");
+                    Console.WriteLine($"  6. Assign it to host: {Environment.MachineName}");
+                    Console.WriteLine();
+                    Console.WriteLine("STEP 2 - Trigger Initial Sync:");
+                    Console.WriteLine("  7. Open PDM Client (Windows Explorer with vault view)");
+                    Console.WriteLine("  8. Right-click on any file in the vault");
+                    Console.WriteLine("  9. Select 'Leo AI' → 'Complete Sync' from the context menu");
+                    Console.WriteLine("  10. Wait for the initial sync to complete");
+                    Console.WriteLine(new string('=', 70));
                 }
             }
             catch (COMException ex)
