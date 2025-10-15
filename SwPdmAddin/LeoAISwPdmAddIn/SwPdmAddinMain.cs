@@ -99,8 +99,11 @@ namespace LeoAISwPdmAddIn
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostCopy);       // File copied
 
                 // Folder events - each creates immediate task
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostAddFolder);    // Folder added
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDeleteFolder); // Folder deleted
+                // NOTE: PostAddFolder and PostDeleteFolder are NOT registered because:
+                // - PostAdd fires for each file when a folder is added
+                // - PostDelete fires for each file when a folder is deleted
+                // poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostAddFolder);    // DISABLED - redundant with PostAdd
+                // poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDeleteFolder); // DISABLED - redundant with PostDelete
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMoveFolder);   // Folder moved
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRenameFolder); // Folder renamed
 
@@ -224,15 +227,19 @@ namespace LeoAISwPdmAddIn
                     CreateImmediateTask(cmd, data, "Copy");
                     break;
 
-                // Folder operations - create immediate task for each
+                // Folder operations - use CreateImmediateFolderTask
                 case EdmCmdType.EdmCmd_PostAddFolder:
-                    LogFileWriter.LogMessage("PostAddFolder event - creating AddFolder task");
-                    CreateImmediateFolderTask(cmd, data, "AddFolder");
+                    // COMMENTED OUT: Add events fire for each file in the folder already
+                    // The file-level PostAdd events handle all files, so folder-level is redundant
+                    LogFileWriter.LogMessage("PostAddFolder event - SKIPPED (files already added via PostAdd)");
+                    // CreateImmediateFolderTask(cmd, data, "AddFolder");
                     break;
 
                 case EdmCmdType.EdmCmd_PostDeleteFolder:
-                    LogFileWriter.LogMessage("PostDeleteFolder event - creating DeleteFolder task");
-                    CreateImmediateFolderTask(cmd, data, "DeleteFolder");
+                    // COMMENTED OUT: Delete events fire for both files AND folder, causing duplicates
+                    // The file-level PostDelete events handle all files in the folder already
+                    LogFileWriter.LogMessage("PostDeleteFolder event - SKIPPED (files already deleted via PostDelete)");
+                    // CreateImmediateFolderTask(cmd, data, "DeleteFolder");
                     break;
 
                 case EdmCmdType.EdmCmd_PostMoveFolder:
@@ -312,13 +319,82 @@ namespace LeoAISwPdmAddIn
                         continue;
                     }
 
-                    // For move/rename/copy, get both paths
+                    // For move/rename/copy, get both paths from event data
                     string newPath = cmdData.mbsStrData2;
+
+                    // Get actual file paths using PDM API for rename/move operations
+                    // This ensures we get vault-relative paths correctly
+                    string actualOldPath = filePath;
+                    string actualNewPath = newPath;
+
+                    if ((operationType == "Rename" || operationType == "Move") && cmdData.mlObjectID1 > 0)
+                    {
+                        try
+                        {
+                            LogFileWriter.LogMessage($"===File Rename/Move RAW data===");
+                            LogFileWriter.LogMessage($"  mbsStrData1: '{filePath}'");
+                            LogFileWriter.LogMessage($"  mbsStrData2: '{newPath}'");
+                            LogFileWriter.LogMessage($"  mlObjectID1 (FileID): {cmdData.mlObjectID1}");
+                            LogFileWriter.LogMessage($"  mlObjectID2 (FolderID): {cmdData.mlObjectID2}");
+
+                            if (operationType == "Move")
+                            {
+                                // For Move: PDM provides both full paths in the event data
+                                // mbsStrData1 = OLD full path
+                                // mbsStrData2 = NEW full path
+                                actualOldPath = filePath;
+                                actualNewPath = newPath;
+                                LogFileWriter.LogMessage($"Move operation - using event paths directly");
+                                LogFileWriter.LogMessage($"  OLD path: '{actualOldPath}'");
+                                LogFileWriter.LogMessage($"  NEW path: '{actualNewPath}'");
+                            }
+                            else // Rename
+                            {
+                                // For Rename: we need PDM API to get the full path
+                                // Get file object by ID (more reliable than path)
+                                IEdmFile5 file = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, cmdData.mlObjectID1);
+                                if (file != null)
+                                {
+                                    // Get parent folder from FolderID
+                                    IEdmFolder5 parentFolder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, cmdData.mlObjectID2);
+                                    if (parentFolder != null)
+                                    {
+                                        // Get current file path (this is the NEW path after rename)
+                                        actualNewPath = file.GetLocalPath(parentFolder.ID);
+                                        LogFileWriter.LogMessage($"Current file path from PDM API: '{actualNewPath}'");
+
+                                        // Reconstruct old path in same folder
+                                        // If newPath (mbsStrData2) matches current filename, then filePath (mbsStrData1) is old name
+                                        string currentFileName = Path.GetFileName(actualNewPath);
+                                        if (!string.IsNullOrEmpty(newPath) && currentFileName.Equals(newPath, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            // mbsStrData1 is the old filename
+                                            string parentPath = Path.GetDirectoryName(actualNewPath);
+                                            actualOldPath = Path.Combine(parentPath, filePath);
+                                            LogFileWriter.LogMessage($"Reconstructed OLD path for rename: '{actualOldPath}'");
+                                        }
+                                        else
+                                        {
+                                            // Fallback: assume filePath is already a full path
+                                            actualOldPath = filePath;
+                                            LogFileWriter.LogMessage($"Using event old path as-is: '{actualOldPath}'");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogFileWriter.LogDebug($"Could not get file from PDM API, using event paths: {ex.Message}");
+                        }
+                    }
 
                     // Convert absolute paths to vault-relative paths for storage in metadata
                     // This ensures task host can reconstruct paths using its own vault root
-                    string relativeOldPath = GetVaultRelativePath(vault, filePath);
-                    string relativeNewPath = string.IsNullOrEmpty(newPath) ? null : GetVaultRelativePath(vault, newPath);
+                    string relativeOldPath = GetVaultRelativePath(vault, actualOldPath);
+                    string relativeNewPath = string.IsNullOrEmpty(actualNewPath) ? null : GetVaultRelativePath(vault, actualNewPath);
+
+                    LogFileWriter.LogMessage($"Final file paths - Old: '{relativeOldPath}', New: '{relativeNewPath}'");
 
                     // Create operation metadata with relative paths
                     var operation = new OperationMetadata
@@ -347,6 +423,13 @@ namespace LeoAISwPdmAddIn
 
         /// <summary>
         /// Creates an immediate task for folder operations
+        /// For PDM folder events:
+        /// - mbsStrData1 = OLD folder path (before rename/move)
+        /// - mbsStrData2 = NEW folder name only (not full path, just the name)
+        /// - mlObjectID1 = Folder ID
+        ///
+        /// IMPORTANT: Creates ONE task for the entire folder (not per file)
+        /// The task host will iterate over all files in the folder
         /// </summary>
         private void CreateImmediateFolderTask(EdmCmd poCmd, EdmCmdData[] ppoData, string operationType)
         {
@@ -355,41 +438,116 @@ namespace LeoAISwPdmAddIn
                 IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
                 if (vault == null) return;
 
-                foreach (EdmCmdData cmdData in ppoData)
+                // For folder operations, ppoData should contain only ONE folder entry
+                // We process only the first item and create ONE task for the entire folder
+                if (ppoData == null || ppoData.Length == 0)
                 {
-                    // For folders, the path info might be in different fields
-                    string folderPath = cmdData.mbsStrData1;
-                    string newPath = cmdData.mbsStrData2;
-
-                    if (string.IsNullOrEmpty(folderPath))
-                        continue;
-
-                    // Convert absolute paths to vault-relative paths for storage in metadata
-                    string relativeOldPath = GetVaultRelativePath(vault, folderPath);
-                    string relativeNewPath = string.IsNullOrEmpty(newPath) ? null : GetVaultRelativePath(vault, newPath);
-
-                    // Create operation metadata for folder with relative paths
-                    var operation = new OperationMetadata
-                    {
-                        Id = Guid.NewGuid().ToString(),
-                        Operation = operationType,
-                        OldPath = (operationType == "MoveFolder" || operationType == "RenameFolder") ? relativeOldPath : null,
-                        NewPath = (operationType == "MoveFolder" || operationType == "RenameFolder") ? relativeNewPath : relativeOldPath,
-                        FileID = cmdData.mlObjectID1,
-                        FolderID = cmdData.mlObjectID2,
-                        Status = "ready",
-                        Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
-                    };
-
-                    LogFileWriter.LogMessage($"Creating {operationType} task for folder: {folderPath} (relative: {relativeOldPath})");
-
-                    // Create task file and execute
-                    string taskFilePath = CreateTaskFileAndExecute(vault, operation);
+                    LogFileWriter.LogWarning($"No folder data provided for {operationType}");
+                    return;
                 }
+
+                // Take ONLY the first folder entry
+                EdmCmdData cmdData = ppoData[0];
+
+                // For folders, PDM provides:
+                // mbsStrData1 = folder path (might be relative or absolute)
+                // mbsStrData2 = NEW folder name (for rename) or destination path (for move)
+                // mlObjectID1 = Folder ID
+                string folderPath1 = cmdData.mbsStrData1;
+                string folderPath2 = cmdData.mbsStrData2;
+                int folderID = cmdData.mlObjectID1;
+
+                LogFileWriter.LogMessage($"===Folder event RAW data===");
+                LogFileWriter.LogMessage($"  mbsStrData1: '{folderPath1}'");
+                LogFileWriter.LogMessage($"  mbsStrData2: '{folderPath2}'");
+                LogFileWriter.LogMessage($"  mlObjectID1 (FolderID): {folderID}");
+
+                // Get the folder object from PDM using the folder ID
+                // This is more reliable than using the paths from event data
+                IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
+                if (folder == null)
+                {
+                    LogFileWriter.LogError($"Could not get folder object with ID: {folderID}");
+                    return;
+                }
+
+                // Get the CURRENT folder path from PDM (this is the NEW path after rename/move)
+                string currentFolderPath = folder.LocalPath;
+                LogFileWriter.LogMessage($"Current folder path from PDM API: '{currentFolderPath}'");
+
+                // For Rename/Move: we need to figure out the OLD path
+                // For AddFolder: we just need the current path
+                string oldFolderPath = null;
+                string newFolderPath = currentFolderPath;
+
+                if (operationType == "RenameFolder" || operationType == "MoveFolder")
+                {
+                    // For rename: mbsStrData2 is the NEW name, so we can deduce the old name
+                    // Current folder name is in currentFolderPath
+                    // OLD name should be: parent path + old name from (currentName vs newName from mbsStrData2)
+
+                    string currentFolderName = Path.GetFileName(currentFolderPath);
+                    string parentPath = Path.GetDirectoryName(currentFolderPath);
+
+                    LogFileWriter.LogMessage($"Current folder name: '{currentFolderName}'");
+                    LogFileWriter.LogMessage($"Parent path: '{parentPath}'");
+
+                    // For rename: if mbsStrData2 matches current name, then mbsStrData1 is the old name
+                    if (!string.IsNullOrEmpty(folderPath2) && currentFolderName.Equals(folderPath2, StringComparison.OrdinalIgnoreCase))
+                    {
+                        // mbsStrData1 is the old folder name
+                        oldFolderPath = Path.Combine(parentPath, folderPath1);
+                        LogFileWriter.LogMessage($"Reconstructed OLD path: '{oldFolderPath}'");
+                    }
+                    else
+                    {
+                        // Fallback: assume mbsStrData1 is old path, mbsStrData2 is new name
+                        if (!string.IsNullOrEmpty(folderPath1))
+                        {
+                            oldFolderPath = folderPath1;
+                        }
+                        else
+                        {
+                            LogFileWriter.LogWarning($"Could not determine old folder path for {operationType}");
+                            oldFolderPath = currentFolderPath; // Fallback
+                        }
+                    }
+                }
+                else
+                {
+                    // For AddFolder, we only need the current path
+                    oldFolderPath = null;
+                }
+
+                // Convert to vault-relative paths
+                string relativeOldPath = oldFolderPath != null ? GetVaultRelativePath(vault, oldFolderPath) : null;
+                string relativeNewPath = GetVaultRelativePath(vault, newFolderPath);
+
+                LogFileWriter.LogMessage($"Final paths - Old: '{relativeOldPath}', New: '{relativeNewPath}'");
+
+                // Create operation metadata for folder with relative paths
+                var operation = new OperationMetadata
+                {
+                    Id = Guid.NewGuid().ToString(),
+                    Operation = operationType,
+                    OldPath = (operationType == "MoveFolder" || operationType == "RenameFolder") ? relativeOldPath : null,
+                    NewPath = (operationType == "MoveFolder" || operationType == "RenameFolder") ? relativeNewPath : relativeNewPath,
+                    FileID = cmdData.mlObjectID1,  // Folder ID
+                    FolderID = cmdData.mlObjectID2,
+                    Status = "ready",
+                    Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                };
+
+                LogFileWriter.LogMessage($"Creating ONE {operationType} task for entire folder: OldPath={operation.OldPath}, NewPath={operation.NewPath}");
+
+                // Create ONE task file for the entire folder and execute
+                // The task host (LeoAiSyncTask) will enumerate all files in the folder
+                string taskFilePath = CreateTaskFileAndExecute(vault, operation);
             }
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Error creating immediate folder task: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
             }
         }
 

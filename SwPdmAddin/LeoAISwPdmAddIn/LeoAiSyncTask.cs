@@ -60,7 +60,7 @@ namespace LeoAISwPdmAddIn
 
         public void GetAddInInfo(ref EdmAddInInfo poInfo, IEdmVault5 poVault, IEdmCmdMgr5 poCmdMgr)
         {
-            LogFileWriter.LogMessage("=== LeoAiSyncTask.GetAddInInfo called ===");
+            LogFileWriter.LogDebug("=== LeoAiSyncTask.GetAddInInfo called ===");
 
             try
             {
@@ -76,8 +76,8 @@ namespace LeoAISwPdmAddIn
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_TaskSetup);
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_TaskRun);
 
-                LogFileWriter.LogMessage($"Task add-in registered: {TASK_NAME}");
-                LogFileWriter.LogMessage("Registered for EdmCmd_TaskSetup and EdmCmd_TaskRun");
+                LogFileWriter.LogInfo($"Task add-in registered: {TASK_NAME}");
+                LogFileWriter.LogDebug("Registered for EdmCmd_TaskSetup and EdmCmd_TaskRun");
             }
             catch (Exception ex)
             {
@@ -88,24 +88,24 @@ namespace LeoAISwPdmAddIn
 
         public void OnCmd(ref EdmCmd poCmd, ref EdmCmdData[] ppoData)
         {
-            LogFileWriter.LogMessage($"=== LeoAiSyncTask.OnCmd called - CmdType: {poCmd.meCmdType} ===");
+            LogFileWriter.LogDebug($"=== LeoAiSyncTask.OnCmd called - CmdType: {poCmd.meCmdType} ===");
 
             try
             {
                 switch (poCmd.meCmdType)
                 {
                     case EdmCmdType.EdmCmd_TaskSetup:
-                        LogFileWriter.LogMessage("Handling EdmCmd_TaskSetup");
+                        LogFileWriter.LogDebug("Handling EdmCmd_TaskSetup");
                         OnTaskSetup(ref poCmd, ref ppoData);
                         break;
 
                     case EdmCmdType.EdmCmd_TaskRun:
-                        LogFileWriter.LogMessage("Handling EdmCmd_TaskRun");
+                        LogFileWriter.LogInfo("Handling EdmCmd_TaskRun");
                         OnTaskRun(ref poCmd, ref ppoData);
                         break;
 
                     default:
-                        LogFileWriter.LogMessage($"Unhandled command type: {poCmd.meCmdType}");
+                        LogFileWriter.LogWarning($"Unhandled command type: {poCmd.meCmdType}");
                         break;
                 }
             }
@@ -118,7 +118,7 @@ namespace LeoAISwPdmAddIn
 
         private void OnTaskSetup(ref EdmCmd poCmd, ref EdmCmdData[] ppoData)
         {
-            LogFileWriter.LogMessage("=== OnTaskSetup: Configuring task properties ===");
+            LogFileWriter.LogDebug("=== OnTaskSetup: Configuring task properties ===");
 
             try
             {
@@ -131,11 +131,11 @@ namespace LeoAISwPdmAddIn
                 // Read and store the retry count from task configuration
                 _maxRetries = taskProps.RetryCount;
 
-                LogFileWriter.LogMessage($"Task ID: {taskProps.TaskID}");
-                LogFileWriter.LogMessage($"Task Name: {taskProps.TaskName}");
-                LogFileWriter.LogMessage($"Task GUID: {taskProps.TaskGUID}");
-                LogFileWriter.LogMessage($"Task Retry Count: {_maxRetries}");
-                LogFileWriter.LogMessage("Task configured: no scheduling, no manual launch (client-triggered only)");
+                LogFileWriter.LogDebug($"Task ID: {taskProps.TaskID}");
+                LogFileWriter.LogDebug($"Task Name: {taskProps.TaskName}");
+                LogFileWriter.LogDebug($"Task GUID: {taskProps.TaskGUID}");
+                LogFileWriter.LogInfo($"Task Retry Count: {_maxRetries}");
+                LogFileWriter.LogDebug("Task configured: no scheduling, no manual launch (client-triggered only)");
             }
             catch (Exception ex)
             {
@@ -382,6 +382,7 @@ namespace LeoAISwPdmAddIn
                         // Execute operation
                         switch (operation.Operation)
                         {
+                            case "Add":
                             case "Upload":
                                 ProcessUploadOperation(vault, operation).Wait();
                                 break;
@@ -406,8 +407,24 @@ namespace LeoAISwPdmAddIn
                                 ProcessCopyOperation(vault, operation).Wait();
                                 break;
 
+                            case "AddFolder":
+                                ProcessAddFolderOperation(vault, operation).Wait();
+                                break;
+
+                            case "DeleteFolder":
+                                ProcessDeleteFolderOperation(vault, operation).Wait();
+                                break;
+
+                            case "MoveFolder":
+                                ProcessMoveFolderOperation(vault, operation).Wait();
+                                break;
+
+                            case "RenameFolder":
+                                ProcessRenameFolderOperation(vault, operation).Wait();
+                                break;
+
                             default:
-                                LogFileWriter.LogMessage($"Unknown operation type: {operation.Operation} - skipping");
+                                LogFileWriter.LogWarning($"Unknown operation type: {operation.Operation} - skipping");
                                 break;
                         }
 
@@ -650,133 +667,220 @@ namespace LeoAISwPdmAddIn
 
         /// <summary>
         /// Process a Copy operation from metadata
-        /// Checks if source and destination have same checksum, uploads only if different
+        /// The copied file is a new independent file - just check if destination exists and upload
         /// </summary>
         private async Task ProcessCopyOperation(IEdmVault11 vault, OperationMetadata operation)
         {
             LogFileWriter.LogMessage($"ProcessCopyOperation: {operation.OldPath} → {operation.NewPath}");
 
-            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
+            if (string.IsNullOrEmpty(operation.NewPath))
             {
-                throw new Exception("Copy operation missing OldPath or NewPath");
+                throw new Exception("Copy operation missing NewPath");
             }
 
-            string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
             string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
 
-            // Check if both files exist in vault
-            if (!FileExistsInVault(vault, operation.OldPath))
-            {
-                LogFileWriter.LogMessage($"Warning: Source file not found in vault: {operation.OldPath}");
-                return;
-            }
-
+            // Check if destination file exists in vault
             if (!FileExistsInVault(vault, operation.NewPath))
             {
                 LogFileWriter.LogMessage($"Warning: Destination file not found in vault: {operation.NewPath}");
                 return;
             }
 
-            // Calculate checksums for both files
-            string sourceChecksum = null;
-            string destChecksum = null;
-
-            try
-            {
-                // Get source file checksum - use GetReadableFilePath to access from archive or temp copy
-                string sourceFullPath = EnsureFullPath(vault, operation.OldPath);
-                IEdmFolder5 sourceFolder;
-                IEdmFile5 sourceFile = vault.GetFileFromPath(sourceFullPath, out sourceFolder);
-
-                if (sourceFile != null && sourceFolder != null)
-                {
-                    string readablePath;
-                    bool needsCleanup;
-                    (readablePath, needsCleanup) = GetReadableFilePath(vault, operation.OldPath, sourceFolder.ID);
-
-                    var sourceInfo = LeoFileInfo.GetFileInfo(readablePath);
-                    sourceChecksum = sourceInfo.CheckSum;
-                    LogFileWriter.LogMessage($"Source checksum: {sourceChecksum}");
-
-                    if (needsCleanup)
-                    {
-                        DeleteTempFile(readablePath);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Failed to compute source checksum: {ex.Message}");
-                // If can't compute checksum, upload full file anyway
-            }
-
-            try
-            {
-                // Get destination file checksum - use GetReadableFilePath to access from archive or temp copy
-                string destFullPath = EnsureFullPath(vault, operation.NewPath);
-                IEdmFolder5 destFolder;
-                IEdmFile5 destFile = vault.GetFileFromPath(destFullPath, out destFolder);
-
-                if (destFile != null && destFolder != null)
-                {
-                    string readablePath;
-                    bool needsCleanup;
-                    (readablePath, needsCleanup) = GetReadableFilePath(vault, operation.NewPath, destFolder.ID);
-
-                    var destInfo = LeoFileInfo.GetFileInfo(readablePath);
-                    destChecksum = destInfo.CheckSum;
-                    LogFileWriter.LogMessage($"Destination checksum: {destChecksum}");
-
-                    if (needsCleanup)
-                    {
-                        DeleteTempFile(readablePath);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Failed to compute destination checksum: {ex.Message}");
-                // If can't compute checksum, upload full file anyway
-            }
-
             // Check if destination already exists on server
             var serverFile = await _leoClient.GetFileInfoByPathAsync(_directoryId, newRelativePath);
 
-            // Case 1: Checksums match (source and dest are identical)
-            if (!string.IsNullOrEmpty(sourceChecksum) && sourceChecksum == destChecksum)
-            {
-                LogFileWriter.LogMessage($"Copy: checksums match ({destChecksum})");
-
-                if (serverFile != null && serverFile.CheckSum == destChecksum)
-                {
-                    // Destination already exists on server with matching checksum - nothing to do
-                    LogFileWriter.LogMessage($"Destination already exists on server with matching checksum - skipping");
-                    return;
-                }
-                else
-                {
-                    // Destination doesn't exist or has different checksum - upload location only (reuse existing file content)
-                    LogFileWriter.LogMessage($"Uploading destination location with checksum reference (no file content)");
-                    string destFullPath = EnsureFullPath(vault, operation.NewPath);
-                    await _leoClient.UpdateFileLocationAsync(_directoryId, vault.RootFolderPath, destFullPath, null);
-                    LogFileWriter.LogMessage($"Copy completed (location only): {oldRelativePath} → {newRelativePath}");
-                    return;
-                }
-            }
-
-            // Case 2: Checksums differ (source and dest have different content) - need to upload full file
-            LogFileWriter.LogMessage($"Copy: checksums differ - uploading full file content");
-
-            // If destination already exists, delete it first
+            // If destination already exists on server, delete it first
             if (serverFile != null)
             {
-                LogFileWriter.LogMessage($"Destination exists on server - deleting before upload");
+                LogFileWriter.LogMessage($"Destination already exists on server - deleting before upload");
                 await _leoClient.DeleteFileAsync(_directoryId, newRelativePath);
             }
 
-            // Upload destination file with full content
+            // Upload the copied file
             await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
-            LogFileWriter.LogMessage($"Copy completed (full upload): {oldRelativePath} → {newRelativePath}");
+            LogFileWriter.LogMessage($"Copy completed: {newRelativePath}");
+        }
+
+        /// <summary>
+        /// Process an AddFolder operation - uploads all files in the folder
+        /// </summary>
+        private async Task ProcessAddFolderOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessAddFolderOperation: {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("AddFolder operation missing NewPath");
+            }
+
+            // Get folder from vault
+            string folderFullPath = EnsureFullPath(vault, operation.NewPath);
+            IEdmFolder5 folder = vault.GetFolderFromPath(folderFullPath);
+
+            if (folder == null)
+            {
+                LogFileWriter.LogMessage($"Warning: Folder not found in vault: {operation.NewPath}");
+                return;
+            }
+
+            // Get all files in folder (recursively)
+            List<string> filesToUpload = new List<string>();
+            EnumerateFolderFilesRecursive(folder, folder.LocalPath, folder.LocalPath, new List<string>(), filesToUpload);
+
+            LogFileWriter.LogMessage($"Found {filesToUpload.Count} files in folder to upload");
+
+            // Upload each file
+            foreach (string filePath in filesToUpload)
+            {
+                try
+                {
+                    await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath);
+                    string relativePath = GetRelativePath(vault.RootFolderPath, filePath);
+                    LogFileWriter.LogMessage($"Uploaded file from new folder: {relativePath}");
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+                    // Continue with other files
+                }
+            }
+
+            LogFileWriter.LogMessage($"AddFolder completed: {operation.NewPath} ({filesToUpload.Count} files)");
+        }
+
+        /// <summary>
+        /// Process a DeleteFolder operation - deletes all files in the folder from server
+        /// </summary>
+        private async Task ProcessDeleteFolderOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessDeleteFolderOperation: {operation.OldPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath))
+            {
+                throw new Exception("DeleteFolder operation missing OldPath");
+            }
+
+            string folderRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
+            LogFileWriter.LogMessage($"Deleting all files in folder from server: {folderRelativePath}");
+
+            // Get all files from server that are in this folder path
+            var serverData = await _leoClient.GetSyncMetadataAsync(_directoryId);
+            List<string> filesToDelete = new List<string>();
+
+            if (serverData?.Files != null)
+            {
+                foreach (var serverFile in serverData.Files)
+                {
+                    // Check if file path starts with folder path (including subfolder files)
+                    if (serverFile.FilePathInDirectory.StartsWith(folderRelativePath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        filesToDelete.Add(serverFile.FilePathInDirectory);
+                    }
+                }
+            }
+
+            LogFileWriter.LogMessage($"Found {filesToDelete.Count} files in folder to delete from server");
+
+            // Delete each file
+            int deleted = 0;
+            foreach (string relativePath in filesToDelete)
+            {
+                try
+                {
+                    bool success = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                    if (success)
+                    {
+                        deleted++;
+                        LogFileWriter.LogMessage($"Deleted file from deleted folder: {relativePath}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Failed to delete file {relativePath}: {ex.Message}");
+                    // Continue with other files
+                }
+            }
+
+            LogFileWriter.LogMessage($"DeleteFolder completed: {operation.OldPath} ({deleted}/{filesToDelete.Count} files deleted)");
+        }
+
+        /// <summary>
+        /// Process a MoveFolder operation - uploads files to new paths and deletes old paths
+        /// </summary>
+        private async Task ProcessMoveFolderOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessMoveFolderOperation: {operation.OldPath} → {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("MoveFolder operation missing OldPath or NewPath");
+            }
+
+            // Get new folder from vault
+            string newFolderFullPath = EnsureFullPath(vault, operation.NewPath);
+            IEdmFolder5 newFolder = vault.GetFolderFromPath(newFolderFullPath);
+
+            if (newFolder == null)
+            {
+                LogFileWriter.LogMessage($"Warning: New folder not found in vault: {operation.NewPath}");
+                return;
+            }
+
+            // Get all files in new folder location
+            List<string> oldFilePaths = new List<string>();
+            List<string> newFilePaths = new List<string>();
+
+            string oldFolderPath = EnsureFullPath(vault, operation.OldPath);
+            string newFolderPath = newFolder.LocalPath;
+
+            EnumerateFolderFilesRecursive(newFolder, oldFolderPath, newFolderPath, oldFilePaths, newFilePaths);
+
+            LogFileWriter.LogMessage($"Found {newFilePaths.Count} files to move");
+
+            // Process each file: upload new path, delete old path
+            int processed = 0;
+            for (int i = 0; i < newFilePaths.Count; i++)
+            {
+                try
+                {
+                    string oldFilePath = oldFilePaths[i];
+                    string newFilePath = newFilePaths[i];
+
+                    string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldFilePath);
+                    string newRelativePath = GetRelativePath(vault.RootFolderPath, newFilePath);
+
+                    // Upload file with new path
+                    await UpdateFilesToLeoAI(vault, new[] { newFilePath }, vault.RootFolderPath);
+                    LogFileWriter.LogMessage($"Uploaded file to new location: {newRelativePath}");
+
+                    // Delete old path
+                    bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
+                    if (deleted)
+                    {
+                        LogFileWriter.LogMessage($"Deleted old file path: {oldRelativePath}");
+                    }
+
+                    processed++;
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Failed to move file {oldFilePaths[i]}: {ex.Message}");
+                    // Continue with other files
+                }
+            }
+
+            LogFileWriter.LogMessage($"MoveFolder completed: {operation.OldPath} → {operation.NewPath} ({processed}/{newFilePaths.Count} files moved)");
+        }
+
+        /// <summary>
+        /// Process a RenameFolder operation - same as MoveFolder
+        /// </summary>
+        private async Task ProcessRenameFolderOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessRenameFolderOperation: {operation.OldPath} → {operation.NewPath}");
+            // Rename and Move folder operations are identical in implementation
+            await ProcessMoveFolderOperation(vault, operation);
         }
 
         /// <summary>
