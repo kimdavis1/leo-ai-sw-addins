@@ -245,23 +245,14 @@ namespace LeoAISwPdmAddIn
 
                     if (!string.IsNullOrEmpty(filePath) && IsProcessableFile(filePath))
                     {
-                        // Compute checksum for comparison with server
-                        string checkSum = null;
-                        try
-                        {
-                            var fileInfo = LeoFileInfo.GetFileInfo(filePath);
-                            checkSum = fileInfo.CheckSum;
-                        }
-                        catch (Exception csEx)
-                        {
-                            LogFileWriter.LogError($"Failed to compute checksum for {filePath}: {csEx.Message}");
-                        }
-
+                        // Store file with null checksum - will be calculated later by caller if needed
+                        // This is because checksum calculation requires archive access which
+                        // the helper class doesn't have (it's in LeoAiSyncTask)
                         var fileData = new FileData
                         {
                             file = filePath,
                             mimeType = LeoAIMemeType.GetMemeType(filePath),
-                            checkSum = checkSum,
+                            checkSum = null, // Will be calculated by caller using archive-first approach
                             children = new List<ChildData>()
                         };
 

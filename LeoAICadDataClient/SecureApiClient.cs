@@ -228,14 +228,25 @@ namespace LeoAICadDataClient
 
         public static string GetRelativePath(string rootPath, string targetPath)
         {
-            Uri rootUri = new Uri(rootPath.EndsWith(Path.DirectorySeparatorChar.ToString()) ? rootPath : rootPath + Path.DirectorySeparatorChar);
-            Uri targetUri = new Uri(targetPath);
-            Uri relativeUri = rootUri.MakeRelativeUri(targetUri);
+            // Use Path-based calculation instead of URI-based to avoid issues with spaces and special characters
+            // Normalize paths to ensure consistent comparison
+            string normalizedRoot = Path.GetFullPath(rootPath).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            string normalizedTarget = Path.GetFullPath(targetPath);
 
-            string relativePath = Uri.UnescapeDataString(relativeUri.ToString());
-            string finalPath = relativePath.Replace('/', Path.DirectorySeparatorChar);
-            Logger.Info($"Calculated relative path: '{finalPath}' from root: '{rootPath}' and target: '{targetPath}'");
-            return finalPath;
+            // Check if target starts with root
+            if (normalizedTarget.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                // Remove root from target to get relative path
+                string relativePath = normalizedTarget.Substring(normalizedRoot.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                Logger.Info($"Calculated relative path: '{relativePath}' from root: '{rootPath}' and target: '{targetPath}'");
+                return relativePath;
+            }
+            else
+            {
+                // If target doesn't start with root, return the target as-is (shouldn't happen in normal operation)
+                Logger.Info($"Target path does not start with root path. Root: '{rootPath}', Target: '{targetPath}'");
+                return targetPath;
+            }
         }
 
         public static string NormalizeFilePathForApi(string filePath)
@@ -306,39 +317,32 @@ namespace LeoAICadDataClient
             }
         }
 
-        public async Task<LeoAICadDataClient.Utilities.FileInfo> GetFileInfoByPathAsync(string directoryId, string relativePath, SyncMetadataResponse cachedSyncMetadata = null)
+        public async Task<LeoAICadDataClient.Utilities.FileInfo> GetFileInfoByPathAsync(string directoryId, string relativePath)
         {
             try
             {
                 Logger.Info($"GetFileInfoByPath: Attempting to find file '{relativePath}' in directory '{directoryId}'");
 
-                var syncMetadata = cachedSyncMetadata ?? await GetSyncMetadataAsync(directoryId);
+                // Fetch specific file using filepath_in_directory query parameter
+                string normalizedPath = NormalizeFilePathForApi(relativePath);
+                var syncMetadata = await GetSyncMetadataAsync(directoryId, normalizedPath);
 
-                if (syncMetadata == null || syncMetadata.Files == null)
+                if (syncMetadata == null || syncMetadata.Files == null || syncMetadata.Files.Count == 0)
                 {
-                    Logger.Error($"GetFileInfoByPath: Could not retrieve sync metadata for directory '{directoryId}'.");
+                    Logger.Info($"GetFileInfoByPath: File '{normalizedPath}' not found in directory '{directoryId}'.");
                     return null;
                 }
 
-                string normalizedApiRelativePath = NormalizeFilePathForApi(relativePath);
-                var syncFile = syncMetadata.Files.FirstOrDefault(f => NormalizeFilePathForApi(f.FilePathInDirectory) == normalizedApiRelativePath);
-
-                if (syncFile == null)
+                // Should return exactly one file
+                var file = syncMetadata.Files.FirstOrDefault();
+                Logger.Info($"GetFileInfoByPath: Successfully found file '{normalizedPath}'.");
+                return new LeoAICadDataClient.Utilities.FileInfo
                 {
-                    Logger.Info($"GetFileInfoByPath: File '{normalizedApiRelativePath}' not found in directory '{directoryId}'.");
-                    return null;
-                }
-                else
-                {
-                    Logger.Info($"GetFileInfoByPath: Successfully found file '{normalizedApiRelativePath}'.");
-                    return new LeoAICadDataClient.Utilities.FileInfo
-                    {
-                        ComponentId = syncFile.ComponentId,
-                        FilePathInDirectory = syncFile.FilePathInDirectory,
-                        CheckSum = syncFile.CheckSum,
-                        mimeType = syncFile.MimeType
-                    };
-                }
+                    ComponentId = file.ComponentId,
+                    FilePathInDirectory = file.FilePathInDirectory,
+                    CheckSum = file.CheckSum,
+                    mimeType = file.MimeType
+                };
             }
             catch (Exception ex)
             {
@@ -349,14 +353,30 @@ namespace LeoAICadDataClient
 
         public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId)
         {
+            return await GetSyncMetadataAsync(directoryId, null);
+        }
+
+        public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId, string filepathInDirectory)
+        {
             await RefreshTokenIfRequiredAsync();
 
             return await ExecuteWithRetryAsync(async () =>
             {
                 try
                 {
-                    Logger.Info($"GetSyncMetadata: Fetching sync metadata for directory {directoryId}");
-                    var response = await _httpClient.GetAsync($"api/v1/synced-directories/{directoryId}/files/sync-metadata");
+                    string url = $"api/v1/synced-directories/{directoryId}/files/sync-metadata";
+
+                    if (!string.IsNullOrEmpty(filepathInDirectory))
+                    {
+                        url += $"?filepath_in_directory={Uri.EscapeDataString(filepathInDirectory)}";
+                        Logger.Info($"GetSyncMetadata: Fetching sync metadata for specific file '{filepathInDirectory}' in directory {directoryId}");
+                    }
+                    else
+                    {
+                        Logger.Info($"GetSyncMetadata: Fetching all sync metadata for directory {directoryId}");
+                    }
+
+                    var response = await _httpClient.GetAsync(url);
                     var responseString = await response.Content.ReadAsStringAsync();
 
                     if (response.IsSuccessStatusCode)
@@ -380,7 +400,7 @@ namespace LeoAICadDataClient
                     Logger.Error($"GetSyncMetadata: Exception occurred: {ex.Message}");
                     throw;
                 }
-            }, $"GetSyncMetadata({directoryId})");
+            }, $"GetSyncMetadata({directoryId}, {filepathInDirectory ?? "all"})");
         }
 
         public async Task<bool> DeleteFileAsync(string directoryId, string filePathInDirectory)

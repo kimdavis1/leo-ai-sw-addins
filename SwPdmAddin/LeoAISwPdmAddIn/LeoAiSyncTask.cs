@@ -274,8 +274,31 @@ namespace LeoAISwPdmAddIn
                 {
                     LogFileWriter.LogMessage($"Reading metadata file: {Path.GetFileName(metadataFilePath)}");
 
-                    // Read the task metadata file
-                    string json = File.ReadAllText(metadataFilePath);
+                    // Read the task metadata file using PDM API (archive or local view)
+                    string json = null;
+                    if (File.Exists(metadataFilePath))
+                    {
+                        // File is in local view
+                        json = File.ReadAllText(metadataFilePath);
+                        LogFileWriter.LogMessage("Read metadata file from local view");
+                    }
+                    else
+                    {
+                        // File not in local view - get from archive using PDM API
+                        LogFileWriter.LogMessage("Metadata file not in local view, using GetReadableFilePath");
+                        string actualPath;
+                        bool needsCleanup;
+                        (actualPath, needsCleanup) = GetReadableFilePath(vault, metadataFilePath, metadataFolder.ID);
+
+                        json = File.ReadAllText(actualPath);
+                        LogFileWriter.LogMessage($"Read metadata file from: {actualPath}");
+
+                        // Clean up temp file if needed
+                        if (needsCleanup && !string.IsNullOrEmpty(actualPath))
+                        {
+                            DeleteTempFile(actualPath);
+                        }
+                    }
 
                     // Deserialize as UserSessionMetadata
                     taskMetadata = Newtonsoft.Json.JsonConvert.DeserializeObject<UserSessionMetadata>(json);
@@ -379,6 +402,10 @@ namespace LeoAISwPdmAddIn
                                 ProcessCompleteSyncOperation(vault, taskInstance).Wait();
                                 break;
 
+                            case "Copy":
+                                ProcessCopyOperation(vault, operation).Wait();
+                                break;
+
                             default:
                                 LogFileWriter.LogMessage($"Unknown operation type: {operation.Operation} - skipping");
                                 break;
@@ -429,6 +456,8 @@ namespace LeoAISwPdmAddIn
 
         /// <summary>
         /// Process an Upload operation from metadata
+        /// Checks if file exists on server, compares checksums, and handles accordingly
+        /// Always checks before upload regardless of operation type (upload, rename, move, replace, etc)
         /// </summary>
         private async Task ProcessUploadOperation(IEdmVault11 vault, OperationMetadata operation)
         {
@@ -439,14 +468,92 @@ namespace LeoAISwPdmAddIn
                 throw new Exception("Upload operation missing NewPath");
             }
 
-            if (!File.Exists(operation.NewPath))
+            // Check if file exists in vault using PDM API (not local view)
+            if (!FileExistsInVault(vault, operation.NewPath))
             {
-                throw new FileNotFoundException($"File not found: {operation.NewPath}");
+                throw new FileNotFoundException($"File not found in vault: {operation.NewPath}");
             }
 
             string relativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
-            LogFileWriter.LogMessage($"Uploading: {relativePath}");
+            LogFileWriter.LogMessage($"Processing upload for: {relativePath}");
 
+            // Always check if file exists on server and compare checksums
+            // This handles all cases: new files, updates, renames, moves, replaces, etc
+            LogFileWriter.LogMessage($"Checking if file exists on server: {relativePath}");
+
+            try
+            {
+                var serverFile = await _leoClient.GetFileInfoByPathAsync(_directoryId, relativePath);
+
+                if (serverFile != null)
+                {
+                    LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
+
+                    // Calculate local file checksum - use GetReadableFilePath to access from archive or temp copy
+                    string localChecksum = null;
+                    try
+                    {
+                        string fullPath = EnsureFullPath(vault, operation.NewPath);
+                        IEdmFolder5 folder;
+                        IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+
+                        if (file != null && folder != null)
+                        {
+                            string readablePath;
+                            bool needsCleanup;
+                            (readablePath, needsCleanup) = GetReadableFilePath(vault, operation.NewPath, folder.ID);
+
+                            var fileInfo = LeoFileInfo.GetFileInfo(readablePath);
+                            localChecksum = fileInfo.CheckSum;
+
+                            if (needsCleanup)
+                            {
+                                DeleteTempFile(readablePath);
+                            }
+                        }
+                    }
+                    catch (Exception csEx)
+                    {
+                        LogFileWriter.LogError($"Failed to compute checksum for {operation.NewPath}: {csEx.Message}");
+                        throw;
+                    }
+
+                    LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
+
+                    if (serverFile.CheckSum == localChecksum)
+                    {
+                        LogFileWriter.LogMessage($"File unchanged (checksums match) - skipping upload");
+                        // TODO: Check if metadata changed and update if needed
+                        return;
+                    }
+                    else
+                    {
+                        LogFileWriter.LogMessage($"File changed (checksums differ) - deleting old version before upload");
+
+                        // Delete the old version first
+                        bool deleted = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                        if (deleted)
+                        {
+                            LogFileWriter.LogMessage($"Deleted old version: {relativePath}");
+                        }
+                        else
+                        {
+                            LogFileWriter.LogMessage($"Warning: Failed to delete old version: {relativePath}");
+                        }
+                    }
+                }
+                else
+                {
+                    LogFileWriter.LogMessage($"File does not exist on server - uploading as new file");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogMessage($"Could not check server file (treating as new): {ex.Message}");
+            }
+
+            // Upload the file
+            LogFileWriter.LogMessage($"Uploading: {relativePath}");
             await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
 
             LogFileWriter.LogMessage($"Upload completed: {relativePath}");
@@ -485,40 +592,8 @@ namespace LeoAISwPdmAddIn
         private async Task ProcessRenameOperation(IEdmVault11 vault, OperationMetadata operation)
         {
             LogFileWriter.LogMessage($"ProcessRenameOperation: {operation.OldPath} → {operation.NewPath}");
-
-            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
-            {
-                throw new Exception("Rename operation missing OldPath or NewPath");
-            }
-
-            string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
-            string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
-
-            // Step 1: Upload file with new path
-            if (File.Exists(operation.NewPath))
-            {
-                LogFileWriter.LogMessage($"Uploading renamed file: {newRelativePath}");
-                await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
-                LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
-            }
-            else
-            {
-                LogFileWriter.LogMessage($"Warning: New path does not exist: {operation.NewPath}");
-            }
-
-            // Step 2: Delete old path from server
-            LogFileWriter.LogMessage($"Deleting old path: {oldRelativePath}");
-            bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
-            if (deleted)
-            {
-                LogFileWriter.LogMessage($"Deleted old path: {oldRelativePath}");
-            }
-            else
-            {
-                LogFileWriter.LogMessage($"Delete returned false for old path: {oldRelativePath}");
-            }
-
-            LogFileWriter.LogMessage($"Rename completed: {oldRelativePath} → {newRelativePath}");
+            // Rename and Move operations are identical in implementation
+            await ProcessRenameOrMoveOperation(vault, operation);
         }
 
         /// <summary>
@@ -528,29 +603,38 @@ namespace LeoAISwPdmAddIn
         private async Task ProcessMoveOperation(IEdmVault11 vault, OperationMetadata operation)
         {
             LogFileWriter.LogMessage($"ProcessMoveOperation: {operation.OldPath} → {operation.NewPath}");
+            // Rename and Move operations are identical in implementation
+            await ProcessRenameOrMoveOperation(vault, operation);
+        }
 
+        /// <summary>
+        /// Common implementation for Rename and Move operations
+        /// Upload new path first, then delete old path
+        /// </summary>
+        private async Task ProcessRenameOrMoveOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
             if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
             {
-                throw new Exception("Move operation missing OldPath or NewPath");
+                throw new Exception($"{operation.Operation} operation missing OldPath or NewPath");
             }
 
             string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
             string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
 
-            // Step 1: Upload file with new path
-            if (File.Exists(operation.NewPath))
+            // Step 1: Upload file with new path - check if file exists in vault using PDM API
+            if (FileExistsInVault(vault, operation.NewPath))
             {
-                LogFileWriter.LogMessage($"Uploading moved file: {newRelativePath}");
+                LogFileWriter.LogMessage($"Uploading file with new path: {newRelativePath}");
                 await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
                 LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
             }
             else
             {
-                LogFileWriter.LogMessage($"Warning: New path does not exist: {operation.NewPath}");
+                LogFileWriter.LogMessage($"Warning: File not found in vault: {operation.NewPath}");
             }
 
             // Step 2: Delete old path from server
-            LogFileWriter.LogMessage($"Deleting old path: {oldRelativePath}");
+            LogFileWriter.LogMessage($"Deleting old path from server: {oldRelativePath}");
             bool deleted = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
             if (deleted)
             {
@@ -561,7 +645,138 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"Delete returned false for old path: {oldRelativePath}");
             }
 
-            LogFileWriter.LogMessage($"Move completed: {oldRelativePath} → {newRelativePath}");
+            LogFileWriter.LogMessage($"{operation.Operation} completed: {oldRelativePath} → {newRelativePath}");
+        }
+
+        /// <summary>
+        /// Process a Copy operation from metadata
+        /// Checks if source and destination have same checksum, uploads only if different
+        /// </summary>
+        private async Task ProcessCopyOperation(IEdmVault11 vault, OperationMetadata operation)
+        {
+            LogFileWriter.LogMessage($"ProcessCopyOperation: {operation.OldPath} → {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("Copy operation missing OldPath or NewPath");
+            }
+
+            string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
+            string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
+
+            // Check if both files exist in vault
+            if (!FileExistsInVault(vault, operation.OldPath))
+            {
+                LogFileWriter.LogMessage($"Warning: Source file not found in vault: {operation.OldPath}");
+                return;
+            }
+
+            if (!FileExistsInVault(vault, operation.NewPath))
+            {
+                LogFileWriter.LogMessage($"Warning: Destination file not found in vault: {operation.NewPath}");
+                return;
+            }
+
+            // Calculate checksums for both files
+            string sourceChecksum = null;
+            string destChecksum = null;
+
+            try
+            {
+                // Get source file checksum - use GetReadableFilePath to access from archive or temp copy
+                string sourceFullPath = EnsureFullPath(vault, operation.OldPath);
+                IEdmFolder5 sourceFolder;
+                IEdmFile5 sourceFile = vault.GetFileFromPath(sourceFullPath, out sourceFolder);
+
+                if (sourceFile != null && sourceFolder != null)
+                {
+                    string readablePath;
+                    bool needsCleanup;
+                    (readablePath, needsCleanup) = GetReadableFilePath(vault, operation.OldPath, sourceFolder.ID);
+
+                    var sourceInfo = LeoFileInfo.GetFileInfo(readablePath);
+                    sourceChecksum = sourceInfo.CheckSum;
+                    LogFileWriter.LogMessage($"Source checksum: {sourceChecksum}");
+
+                    if (needsCleanup)
+                    {
+                        DeleteTempFile(readablePath);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to compute source checksum: {ex.Message}");
+                // If can't compute checksum, upload full file anyway
+            }
+
+            try
+            {
+                // Get destination file checksum - use GetReadableFilePath to access from archive or temp copy
+                string destFullPath = EnsureFullPath(vault, operation.NewPath);
+                IEdmFolder5 destFolder;
+                IEdmFile5 destFile = vault.GetFileFromPath(destFullPath, out destFolder);
+
+                if (destFile != null && destFolder != null)
+                {
+                    string readablePath;
+                    bool needsCleanup;
+                    (readablePath, needsCleanup) = GetReadableFilePath(vault, operation.NewPath, destFolder.ID);
+
+                    var destInfo = LeoFileInfo.GetFileInfo(readablePath);
+                    destChecksum = destInfo.CheckSum;
+                    LogFileWriter.LogMessage($"Destination checksum: {destChecksum}");
+
+                    if (needsCleanup)
+                    {
+                        DeleteTempFile(readablePath);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to compute destination checksum: {ex.Message}");
+                // If can't compute checksum, upload full file anyway
+            }
+
+            // Check if destination already exists on server
+            var serverFile = await _leoClient.GetFileInfoByPathAsync(_directoryId, newRelativePath);
+
+            // Case 1: Checksums match (source and dest are identical)
+            if (!string.IsNullOrEmpty(sourceChecksum) && sourceChecksum == destChecksum)
+            {
+                LogFileWriter.LogMessage($"Copy: checksums match ({destChecksum})");
+
+                if (serverFile != null && serverFile.CheckSum == destChecksum)
+                {
+                    // Destination already exists on server with matching checksum - nothing to do
+                    LogFileWriter.LogMessage($"Destination already exists on server with matching checksum - skipping");
+                    return;
+                }
+                else
+                {
+                    // Destination doesn't exist or has different checksum - upload location only (reuse existing file content)
+                    LogFileWriter.LogMessage($"Uploading destination location with checksum reference (no file content)");
+                    string destFullPath = EnsureFullPath(vault, operation.NewPath);
+                    await _leoClient.UpdateFileLocationAsync(_directoryId, vault.RootFolderPath, destFullPath, null);
+                    LogFileWriter.LogMessage($"Copy completed (location only): {oldRelativePath} → {newRelativePath}");
+                    return;
+                }
+            }
+
+            // Case 2: Checksums differ (source and dest have different content) - need to upload full file
+            LogFileWriter.LogMessage($"Copy: checksums differ - uploading full file content");
+
+            // If destination already exists, delete it first
+            if (serverFile != null)
+            {
+                LogFileWriter.LogMessage($"Destination exists on server - deleting before upload");
+                await _leoClient.DeleteFileAsync(_directoryId, newRelativePath);
+            }
+
+            // Upload destination file with full content
+            await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
+            LogFileWriter.LogMessage($"Copy completed (full upload): {oldRelativePath} → {newRelativePath}");
         }
 
         /// <summary>
@@ -580,6 +795,47 @@ namespace LeoAISwPdmAddIn
                 pdmHelper.ProcessFolders(vault);
                 List<FileData> vaultFiles = pdmHelper.FilesInfo;
                 LogFileWriter.LogMessage($"Found {vaultFiles.Count} files in vault");
+
+                taskInstance.SetProgressPos(35, "Calculating checksums...");
+
+                // Calculate checksums for all vault files using archive-first approach
+                int checksumProgress = 0;
+                foreach (var vaultFile in vaultFiles)
+                {
+                    try
+                    {
+                        string fullPath = EnsureFullPath(vault, vaultFile.file);
+                        IEdmFolder5 folder;
+                        IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+
+                        if (file != null && folder != null)
+                        {
+                            string readablePath;
+                            bool needsCleanup;
+                            (readablePath, needsCleanup) = GetReadableFilePath(vault, vaultFile.file, folder.ID);
+
+                            var fileInfo = LeoFileInfo.GetFileInfo(readablePath);
+                            vaultFile.checkSum = fileInfo.CheckSum;
+
+                            if (needsCleanup)
+                            {
+                                DeleteTempFile(readablePath);
+                            }
+                        }
+                    }
+                    catch (Exception csEx)
+                    {
+                        LogFileWriter.LogError($"Failed to compute checksum for {vaultFile.file}: {csEx.Message}");
+                        // Leave checksum as null - will be treated as changed
+                    }
+
+                    checksumProgress++;
+                    if (checksumProgress % 10 == 0)
+                    {
+                        int progress = 35 + (int)((checksumProgress / (float)vaultFiles.Count) * 5);
+                        taskInstance.SetProgressPos(progress, $"Calculated checksums for {checksumProgress}/{vaultFiles.Count} files");
+                    }
+                }
 
                 taskInstance.SetProgressPos(40, "Getting server state...");
 
@@ -606,23 +862,37 @@ namespace LeoAISwPdmAddIn
                 }
 
                 // Find files to upload (in vault but not on server, or changed)
-                List<string> filesToUpload = new List<string>();
+                List<string> newFilesToUpload = new List<string>();
+                List<string> modifiedFilesToUpload = new List<string>();
                 foreach (var vaultFile in vaultFiles)
                 {
                     string relativePath = GetRelativePath(vault.RootFolderPath, vaultFile.file);
                     if (!serverFiles.ContainsKey(relativePath))
                     {
-                        filesToUpload.Add(vaultFile.file);
+                        newFilesToUpload.Add(vaultFile.file);
                         LogFileWriter.LogMessage($"New file to upload: {relativePath}");
                     }
                     else
                     {
                         // Check if file changed (compare checksum)
                         var serverFile = serverFiles[relativePath];
-                        if (serverFile.CheckSum != vaultFile.checkSum)
+
+                        // Only compare if we successfully calculated checksum
+                        if (!string.IsNullOrEmpty(vaultFile.checkSum) && serverFile.CheckSum != vaultFile.checkSum)
                         {
-                            filesToUpload.Add(vaultFile.file);
-                            LogFileWriter.LogMessage($"Modified file to upload: {relativePath}");
+                            modifiedFilesToUpload.Add(vaultFile.file);
+                            LogFileWriter.LogMessage($"Modified file to upload: {relativePath} (server: {serverFile.CheckSum}, vault: {vaultFile.checkSum})");
+                        }
+                        else if (string.IsNullOrEmpty(vaultFile.checkSum))
+                        {
+                            // Couldn't calculate checksum - treat as modified to be safe
+                            modifiedFilesToUpload.Add(vaultFile.file);
+                            LogFileWriter.LogMessage($"Modified file to upload (no checksum): {relativePath}");
+                        }
+                        else
+                        {
+                            // Checksums match - skip
+                            LogFileWriter.LogMessage($"File unchanged (checksums match): {relativePath}");
                         }
                     }
                 }
@@ -638,20 +908,55 @@ namespace LeoAISwPdmAddIn
                     }
                 }
 
-                LogFileWriter.LogMessage($"Files to upload: {filesToUpload.Count}, Files to delete: {filesToDelete.Count}");
+                int totalFilesToUpload = newFilesToUpload.Count + modifiedFilesToUpload.Count;
+                LogFileWriter.LogMessage($"New files: {newFilesToUpload.Count}, Modified files: {modifiedFilesToUpload.Count}, Files to delete: {filesToDelete.Count}");
 
-                // Upload files
-                taskInstance.SetProgressPos(60, $"Uploading {filesToUpload.Count} files...");
+                // Delete modified files first (before uploading new versions)
+                if (modifiedFilesToUpload.Count > 0)
+                {
+                    taskInstance.SetProgressPos(55, $"Deleting {modifiedFilesToUpload.Count} modified files before re-upload...");
+                    int deletedModified = 0;
+                    foreach (var filePath in modifiedFilesToUpload)
+                    {
+                        try
+                        {
+                            string relativePath = GetRelativePath(vault.RootFolderPath, filePath);
+                            bool deleteSuccess = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                            if (deleteSuccess)
+                            {
+                                deletedModified++;
+                                LogFileWriter.LogMessage($"Deleted modified file before re-upload: {relativePath}");
+                            }
+                            else
+                            {
+                                LogFileWriter.LogMessage($"Warning: Failed to delete modified file: {relativePath}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogFileWriter.LogError($"Error deleting modified file {filePath}: {ex.Message}");
+                            // Continue with upload anyway
+                        }
+                    }
+                    LogFileWriter.LogMessage($"Deleted {deletedModified} modified files before re-upload");
+                }
+
+                // Upload all files (new + modified)
+                List<string> allFilesToUpload = new List<string>();
+                allFilesToUpload.AddRange(newFilesToUpload);
+                allFilesToUpload.AddRange(modifiedFilesToUpload);
+
+                taskInstance.SetProgressPos(60, $"Uploading {totalFilesToUpload} files...");
                 int uploaded = 0;
-                int uploadTotal = filesToUpload.Count > 0 ? filesToUpload.Count : 1;
-                foreach (var filePath in filesToUpload)
+                int uploadTotal = totalFilesToUpload > 0 ? totalFilesToUpload : 1;
+                foreach (var filePath in allFilesToUpload)
                 {
                     try
                     {
                         await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath);
                         uploaded++;
                         int progress = 60 + (int)((uploaded / (float)uploadTotal) * 20);
-                        taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{filesToUpload.Count} files");
+                        taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{totalFilesToUpload} files");
                     }
                     catch (Exception ex)
                     {
@@ -723,9 +1028,10 @@ namespace LeoAISwPdmAddIn
                     continue;
                 }
 
-                if (!File.Exists(localPath))
+                // Check if file exists in vault using PDM API (not local view)
+                if (!FileExistsInVault(vault, localPath))
                 {
-                    string errorMsg = $"File does not exist locally: {localPath}";
+                    string errorMsg = $"File not found in vault: {localPath}";
                     LogFileWriter.LogError(errorMsg);
                     throw new FileNotFoundException(errorMsg);
                 }
@@ -840,8 +1146,8 @@ namespace LeoAISwPdmAddIn
                     string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldPath);
                     string newRelativePath = GetRelativePath(vault.RootFolderPath, newPath);
 
-                    // Upload file with new path first
-                    if (File.Exists(newPath))
+                    // Upload file with new path first - check if exists in vault
+                    if (FileExistsInVault(vault, newPath))
                     {
                         await UpdateFilesToLeoAI(vault, new[] { newPath }, vault.RootFolderPath);
                         LogFileWriter.LogMessage($"Uploaded file with new path: {newRelativePath}");
@@ -925,8 +1231,8 @@ namespace LeoAISwPdmAddIn
                     string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldFilePath);
                     string newRelativePath = GetRelativePath(vault.RootFolderPath, newFilePath);
 
-                    // Upload with new path first
-                    if (File.Exists(newFilePath))
+                    // Upload with new path first - check if exists in vault
+                    if (FileExistsInVault(vault, newFilePath))
                     {
                         await UpdateFilesToLeoAI(vault, new[] { newFilePath }, vault.RootFolderPath);
                         LogFileWriter.LogMessage($"Uploaded: {newRelativePath}");
@@ -1254,9 +1560,12 @@ namespace LeoAISwPdmAddIn
 
                 try
                 {
+                    // Ensure we have full path for GetFileFromPath
+                    string fullPath = EnsureFullPath(vault, filePath);
+
                     // Get readable file path (archive or temp copy)
                     IEdmFolder5 folder;
-                    IEdmFile5 file = vault.GetFileFromPath(filePath, out folder);
+                    IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
 
                     if (file != null && folder != null)
                     {
@@ -1422,9 +1731,12 @@ namespace LeoAISwPdmAddIn
         {
             try
             {
+                // Ensure we have full path for GetFileFromPath
+                string fullPath = EnsureFullPath(vault, logicalPath);
+
                 // Get file object from vault
                 IEdmFolder5 folder;
-                IEdmFile5 file = vault.GetFileFromPath(logicalPath, out folder);
+                IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
 
                 if (file == null)
                 {
@@ -1491,6 +1803,130 @@ namespace LeoAISwPdmAddIn
                 return relative.Replace(Path.DirectorySeparatorChar, '/');
             }
             return fullPath.Replace(Path.DirectorySeparatorChar, '/');
+        }
+
+        /// <summary>
+        /// Checks if a file exists in the PDM vault (not in local view, but in vault archive/database)
+        /// This is safer than File.Exists() which only checks local view
+        /// Handles both full paths and relative paths/filenames by constructing full path if needed
+        /// </summary>
+        private bool FileExistsInVault(IEdmVault11 vault, string filePath)
+        {
+            try
+            {
+                string fullPath = filePath;
+
+                // If filePath is not absolute (just filename or relative path), construct full path
+                if (!Path.IsPathRooted(filePath))
+                {
+                    fullPath = Path.Combine(vault.RootFolderPath, filePath);
+                    LogFileWriter.LogMessage($"Constructed full path: {fullPath} from relative path: {filePath}");
+                }
+
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+                bool exists = file != null;
+
+                if (exists)
+                {
+                    LogFileWriter.LogMessage($"File exists in vault: {fullPath} (ID: {file.ID})");
+                }
+                else
+                {
+                    LogFileWriter.LogMessage($"File not found in vault: {fullPath}");
+                }
+
+                return exists;
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error checking file existence in vault for {filePath}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Ensures a file path is absolute (fully qualified) and uses the task host's vault root
+        /// Handles paths from different vault views (client local view vs task host local view)
+        /// If the path is relative, constructs full path by combining with task host's vault root
+        /// If the path is absolute but from a different vault view, extracts relative portion and recombines with task host's vault root
+        /// </summary>
+        private string EnsureFullPath(IEdmVault11 vault, string filePath)
+        {
+            string taskHostVaultRoot = vault.RootFolderPath;
+
+            // If path is not rooted, it's relative - just combine with vault root
+            if (!Path.IsPathRooted(filePath))
+            {
+                string fullPath = Path.Combine(taskHostVaultRoot, filePath);
+                LogFileWriter.LogMessage($"EnsureFullPath: Converted relative path '{filePath}' to absolute path '{fullPath}'");
+                return fullPath;
+            }
+
+            // Path is absolute - check if it starts with task host's vault root
+            if (filePath.StartsWith(taskHostVaultRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                // Path already uses task host's vault root - return as-is
+                LogFileWriter.LogMessage($"EnsureFullPath: Path already uses task host vault root: '{filePath}'");
+                return filePath;
+            }
+
+            // Path is absolute but uses different vault root (e.g., from client's local view)
+            // Need to extract the vault-relative portion and recombine with task host's vault root
+            LogFileWriter.LogMessage($"EnsureFullPath: Path uses different vault root: '{filePath}', task host root: '{taskHostVaultRoot}'");
+
+            // Try to find vault-relative path by looking for common vault structure
+            // Strategy: Use PDM API to get file by path, then reconstruct using task host's vault root
+            try
+            {
+                // Get file from vault using the provided path
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(filePath, out folder);
+
+                if (file != null && folder != null)
+                {
+                    // Success - get the path using task host's vault root
+                    string taskHostPath = file.GetLocalPath(folder.ID);
+                    LogFileWriter.LogMessage($"EnsureFullPath: Resolved via PDM API to task host path: '{taskHostPath}'");
+                    return taskHostPath;
+                }
+                else
+                {
+                    LogFileWriter.LogMessage($"EnsureFullPath: PDM API returned null - trying path extraction fallback");
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogMessage($"EnsureFullPath: PDM API lookup failed: {ex.Message} - trying path extraction fallback");
+            }
+
+            // Fallback: Extract vault-relative path by removing known vault root patterns
+            // Common pattern: C:\test_pro\ or C:\Users\...\test_pro\
+            // We need to find where the vault name portion starts
+            string vaultName = vault.Name;
+            int vaultNameIndex = filePath.IndexOf(vaultName, StringComparison.OrdinalIgnoreCase);
+
+            if (vaultNameIndex >= 0)
+            {
+                // Extract everything after "vaultName\"
+                int relativeStartIndex = vaultNameIndex + vaultName.Length;
+                if (relativeStartIndex < filePath.Length && (filePath[relativeStartIndex] == '\\' || filePath[relativeStartIndex] == '/'))
+                {
+                    relativeStartIndex++; // Skip the separator
+                }
+
+                if (relativeStartIndex < filePath.Length)
+                {
+                    string relativePath = filePath.Substring(relativeStartIndex);
+                    string reconstructedPath = Path.Combine(taskHostVaultRoot, relativePath);
+                    LogFileWriter.LogMessage($"EnsureFullPath: Extracted relative path '{relativePath}', reconstructed as '{reconstructedPath}'");
+                    return reconstructedPath;
+                }
+            }
+
+            // Last resort: use path as-is and hope for the best
+            LogFileWriter.LogMessage($"EnsureFullPath: Could not normalize path - using as-is: '{filePath}'");
+            return filePath;
         }
 
         #endregion

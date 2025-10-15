@@ -148,7 +148,24 @@ namespace Bundle.Core.CustomAction
             session.Log("Begin ShowCleanupPopup");
             string installFolder = session.CustomActionData["INSTALLFOLDER"];
             var cleanFolder = installFolder.TrimEnd('\\');
+
+            // Clear environment variable
             Environment.SetEnvironmentVariable("LEO_AUTH_KEY", null, EnvironmentVariableTarget.Machine);
+
+            // Delete LeoAuthKey.json file if it exists
+            string authKeyPath = Path.Combine(cleanFolder, "LeoAuthKey.json");
+            if (File.Exists(authKeyPath))
+            {
+                try
+                {
+                    File.Delete(authKeyPath);
+                    session.Log($"Deleted LeoAuthKey.json from: {authKeyPath}");
+                }
+                catch (Exception ex)
+                {
+                    session.Log($"WARNING: Could not delete LeoAuthKey.json: {ex.Message}");
+                }
+            }
 
             try
             {
@@ -372,10 +389,11 @@ namespace Bundle.Core.CustomAction
 
             try
             {
-                string destPath = Path.Combine(installFolder, Path.GetFileName(sourcePath));
+                // Always copy as "LeoAuthKey.json" regardless of source filename
+                string destPath = Path.Combine(installFolder, "LeoAuthKey.json");
                 session.Log($"Copying from '{sourcePath}' to '{destPath}'");
                 File.Copy(sourcePath, destPath, overwrite: true);
-                session.Log("JSON copy succeeded");
+                session.Log("JSON copy succeeded - file saved as LeoAuthKey.json");
 
                 return ActionResult.Success;
             }
