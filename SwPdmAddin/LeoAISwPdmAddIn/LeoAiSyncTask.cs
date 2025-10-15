@@ -537,15 +537,32 @@ namespace LeoAISwPdmAddIn
 
                     LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
 
-                    if (serverFile.CheckSum == localChecksum)
+                    // Check if file needs reupload
+                    bool needsReupload = false;
+                    string reason = "";
+
+                    if (serverFile.ParentStatus == "IN_ERROR")
                     {
-                        LogFileWriter.LogMessage($"File unchanged (checksums match) - skipping upload");
+                        needsReupload = true;
+                        reason = "file has IN_ERROR status";
+                        LogFileWriter.LogMessage($"File has IN_ERROR status - forcing reupload even though checksum may match");
+                    }
+                    else if (serverFile.CheckSum != localChecksum)
+                    {
+                        needsReupload = true;
+                        reason = "checksum changed";
+                    }
+
+                    if (!needsReupload && serverFile.CheckSum == localChecksum)
+                    {
+                        LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - skipping upload");
                         // TODO: Check if metadata changed and update if needed
                         return;
                     }
-                    else
+
+                    if (needsReupload)
                     {
-                        LogFileWriter.LogMessage($"File changed (checksums differ) - deleting old version before upload");
+                        LogFileWriter.LogMessage($"File changed ({reason}) - deleting old version before upload");
 
                         // Delete the old version first
                         bool deleted = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
@@ -978,11 +995,17 @@ namespace LeoAISwPdmAddIn
                     }
                     else
                     {
-                        // Check if file changed (compare checksum)
+                        // Check if file changed (compare checksum) or has IN_ERROR status
                         var serverFile = serverFiles[relativePath];
 
+                        // Check if file has IN_ERROR status - force reupload even if checksum matches
+                        if (serverFile.ParentStatus == "IN_ERROR")
+                        {
+                            modifiedFilesToUpload.Add(vaultFile.file);
+                            LogFileWriter.LogMessage($"Modified file to upload: {relativePath} (IN_ERROR status - forcing reupload)");
+                        }
                         // Only compare if we successfully calculated checksum
-                        if (!string.IsNullOrEmpty(vaultFile.checkSum) && serverFile.CheckSum != vaultFile.checkSum)
+                        else if (!string.IsNullOrEmpty(vaultFile.checkSum) && serverFile.CheckSum != vaultFile.checkSum)
                         {
                             modifiedFilesToUpload.Add(vaultFile.file);
                             LogFileWriter.LogMessage($"Modified file to upload: {relativePath} (server: {serverFile.CheckSum}, vault: {vaultFile.checkSum})");
@@ -1654,6 +1677,86 @@ namespace LeoAISwPdmAddIn
         {
             LogFileWriter.LogMessage($"Updating {filePaths.Length} files to Leo AI");
 
+            // Sort files by type: parts first, then assemblies, then other files
+            // This ensures dependencies exist before assemblies reference them
+            var sortedFiles = SortFilesByUploadOrder(filePaths);
+            LogFileWriter.LogMessage($"Upload order: {sortedFiles.partFiles.Length} parts, {sortedFiles.assemblyFiles.Length} assemblies, {sortedFiles.otherFiles.Length} other files");
+
+            // Upload parts first
+            await UploadFileGroup(vault, sortedFiles.partFiles, vaultRootPath, "Parts");
+
+            // Then assemblies
+            await UploadFileGroup(vault, sortedFiles.assemblyFiles, vaultRootPath, "Assemblies");
+
+            // Finally other files (PDFs, images, etc.)
+            await UploadFileGroup(vault, sortedFiles.otherFiles, vaultRootPath, "Other files");
+        }
+
+        /// <summary>
+        /// Sorts files into three groups for ordered upload: parts, assemblies, other
+        /// Parts are uploaded first so assemblies can reference them
+        /// Supports multiple CAD formats: SOLIDWORKS, Creo, NX, CATIA, etc.
+        /// </summary>
+        private (string[] partFiles, string[] assemblyFiles, string[] otherFiles) SortFilesByUploadOrder(string[] filePaths)
+        {
+            List<string> partFiles = new List<string>();
+            List<string> assemblyFiles = new List<string>();
+            List<string> otherFiles = new List<string>();
+
+            // Part file extensions (various CAD systems)
+            HashSet<string> partExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ".sldprt",  // SOLIDWORKS Part
+                ".prt",     // Creo/Pro-E Part, NX Part
+                ".par",     // Solid Edge Part
+                ".ipt",     // Inventor Part
+                ".catpart"  // CATIA Part
+            };
+
+            // Assembly file extensions (various CAD systems)
+            HashSet<string> assemblyExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ".sldasm",  // SOLIDWORKS Assembly
+                ".asm",     // Creo/Pro-E Assembly, NX Assembly
+                ".psm",     // Solid Edge Assembly
+                ".iam",     // Inventor Assembly
+                ".catproduct" // CATIA Product (Assembly)
+            };
+
+            foreach (string filePath in filePaths)
+            {
+                string extension = Path.GetExtension(filePath);
+
+                if (partExtensions.Contains(extension))
+                {
+                    partFiles.Add(filePath);
+                }
+                else if (assemblyExtensions.Contains(extension))
+                {
+                    assemblyFiles.Add(filePath);
+                }
+                else
+                {
+                    otherFiles.Add(filePath);
+                }
+            }
+
+            return (partFiles.ToArray(), assemblyFiles.ToArray(), otherFiles.ToArray());
+        }
+
+        /// <summary>
+        /// Uploads a group of files with proper error handling
+        /// </summary>
+        private async Task UploadFileGroup(IEdmVault11 vault, string[] filePaths, string vaultRootPath, string groupName)
+        {
+            if (filePaths.Length == 0)
+            {
+                LogFileWriter.LogMessage($"No files in group '{groupName}' to upload");
+                return;
+            }
+
+            LogFileWriter.LogMessage($"=== Uploading {groupName}: {filePaths.Length} files ===");
+
             foreach (string filePath in filePaths)
             {
                 string relativePath = GetRelativePath(vaultRootPath, filePath);
@@ -1705,6 +1808,8 @@ namespace LeoAISwPdmAddIn
                     }
                 }
             }
+
+            LogFileWriter.LogMessage($"=== Completed uploading {groupName} ===");
         }
 
         /// <summary>

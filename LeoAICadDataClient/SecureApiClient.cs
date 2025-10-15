@@ -341,7 +341,8 @@ namespace LeoAICadDataClient
                     ComponentId = file.ComponentId,
                     FilePathInDirectory = file.FilePathInDirectory,
                     CheckSum = file.CheckSum,
-                    mimeType = file.MimeType
+                    mimeType = file.MimeType,
+                    ParentStatus = file.ParentStatus
                 };
             }
             catch (Exception ex)
