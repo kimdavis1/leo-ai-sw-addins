@@ -1579,6 +1579,159 @@ namespace LeoAISwPdmAddIn
         #region Helper Methods (copied from SwPdmAddinMain)
 
         /// <summary>
+        /// Gets all file dependencies (references) for a given file
+        /// Returns a list of relative paths (checksums calculated later when uploading)
+        /// Uses recursive traversal of the PDM reference tree
+        /// </summary>
+        private List<string> GetFileDependencies(IEdmVault11 vault, string filePath, string vaultRootPath)
+        {
+            HashSet<string> dependencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            try
+            {
+                // Get file object from vault
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(filePath, out folder);
+
+                if (file == null || folder == null)
+                {
+                    LogFileWriter.LogMessage($"GetFileDependencies: File not found: {filePath}");
+                    return new List<string>();
+                }
+
+                // Get the reference tree for this file
+                IEdmReference10 referenceTree = (IEdmReference10)file.GetReferenceTree(folder.ID);
+
+                if (referenceTree == null)
+                {
+                    LogFileWriter.LogMessage($"GetFileDependencies: No reference tree for: {filePath}");
+                    return new List<string>();
+                }
+
+                // Recursively traverse the reference tree to collect dependency paths
+                TraverseReferences(vault, referenceTree, "", 0, true, vaultRootPath, dependencies);
+
+                LogFileWriter.LogMessage($"GetFileDependencies: Found {dependencies.Count} dependencies for {filePath}");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"GetFileDependencies failed for {filePath}: {ex.Message}");
+                // Return empty list - file will be uploaded without dependencies
+            }
+
+            return new List<string>(dependencies);
+        }
+
+        /// <summary>
+        /// Recursively traverses the PDM reference tree to extract all dependency paths
+        /// Filters out invalid references like weldment cut-list items
+        /// </summary>
+        private void TraverseReferences(IEdmVault11 vault, IEdmReference10 reference, string projectName, int level, bool isTop, string vaultRootPath, HashSet<string> dependencies)
+        {
+            try
+            {
+                if (isTop)
+                {
+                    // This is the root - skip adding it, just traverse children
+                    IEdmPos5 pos = reference.GetFirstChildPosition3(projectName, true, true, (int)EdmRefFlags.EdmRef_File, "", 0);
+
+                    while (!pos.IsNull)
+                    {
+                        IEdmReference10 childRef = (IEdmReference10)reference.GetNextChild(pos);
+                        if (childRef != null && !string.IsNullOrEmpty(childRef.FoundPath))
+                        {
+                            // Skip invalid references (e.g., weldment cut-list items, broken references)
+                            if (IsValidFileReference(childRef.FoundPath))
+                            {
+                                string relativePath = GetRelativePath(vaultRootPath, childRef.FoundPath);
+
+                                // Add dependency if not already added
+                                if (!dependencies.Contains(relativePath))
+                                {
+                                    dependencies.Add(relativePath);
+                                    LogFileWriter.LogMessage($"  Dependency (level {level}): {relativePath}");
+                                }
+
+                                // Recursively traverse this child's dependencies
+                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependencies);
+                            }
+                            else
+                            {
+                                LogFileWriter.LogMessage($"  Skipping invalid reference (level {level}): {childRef.FoundPath}");
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    // Process children of this reference
+                    IEdmPos5 pos = reference.GetFirstChildPosition3(projectName, false, true, (int)EdmRefFlags.EdmRef_File, "", 0);
+
+                    while (!pos.IsNull)
+                    {
+                        IEdmReference10 childRef = (IEdmReference10)reference.GetNextChild(pos);
+                        if (childRef != null && !string.IsNullOrEmpty(childRef.FoundPath))
+                        {
+                            // Skip invalid references (e.g., weldment cut-list items, broken references)
+                            if (IsValidFileReference(childRef.FoundPath))
+                            {
+                                string relativePath = GetRelativePath(vaultRootPath, childRef.FoundPath);
+
+                                // Add dependency if not already added
+                                if (!dependencies.Contains(relativePath))
+                                {
+                                    dependencies.Add(relativePath);
+                                    LogFileWriter.LogMessage($"  Dependency (level {level}): {relativePath}");
+                                }
+
+                                // Recursively traverse this child's dependencies
+                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependencies);
+                            }
+                            else
+                            {
+                                LogFileWriter.LogMessage($"  Skipping invalid reference (level {level}): {childRef.FoundPath}");
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"TraverseReferences failed at level {level}: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Checks if a file reference is valid (has a file extension and is not a cut-list item)
+        /// </summary>
+        private bool IsValidFileReference(string filePath)
+        {
+            if (string.IsNullOrEmpty(filePath))
+            {
+                return false;
+            }
+
+            // Check if it has a file extension
+            string extension = Path.GetExtension(filePath);
+            if (string.IsNullOrEmpty(extension))
+            {
+                // No extension = likely a cut-list item or broken reference
+                return false;
+            }
+
+            // Filter out known invalid references
+            string fileName = Path.GetFileName(filePath);
+
+            // Skip weldment cut-list items (typically named like "Cut-List-Item1", "Cut-List-Item2", etc.)
+            if (fileName.StartsWith("Cut-List-Item", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
         /// Deletes a metadata file from vault
         /// </summary>
         private void DeleteMetadataFile(IEdmVault11 vault, IEdmFile5 file, IEdmFolder5 folder)
@@ -1677,139 +1830,244 @@ namespace LeoAISwPdmAddIn
         {
             LogFileWriter.LogMessage($"Updating {filePaths.Length} files to Leo AI");
 
-            // Sort files by type: parts first, then assemblies, then other files
-            // This ensures dependencies exist before assemblies reference them
-            var sortedFiles = SortFilesByUploadOrder(filePaths);
-            LogFileWriter.LogMessage($"Upload order: {sortedFiles.partFiles.Length} parts, {sortedFiles.assemblyFiles.Length} assemblies, {sortedFiles.otherFiles.Length} other files");
+            // Track uploaded files to avoid re-uploading dependencies multiple times
+            HashSet<string> uploadedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Upload parts first
-            await UploadFileGroup(vault, sortedFiles.partFiles, vaultRootPath, "Parts");
-
-            // Then assemblies
-            await UploadFileGroup(vault, sortedFiles.assemblyFiles, vaultRootPath, "Assemblies");
-
-            // Finally other files (PDFs, images, etc.)
-            await UploadFileGroup(vault, sortedFiles.otherFiles, vaultRootPath, "Other files");
-        }
-
-        /// <summary>
-        /// Sorts files into three groups for ordered upload: parts, assemblies, other
-        /// Parts are uploaded first so assemblies can reference them
-        /// Supports multiple CAD formats: SOLIDWORKS, Creo, NX, CATIA, etc.
-        /// </summary>
-        private (string[] partFiles, string[] assemblyFiles, string[] otherFiles) SortFilesByUploadOrder(string[] filePaths)
-        {
-            List<string> partFiles = new List<string>();
-            List<string> assemblyFiles = new List<string>();
-            List<string> otherFiles = new List<string>();
-
-            // Part file extensions (various CAD systems)
-            HashSet<string> partExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ".sldprt",  // SOLIDWORKS Part
-                ".prt",     // Creo/Pro-E Part, NX Part
-                ".par",     // Solid Edge Part
-                ".ipt",     // Inventor Part
-                ".catpart"  // CATIA Part
-            };
-
-            // Assembly file extensions (various CAD systems)
-            HashSet<string> assemblyExtensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                ".sldasm",  // SOLIDWORKS Assembly
-                ".asm",     // Creo/Pro-E Assembly, NX Assembly
-                ".psm",     // Solid Edge Assembly
-                ".iam",     // Inventor Assembly
-                ".catproduct" // CATIA Product (Assembly)
-            };
-
+            // Upload each file with its dependencies (dependencies uploaded first, recursively)
             foreach (string filePath in filePaths)
             {
-                string extension = Path.GetExtension(filePath);
-
-                if (partExtensions.Contains(extension))
-                {
-                    partFiles.Add(filePath);
-                }
-                else if (assemblyExtensions.Contains(extension))
-                {
-                    assemblyFiles.Add(filePath);
-                }
-                else
-                {
-                    otherFiles.Add(filePath);
-                }
-            }
-
-            return (partFiles.ToArray(), assemblyFiles.ToArray(), otherFiles.ToArray());
-        }
-
-        /// <summary>
-        /// Uploads a group of files with proper error handling
-        /// </summary>
-        private async Task UploadFileGroup(IEdmVault11 vault, string[] filePaths, string vaultRootPath, string groupName)
-        {
-            if (filePaths.Length == 0)
-            {
-                LogFileWriter.LogMessage($"No files in group '{groupName}' to upload");
-                return;
-            }
-
-            LogFileWriter.LogMessage($"=== Uploading {groupName}: {filePaths.Length} files ===");
-
-            foreach (string filePath in filePaths)
-            {
-                string relativePath = GetRelativePath(vaultRootPath, filePath);
-                LogFileWriter.LogMessage($"Processing: {relativePath}");
-
-                string actualFilePath = null;
-                bool needsCleanup = false;
-
                 try
                 {
-                    // Ensure we have full path for GetFileFromPath
-                    string fullPath = EnsureFullPath(vault, filePath);
-
-                    // Get readable file path (archive or temp copy)
-                    IEdmFolder5 folder;
-                    IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
-
-                    if (file != null && folder != null)
-                    {
-                        (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
-                        LogFileWriter.LogMessage($"File path for upload: {actualFilePath} (cleanup: {needsCleanup})");
-                    }
-                    else
-                    {
-                        // Fallback: use the provided path directly
-                        actualFilePath = filePath;
-                        LogFileWriter.LogMessage($"Could not get file from vault, using path directly: {actualFilePath}");
-                    }
-
-                    // CreateFileAsync handles both create and update (with automatic retry for rate limits)
-                    var fileInfo = await _leoClient.CreateFileAsync(_directoryId, vaultRootPath, filePath, actualFilePath, null);
-
-                    if (fileInfo != null)
-                    {
-                        LogFileWriter.LogMessage($"File synced to server: {relativePath} (ID: {fileInfo.ComponentId})");
-                    }
+                    await UploadFileWithDependencies(vault, filePath, vaultRootPath, uploadedFiles);
                 }
                 catch (Exception ex)
                 {
-                    LogFileWriter.LogError($"Failed to update file {filePath}: {ex.Message}");
-                    throw new Exception($"Failed to sync file {relativePath}: {ex.Message}", ex);
+                    LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+                    throw; // Propagate error to fail the operation
                 }
-                finally
+            }
+
+            LogFileWriter.LogMessage($"Uploaded {uploadedFiles.Count} unique files (including dependencies)");
+        }
+
+        /// <summary>
+        /// Recursively uploads a file and all its dependencies
+        /// Dependencies are uploaded first before the file that depends on them
+        /// Uses uploadedFiles set to track what's been uploaded and avoid duplicates
+        /// </summary>
+        private async Task UploadFileWithDependencies(IEdmVault11 vault, string filePath, string vaultRootPath, HashSet<string> uploadedFiles)
+        {
+            string relativePath = GetRelativePath(vaultRootPath, filePath);
+
+            // Check if already uploaded - if so, skip everything (no need to process dependencies or upload)
+            if (uploadedFiles.Contains(relativePath))
+            {
+                LogFileWriter.LogMessage($"File already uploaded, skipping: {relativePath}");
+                return;
+            }
+
+            LogFileWriter.LogMessage($"=== Processing file: {relativePath} ===");
+
+            // Get dependencies for this file (just paths, no checksums yet)
+            List<string> dependencyPaths = GetFileDependencies(vault, filePath, vaultRootPath);
+
+            // If file has dependencies, upload them first (recursively)
+            if (dependencyPaths.Count > 0)
+            {
+                LogFileWriter.LogMessage($"File has {dependencyPaths.Count} dependencies - uploading dependencies first");
+
+                foreach (var depRelativePath in dependencyPaths)
                 {
-                    // Clean up temp file if needed
-                    if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
+                    // Skip if already uploaded - the recursive call will handle this check too
+                    if (uploadedFiles.Contains(depRelativePath))
                     {
-                        DeleteTempFile(actualFilePath);
+                        LogFileWriter.LogMessage($"  Dependency already uploaded, skipping: {depRelativePath}");
+                        continue;
+                    }
+
+                    // Convert relative path back to full path for recursive call
+                    string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
+
+                    try
+                    {
+                        // Recursively upload this dependency (and its dependencies)
+                        // The recursive call will skip if already in uploadedFiles set
+                        await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log error but continue - missing dependencies shouldn't fail the entire operation
+                        LogFileWriter.LogError($"Failed to upload dependency {depRelativePath}: {ex.Message}");
+                        LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
                     }
                 }
             }
 
-            LogFileWriter.LogMessage($"=== Completed uploading {groupName} ===");
+            // Build dependency dictionary with checksums for files that were uploaded
+            // Dictionary format: Key = checksum, Value = filePath (for ChildData constructor)
+            Dictionary<string, string> dependenciesWithChecksums = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var depRelativePath in dependencyPaths)
+            {
+                // Only include dependencies that were successfully uploaded
+                if (uploadedFiles.Contains(depRelativePath))
+                {
+                    try
+                    {
+                        // Get checksum from uploaded file
+                        string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
+                        string checksum = await GetFileChecksumForDependency(vault, depFullPath);
+                        if (!string.IsNullOrEmpty(checksum))
+                        {
+                            // Key = checksum, Value = filePath (required for ChildData constructor)
+                            dependenciesWithChecksums[checksum] = depRelativePath;
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log error but continue - skip this dependency
+                        LogFileWriter.LogError($"Failed to get checksum for dependency {depRelativePath}: {ex.Message}");
+                    }
+                }
+            }
+
+            // Now upload the file itself (with dependency info)
+            await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums);
+
+            // Mark as uploaded
+            uploadedFiles.Add(relativePath);
+            LogFileWriter.LogMessage($"File uploaded successfully: {relativePath}");
+        }
+
+        /// <summary>
+        /// Gets the checksum for a dependency file (reuses existing LeoFileInfo.GetFileInfo)
+        /// Deletes temp file immediately after getting checksum if it was copied to local view
+        /// </summary>
+        private Task<string> GetFileChecksumForDependency(IEdmVault11 vault, string filePath)
+        {
+            try
+            {
+                string fullPath = EnsureFullPath(vault, filePath);
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+
+                if (file != null && folder != null)
+                {
+                    string readablePath;
+                    bool needsCleanup;
+                    (readablePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
+
+                    // Reuse existing LeoFileInfo.GetFileInfo to calculate checksum
+                    var fileInfo = LeoFileInfo.GetFileInfo(readablePath);
+                    string checksum = fileInfo.CheckSum;
+
+                    // Delete temp file immediately after getting checksum
+                    // Only delete if we copied it from archive (needsCleanup = true)
+                    if (needsCleanup && !string.IsNullOrEmpty(readablePath))
+                    {
+                        try
+                        {
+                            DeleteTempFile(readablePath);
+                            LogFileWriter.LogMessage($"Deleted temp file after checksum: {readablePath}");
+                        }
+                        catch (Exception delEx)
+                        {
+                            LogFileWriter.LogError($"Failed to delete temp file {readablePath}: {delEx.Message}");
+                        }
+                    }
+
+                    return Task.FromResult(checksum);
+                }
+
+                return Task.FromResult<string>(null);
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"GetFileChecksumForDependency failed for {filePath}: {ex.Message}");
+                return Task.FromResult<string>(null);
+            }
+        }
+
+        /// <summary>
+        /// Uploads a single file with proper error handling and dependency information
+        /// Deletes temp file immediately after upload if it was copied to local view
+        /// </summary>
+        private async Task UploadSingleFile(IEdmVault11 vault, string filePath, string vaultRootPath, Dictionary<string, string> dependencies)
+        {
+            string relativePath = GetRelativePath(vaultRootPath, filePath);
+            LogFileWriter.LogMessage($"Uploading file: {relativePath}");
+
+            string actualFilePath = null;
+            bool needsCleanup = false;
+
+            try
+            {
+                // Ensure we have full path for GetFileFromPath
+                string fullPath = EnsureFullPath(vault, filePath);
+
+                // Get readable file path (archive or temp copy)
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+
+                if (file != null && folder != null)
+                {
+                    (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
+                    LogFileWriter.LogMessage($"File path for upload: {actualFilePath} (cleanup: {needsCleanup})");
+                }
+                else
+                {
+                    // Fallback: use the provided path directly
+                    actualFilePath = filePath;
+                    LogFileWriter.LogMessage($"Could not get file from vault, using path directly: {actualFilePath}");
+                }
+
+                // CreateFileAsync handles both create and update (with automatic retry for rate limits)
+                // Pass dependencies dictionary - will be converted to proper format and sent to server
+                var fileInfo = await _leoClient.CreateFileAsync(_directoryId, vaultRootPath, filePath, actualFilePath, dependencies);
+
+                if (fileInfo != null)
+                {
+                    LogFileWriter.LogMessage($"File synced to server: {relativePath} (ID: {fileInfo.ComponentId})");
+                    if (dependencies != null && dependencies.Count > 0)
+                    {
+                        LogFileWriter.LogMessage($"  With {dependencies.Count} dependencies attached");
+                    }
+                }
+
+                // Delete temp file immediately after successful upload
+                // Only delete if we copied it from archive (needsCleanup = true)
+                if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
+                {
+                    try
+                    {
+                        DeleteTempFile(actualFilePath);
+                        LogFileWriter.LogMessage($"Deleted temp file after upload: {actualFilePath}");
+                    }
+                    catch (Exception delEx)
+                    {
+                        LogFileWriter.LogError($"Failed to delete temp file {actualFilePath}: {delEx.Message}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+
+                // Still try to clean up temp file even if upload failed
+                if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
+                {
+                    try
+                    {
+                        DeleteTempFile(actualFilePath);
+                        LogFileWriter.LogMessage($"Deleted temp file after failed upload: {actualFilePath}");
+                    }
+                    catch (Exception delEx)
+                    {
+                        LogFileWriter.LogError($"Failed to delete temp file {actualFilePath}: {delEx.Message}");
+                    }
+                }
+
+                throw new Exception($"Failed to sync file {relativePath}: {ex.Message}", ex);
+            }
         }
 
         /// <summary>

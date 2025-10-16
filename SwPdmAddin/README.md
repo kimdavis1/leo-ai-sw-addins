@@ -6,14 +6,57 @@
 You can use the pre-built MSI installer or build it yourself. [Prebuilt installers are available for download here.](https://github.com/kimdavis1/leo-ai-sw-addins/blob/main/SwPdmAddin/LeoAISetUp/LeoAISetUp.msi)
 
 1. Run the `LeoAISetUp.msi` file as Administrator.
-2. The add-in and all required files will be installed to:
+2. The add-in files will be installed to:
    - `C:\Program Files\LeoAISwPdmAddIn`
-3. The installer will automatically register the add-in with your PDM vault(s). No further manual steps are required.
+3. Follow the manual configuration steps below to complete the installation.
 
-### Step 2: Verification
+### Step 2: Add Task Add-in to PDM Vault
+1. Open **PDM Administration** and connect to your vault.
+2. Navigate to **Add-ins** in the vault tree.
+3. Right-click on **Add-ins** and select **New Add-in**.
+4. Browse to `C:\Program Files\LeoAISwPdmAddIn` and select the following files:
+   - `LeoAISwPdmTaskAddIn.dll`
+   - `LeoAICadDataClient.dll`
+5. Click **Open** to register the task add-in.
+6. Approve different windows.
+
+
+### Step 3: Configure Task Host
+1. In **PDM Administration**, right click on the vualt and choose **explore**.
+2. In the PDM valut explorer, choose the **Tools** menu, and click on **Task Host Configuration**.
+3. Click on the **prmit** check box for the Leo AI Sync Task.
+4. Click **OK**.
+
+### Step 4: Create and Assign Task
+1. In **PDM Administration** relevant vualt droplist, Right click on **Tasks** and choose **New Task...**.
+2. For **task name**, type in **Leo AI Sync Task**.
+3. For **Add-in**, choose **Leo AI Sync Task** from the drop list.
+4. For **Execute task as user**, choose **Admin** and type in password.
+5. For **Number of retries on failure**, fill in 3.
+6. Click on **Execution Method** tab (Or just **Next** button which should take you to the same window)
+7. Choose the task host you configured in step 3.
+8. Click **OK**.
+
+### Step 5: Add Client Add-in to PDM Vault
+1. Still in **PDM Administration**, right-click on **Add-ins** and select **New Add-in**.
+2. Browse to `C:\Program Files\LeoAISwPdmAddIn` and select the following files:
+   - `LeoAISwPdmAddIn.dll`
+   - `LeoAICadDataClient.dll`
+3. Click **Open** to register the client add-in.
+4. Approve different windows.
+
+### Step 6: Trigger Initial Sync
+1. In the **Add-in**, left click on the **LeoAISwPdmAddIn** and click on Initiate complete sync button from menu.
+2. Click on **Tasks**, click on **Task List** where you should see a task running for the initial sync.
+4. Wait for the initial sync to complete.
+
+### Step 7: Verification
 After installation:
-1. Open PDM Administrator and connect to your vault.
-2. Navigate to Add-ins in the vault tree. The LeoAI add-in should be visible under your vault's add-ins.
+1. Check **PDM Administration** → **Add-ins** - you should see both:
+   - **LeoAISolidWorksPDMAdddIn** (client add-in)
+   - **Leo AI Sync Task** (task add-in)
+2. Check **Task Host Computers** - your computer should be listed.
+3. Check **Tasks** → **Leo AI Sync Task** - it should be assigned to your task host.
 
 ---
 

@@ -375,17 +375,12 @@ namespace Bundle.Core.CustomAction
 
             string sourcePath = session.CustomActionData["SELECTED_FILE"];
             string installFolder = session.CustomActionData["INSTALLFOLDER"];
-            string fullPath = Path.Combine(installFolder, sourcePath);
-
 
             if (string.IsNullOrEmpty(sourcePath) || !File.Exists(sourcePath))
             {
                 session.Log("No valid JSONFILE to copy.");
                 return ActionResult.Failure;
             }
-
-            Environment.SetEnvironmentVariable("LEO_AUTH_KEY", fullPath, EnvironmentVariableTarget.Machine);
-
 
             try
             {
@@ -395,11 +390,21 @@ namespace Bundle.Core.CustomAction
                 File.Copy(sourcePath, destPath, overwrite: true);
                 session.Log("JSON copy succeeded - file saved as LeoAuthKey.json");
 
+                // Set environment variable to point to the copied file location (not the original source)
+                Environment.SetEnvironmentVariable("LEO_AUTH_KEY", destPath, EnvironmentVariableTarget.Machine);
+                session.Log($"Set LEO_AUTH_KEY environment variable to: {destPath}");
+
                 return ActionResult.Success;
             }
             catch (Exception ex)
             {
                 session.Log($"ERROR copying JSON: {ex}");
+
+                // Fallback: point to original source location if copy failed
+                session.Log($"Falling back to original source location: {sourcePath}");
+                Environment.SetEnvironmentVariable("LEO_AUTH_KEY", sourcePath, EnvironmentVariableTarget.Machine);
+                session.Log($"Set LEO_AUTH_KEY environment variable to original location: {sourcePath}");
+
                 return ActionResult.Failure;
             }
         }
