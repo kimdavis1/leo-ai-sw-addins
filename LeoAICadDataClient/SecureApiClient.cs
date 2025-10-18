@@ -183,6 +183,13 @@ namespace LeoAICadDataClient
                     string relativePath = GetRelativePath(vaultPath, logicalFilePath); // Use logical path for API
                     string memeType = LeoAIMemeType.GetMemeType(logicalFilePath); // Use logical path for extension
 
+                    // Log API request parameters
+                    Logger.Info($"[API CALL] CreateFile: path={NormalizeFilePathForApi(relativePath)}, checksum={fInfo.CheckSum}, mimeType={memeType}, hasFileContent=true");
+                    if (childInfos != null && childInfos.Count > 0)
+                    {
+                        Logger.Info($"[API CALL] CreateFile dependencies: {JsonConvert.SerializeObject(childInfos)}");
+                    }
+
                     using (var content = new MultipartFormDataContent())
                     {
                         content.Add(new StringContent(memeType), "mimeType");
@@ -257,64 +264,80 @@ namespace LeoAICadDataClient
         public async Task<string> CreateDirectoryAsync(string machineId, string uri)
         {
             await RefreshTokenIfRequiredAsync();
-            try
+
+            return await ExecuteWithRetryAsync(async () =>
             {
-                if (!LeoAIDataUtilities.IsValidMacAddressFormat(machineId))
+                try
                 {
-                    Logger.Error($"Invalid MAC address format: {machineId}. Expected format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX");
-                    return string.Empty;
+                    if (!LeoAIDataUtilities.IsValidMacAddressFormat(machineId))
+                    {
+                        Logger.Error($"Invalid MAC address format: {machineId}. Expected format: XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX");
+                        return string.Empty;
+                    }
+
+                    Logger.Info($"Creating directory for machine: {machineId}, uri: {uri}");
+                    var jsonPayload = JsonConvert.SerializeObject(new { machineId, uri });
+                    var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
+
+                    var response = await _httpClient.PostAsync("api/v1/synced-directories", content);
+                    var responseString = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var project = JsonConvert.DeserializeObject<ProjectData>(responseString);
+                        Logger.Info($"Directory created successfully with ID: {project.Id}");
+                        return project.Id;
+                    }
+                    else
+                    {
+                        Logger.Error($"Failed to create directory. Status: {response.StatusCode}, Response: {responseString}");
+                        if ((int)response.StatusCode == 429)
+                        {
+                            throw new Exception($"Rate limit (429): {responseString}");
+                        }
+                        return string.Empty;
+                    }
                 }
-
-                Logger.Info($"Creating directory for machine: {machineId}, uri: {uri}");
-                var jsonPayload = JsonConvert.SerializeObject(new { machineId, uri });
-                var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
-
-                var response = await _httpClient.PostAsync("api/v1/synced-directories", content);
-                var responseString = await response.Content.ReadAsStringAsync();
-
-                if (response.IsSuccessStatusCode)
+                catch (Exception ex)
                 {
-                    var project = JsonConvert.DeserializeObject<ProjectData>(responseString);
-                    Logger.Info($"Directory created successfully with ID: {project.Id}");
-                    return project.Id;
+                    Logger.Error($"CreateDirectory failed: {ex.Message}");
+                    throw;
                 }
-                else
-                {
-                    Logger.Error($"Failed to create directory. Status: {response.StatusCode}, Response: {responseString}");
-                    return string.Empty;
-                }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"CreateDirectory failed: {ex.Message}");
-                return string.Empty;
-            }
+            }, $"CreateDirectory({machineId})");
         }
 
         public async Task<List<LeoDirectoryInfo>> GetDirectoryInfoAsync(string machineId)
         {
             await RefreshTokenIfRequiredAsync();
-            try
-            {
-                Logger.Info($"GetDirectoryInfo: Starting to fetch directory info for machine {machineId}");
-                var response = await _httpClient.GetAsync("api/v1/synced-directories");
-                var responseString = await response.Content.ReadAsStringAsync();
 
-                if (response.IsSuccessStatusCode)
-                {
-                    return JsonConvert.DeserializeObject<List<LeoDirectoryInfo>>(responseString);
-                }
-                else
-                {
-                    Logger.Error($"GetDirectoryInfo failed. Status: {response.StatusCode}, Response: {responseString}");
-                    return null;
-                }
-            }
-            catch (Exception ex)
+            return await ExecuteWithRetryAsync(async () =>
             {
-                Logger.Error($"Error in GetDirectoryInfo: {ex.Message}");
-                return null;
-            }
+                try
+                {
+                    Logger.Info($"GetDirectoryInfo: Starting to fetch directory info for machine {machineId}");
+                    var response = await _httpClient.GetAsync("api/v1/synced-directories");
+                    var responseString = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        return JsonConvert.DeserializeObject<List<LeoDirectoryInfo>>(responseString);
+                    }
+                    else
+                    {
+                        Logger.Error($"GetDirectoryInfo failed. Status: {response.StatusCode}, Response: {responseString}");
+                        if ((int)response.StatusCode == 429)
+                        {
+                            throw new Exception($"Rate limit (429): {responseString}");
+                        }
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Error in GetDirectoryInfo: {ex.Message}");
+                    throw;
+                }
+            }, $"GetDirectoryInfo({machineId})");
         }
 
         public async Task<LeoAICadDataClient.Utilities.FileInfo> GetFileInfoByPathAsync(string directoryId, string relativePath)
@@ -336,7 +359,8 @@ namespace LeoAICadDataClient
                 // Should return exactly one file
                 var file = syncMetadata.Files.FirstOrDefault();
                 Logger.Info($"GetFileInfoByPath: Successfully found file '{normalizedPath}'.");
-                return new LeoAICadDataClient.Utilities.FileInfo
+
+                var fileInfo = new LeoAICadDataClient.Utilities.FileInfo
                 {
                     ComponentId = file.ComponentId,
                     FilePathInDirectory = file.FilePathInDirectory,
@@ -344,6 +368,9 @@ namespace LeoAICadDataClient
                     mimeType = file.MimeType,
                     ParentStatus = file.ParentStatus
                 };
+
+                Logger.Info($"[API RESPONSE] GetFileInfoByPath: componentId={fileInfo.ComponentId}, checksum={fileInfo.CheckSum}, parentStatus={fileInfo.ParentStatus}, path={fileInfo.FilePathInDirectory}");
+                return fileInfo;
             }
             catch (Exception ex)
             {
@@ -416,6 +443,7 @@ namespace LeoAICadDataClient
                     string encodedFilePath = Uri.EscapeDataString(normalizedPath);
                     string requestUri = $"api/v1/synced-directories/{directoryId}/files?filePathInDirectory={encodedFilePath}";
 
+                    Logger.Info($"[API CALL] DeleteFile: path={normalizedPath}, directoryId={directoryId}");
                     Logger.Info($"Sending DELETE request to: {requestUri}");
 
                     var response = await _httpClient.DeleteAsync(requestUri);
@@ -445,77 +473,110 @@ namespace LeoAICadDataClient
             }, $"DeleteFile({filePathInDirectory})");
         }
 
-        public async Task<LeoAICadDataClient.Utilities.FileInfo> UpdateFileLocationAsync(string directoryId, string vaultPath, string filePath, Dictionary<string, string> childInfos = null)
+        /// <summary>
+        /// Updates file location (move/rename) - sends checksum to identify the file but NOT the file content
+        /// Backend uses checksum to attach new path to existing file
+        /// checksum: The checksum from the OLD file location (to identify which file to update)
+        /// </summary>
+        public async Task<LeoAICadDataClient.Utilities.FileInfo> UpdateFileLocationAsync(string directoryId, string vaultPath, string filePath, string checksum, Dictionary<string, string> childInfos = null)
         {
             await RefreshTokenIfRequiredAsync();
-            try
+
+            return await ExecuteWithRetryAsync(async () =>
             {
-                Logger.Info($"Attempting to update file location: {filePath} in directory: {directoryId}");
-                LeoFileInfo.LeoFileInformation fInfo = LeoFileInfo.GetFileInfo(filePath);
-                string relativePath = GetRelativePath(vaultPath, filePath);
-                string mimeType = LeoAIMemeType.GetMemeType(filePath);
-
-                using (var content = new MultipartFormDataContent())
+                try
                 {
-                    content.Add(new StringContent(mimeType), "mimeType");
-                    content.Add(new StringContent(fInfo.CheckSum), "checkSum");
-                    content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
+                    Logger.Info($"Attempting to update file location: {filePath} in directory: {directoryId}");
 
+                    // For move/rename: use the provided checksum (from old file) to identify the file on server
+                    // Do NOT calculate new checksum - we already compared checksums earlier
+                    string relativePath = GetRelativePath(vaultPath, filePath);
+                    string mimeType = LeoAIMemeType.GetMemeType(filePath);
+
+                    // Log API request parameters
+                    Logger.Info($"[API CALL] UpdateFileLocation: path={NormalizeFilePathForApi(relativePath)}, checksum={checksum}, mimeType={mimeType}, hasFileContent=false");
                     if (childInfos != null && childInfos.Count > 0)
                     {
-                        var childDatas = childInfos.Select(kvp => new ChildData(kvp.Key, kvp.Value)).ToList();
-                        content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
+                        Logger.Info($"[API CALL] UpdateFileLocation dependencies: {JsonConvert.SerializeObject(childInfos)}");
                     }
 
-                    var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content);
-                    var responseString = await response.Content.ReadAsStringAsync();
+                    using (var content = new MultipartFormDataContent())
+                    {
+                        content.Add(new StringContent(mimeType), "mimeType");
+                        content.Add(new StringContent(checksum), "checkSum");
+                        content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
 
-                    if (response.IsSuccessStatusCode)
-                    {
-                        Logger.Info($"Successfully updated file location: {filePath}");
-                        return JsonConvert.DeserializeObject<LeoAICadDataClient.Utilities.FileInfo>(responseString);
-                    }
-                    else
-                    {
-                        Logger.Error($"Failed to update file location: {filePath}. Status: {response.StatusCode}, Response: {responseString}");
-                        return null;
+                        // NOTE: We send checkSum so backend can identify which file to attach the new path to
+                        // We do NOT send file content (no ByteArrayContent with Base64EncodedFile)
+
+                        if (childInfos != null && childInfos.Count > 0)
+                        {
+                            var childDatas = childInfos.Select(kvp => new ChildData(kvp.Key, kvp.Value)).ToList();
+                            content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
+                        }
+
+                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content);
+                        var responseString = await response.Content.ReadAsStringAsync();
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            Logger.Info($"Successfully updated file location: {filePath}");
+                            return JsonConvert.DeserializeObject<LeoAICadDataClient.Utilities.FileInfo>(responseString);
+                        }
+                        else
+                        {
+                            Logger.Error($"Failed to update file location: {filePath}. Status: {response.StatusCode}, Response: {responseString}");
+                            if ((int)response.StatusCode == 429)
+                            {
+                                throw new Exception($"Rate limit (429): {responseString}");
+                            }
+                            return null;
+                        }
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"An exception occurred in UpdateFileLocation: {ex.Message}");
-                Logger.Error($"StackTrace: {ex.StackTrace}");
-                return null;
-            }
+                catch (Exception ex)
+                {
+                    Logger.Error($"An exception occurred in UpdateFileLocation: {ex.Message}");
+                    Logger.Error($"StackTrace: {ex.StackTrace}");
+                    throw;
+                }
+            }, $"UpdateFileLocation({Path.GetFileName(filePath)})");
         }
 
         public async Task<bool> DeleteDirectoryAsync(string directoryId)
         {
             await RefreshTokenIfRequiredAsync();
-            try
-            {
-                Logger.Info($"Attempting to delete directory: {directoryId}");
-                var response = await _httpClient.DeleteAsync($"api/v1/synced-directories/{directoryId}");
 
-                if (response.IsSuccessStatusCode)
-                {
-                    Logger.Info($"Successfully deleted directory: {directoryId}");
-                    return true;
-                }
-                else
-                {
-                    var errorContent = await response.Content.ReadAsStringAsync();
-                    Logger.Error($"Failed to delete directory: {directoryId}. Status: {response.StatusCode}, Response: {errorContent}");
-                    return false;
-                }
-            }
-            catch (Exception ex)
+            return await ExecuteWithRetryAsync(async () =>
             {
-                Logger.Error($"An exception occurred in DeleteDirectory: {ex.Message}");
-                Logger.Error($"StackTrace: {ex.StackTrace}");
-                return false;
-            }
+                try
+                {
+                    Logger.Info($"Attempting to delete directory: {directoryId}");
+                    var response = await _httpClient.DeleteAsync($"api/v1/synced-directories/{directoryId}");
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        Logger.Info($"Successfully deleted directory: {directoryId}");
+                        return true;
+                    }
+                    else
+                    {
+                        var errorContent = await response.Content.ReadAsStringAsync();
+                        Logger.Error($"Failed to delete directory: {directoryId}. Status: {response.StatusCode}, Response: {errorContent}");
+                        if ((int)response.StatusCode == 429)
+                        {
+                            throw new Exception($"Rate limit (429): {errorContent}");
+                        }
+                        return false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"An exception occurred in DeleteDirectory: {ex.Message}");
+                    Logger.Error($"StackTrace: {ex.StackTrace}");
+                    throw;
+                }
+            }, $"DeleteDirectory({directoryId})");
         }
     }
 

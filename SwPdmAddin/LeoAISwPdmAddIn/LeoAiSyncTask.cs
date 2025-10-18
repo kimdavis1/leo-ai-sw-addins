@@ -644,6 +644,7 @@ namespace LeoAISwPdmAddIn
         /// <summary>
         /// Common implementation for Rename and Move operations
         /// Upload new path first, then delete old path
+        /// Uses move context to handle dependencies efficiently
         /// </summary>
         private async Task ProcessRenameOrMoveOperation(IEdmVault11 vault, OperationMetadata operation)
         {
@@ -655,11 +656,23 @@ namespace LeoAISwPdmAddIn
             string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
             string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
 
+            LogFileWriter.LogMessage($"Moving file: {operation.OldPath} -> {operation.NewPath}");
+
+            // Build mapping for this single file move (new relative path -> old relative path)
+            Dictionary<string, string> moveMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            moveMap[newRelativePath] = oldRelativePath;
+
+            // Create processedFiles set for this operation
+            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             // Step 1: Upload file with new path - check if file exists in vault using PDM API
             if (FileExistsInVault(vault, operation.NewPath))
             {
-                LogFileWriter.LogMessage($"Uploading file with new path: {newRelativePath}");
-                await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath);
+                LogFileWriter.LogMessage($"Uploading file with new path using move context: {newRelativePath}");
+
+                // Use UploadFileWithDependencies with moveMap to handle dependencies
+                await UploadFileWithDependencies(vault, operation.NewPath, vault.RootFolderPath, processedFiles, moveMap);
+
                 LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
             }
             else
@@ -855,6 +868,20 @@ namespace LeoAISwPdmAddIn
 
             LogFileWriter.LogMessage($"Found {newFilePaths.Count} files to move");
 
+            // Build mapping of files being moved (new relative path -> old relative path)
+            // This is used to identify if a dependency is part of this folder move operation
+            Dictionary<string, string> moveMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < newFilePaths.Count; i++)
+            {
+                string oldRelPath = GetRelativePath(vault.RootFolderPath, oldFilePaths[i]);
+                string newRelPath = GetRelativePath(vault.RootFolderPath, newFilePaths[i]);
+                moveMap[newRelPath] = oldRelPath;
+            }
+
+            // IMPORTANT: Share processedFiles across all files in this folder move
+            // This prevents re-processing dependencies that were already handled
+            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             // Process each file: upload new path, delete old path
             int processed = 0;
             for (int i = 0; i < newFilePaths.Count; i++)
@@ -867,8 +894,11 @@ namespace LeoAISwPdmAddIn
                     string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldFilePath);
                     string newRelativePath = GetRelativePath(vault.RootFolderPath, newFilePath);
 
-                    // Upload file with new path
-                    await UpdateFilesToLeoAI(vault, new[] { newFilePath }, vault.RootFolderPath);
+                    LogFileWriter.LogMessage($"Moving file: {oldFilePath} -> {newFilePath}");
+
+                    // Upload file with new path using move context
+                    // Pass move map and shared processedFiles so dependencies can be identified and tracked
+                    await UploadFileWithDependencies(vault, newFilePath, vault.RootFolderPath, processedFiles, moveMap);
                     LogFileWriter.LogMessage($"Uploaded file to new location: {newRelativePath}");
 
                     // Delete old path
@@ -982,6 +1012,9 @@ namespace LeoAISwPdmAddIn
                     vaultPaths.Add(relativePath);
                 }
 
+                // Track files that already exist on server (to avoid re-processing dependencies)
+                HashSet<string> alreadyOnServer = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
                 // Find files to upload (in vault but not on server, or changed)
                 List<string> newFilesToUpload = new List<string>();
                 List<string> modifiedFilesToUpload = new List<string>();
@@ -1018,7 +1051,11 @@ namespace LeoAISwPdmAddIn
                         }
                         else
                         {
-                            // Checksums match - skip
+                            // Checksums match - skip upload but track as already on server
+                            // This is important for dependency tracking: if file A depends on file B,
+                            // and B already exists on server with correct checksum, we don't want to
+                            // re-upload B when processing A's dependencies
+                            alreadyOnServer.Add(relativePath);
                             LogFileWriter.LogMessage($"File unchanged (checksums match): {relativePath}");
                         }
                     }
@@ -1076,11 +1113,15 @@ namespace LeoAISwPdmAddIn
                 taskInstance.SetProgressPos(60, $"Uploading {totalFilesToUpload} files...");
                 int uploaded = 0;
                 int uploadTotal = totalFilesToUpload > 0 ? totalFilesToUpload : 1;
+
+                LogFileWriter.LogMessage($"Initial sync: {alreadyOnServer.Count} files already on server with matching checksums (will be used for dependency tracking)");
+
                 foreach (var filePath in allFilesToUpload)
                 {
                     try
                     {
-                        await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath);
+                        // Pass alreadyOnServer set so dependencies that exist on server aren't re-uploaded
+                        await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath, alreadyOnServer);
                         uploaded++;
                         int progress = 60 + (int)((uploaded / (float)uploadTotal) * 20);
                         taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{totalFilesToUpload} files");
@@ -1136,95 +1177,6 @@ namespace LeoAISwPdmAddIn
 
         #region Sync Operations (Old Format - Legacy)
 
-        private async Task ExecuteUpload(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, string vaultRootPath)
-        {
-            LogFileWriter.LogMessage($"=== ExecuteUpload: Processing {files.Length} files ===");
-
-            int processed = 0;
-            int total = files.Length;
-
-            foreach (EdmCmdData fileData in files)
-            {
-                // Use file path instead of IDs - IDs may not be valid on task host
-                string localPath = fileData.mbsStrData1; // File path from metadata
-                LogFileWriter.LogMessage($"Uploading file: {localPath}");
-
-                if (string.IsNullOrEmpty(localPath))
-                {
-                    LogFileWriter.LogMessage($"Skipping - no file path provided");
-                    continue;
-                }
-
-                // Check if file exists in vault using PDM API (not local view)
-                if (!FileExistsInVault(vault, localPath))
-                {
-                    string errorMsg = $"File not found in vault: {localPath}";
-                    LogFileWriter.LogError(errorMsg);
-                    throw new FileNotFoundException(errorMsg);
-                }
-
-                string relativePath = GetRelativePath(vaultRootPath, localPath);
-                LogFileWriter.LogMessage($"Relative path: {relativePath}");
-
-                // Upload to Leo AI (will throw on error to fail task)
-                await UpdateFilesToLeoAI(vault, new[] { localPath }, vaultRootPath);
-
-                processed++;
-                int progress = 40 + (int)((processed / (float)total) * 50);
-                taskInstance.SetProgressPos(progress, $"Uploaded {processed}/{total} files");
-
-                LogFileWriter.LogMessage($"Upload successful: {relativePath}");
-            }
-
-            LogFileWriter.LogMessage($"=== ExecuteUpload: Completed - {processed}/{total} files uploaded ===");
-        }
-
-        private async Task ExecuteDelete(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, Dictionary<string, string> additionalData)
-        {
-            LogFileWriter.LogMessage($"=== ExecuteDelete: Processing {files.Length} files ===");
-
-            // Get file paths from additional data
-            string filePathsStr = additionalData.ContainsKey("FilePaths") ? additionalData["FilePaths"] : "";
-            string[] filePaths = string.IsNullOrEmpty(filePathsStr) ? new string[0] : filePathsStr.Split('|');
-
-            LogFileWriter.LogMessage($"File paths from metadata: {string.Join(", ", filePaths)}");
-
-            int processed = 0;
-            int total = filePaths.Length;
-
-            foreach (string filePath in filePaths)
-            {
-                try
-                {
-                    LogFileWriter.LogMessage($"Deleting file from Leo AI: {filePath}");
-
-                    string relativePath = GetRelativePath(vault.RootFolderPath, filePath);
-
-                    // Call delete API with just directoryId and file path (no componentId needed)
-                    bool deleted = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
-                    if (deleted)
-                    {
-                        LogFileWriter.LogMessage($"Deleted from server: {relativePath}");
-                    }
-                    else
-                    {
-                        LogFileWriter.LogMessage($"Delete returned false for: {relativePath}");
-                    }
-
-                    processed++;
-                    int progress = 30 + (int)((processed / (float)total) * 50);
-                    taskInstance.SetProgressPos(progress, $"Deleted {processed}/{total} files");
-                }
-                catch (Exception ex)
-                {
-                    LogFileWriter.LogError($"Failed to delete file {filePath}: {ex.Message}");
-                    throw; // Propagate exception to fail the task
-                }
-            }
-
-            LogFileWriter.LogMessage($"=== ExecuteDelete: Completed - {processed}/{total} files deleted ===");
-        }
-
         private async Task ExecuteMove(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, Dictionary<string, string> additionalData)
         {
             LogFileWriter.LogMessage($"=== ExecuteMove: Starting ===");
@@ -1258,6 +1210,20 @@ namespace LeoAISwPdmAddIn
                 throw new Exception($"Path count mismatch: {oldPaths.Length} old paths vs {newPaths.Length} new paths");
             }
 
+            // Build mapping of files being moved (new relative path -> old relative path)
+            // This is used to identify if a dependency is part of this move operation
+            Dictionary<string, string> moveMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < oldPaths.Length; i++)
+            {
+                string oldRelPath = GetRelativePath(vault.RootFolderPath, oldPaths[i]);
+                string newRelPath = GetRelativePath(vault.RootFolderPath, newPaths[i]);
+                moveMap[newRelPath] = oldRelPath;
+            }
+
+            // IMPORTANT: Share processedFiles across all files in this file move
+            // This prevents re-processing dependencies that were already handled
+            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             int processed = 0;
             int total = oldPaths.Length > 0 ? oldPaths.Length : 1; // Prevent division by zero
 
@@ -1276,7 +1242,8 @@ namespace LeoAISwPdmAddIn
                     // Upload file with new path first - check if exists in vault
                     if (FileExistsInVault(vault, newPath))
                     {
-                        await UpdateFilesToLeoAI(vault, new[] { newPath }, vault.RootFolderPath);
+                        // Pass move map and shared processedFiles so dependencies can be identified and tracked
+                        await UploadFileWithDependencies(vault, newPath, vault.RootFolderPath, processedFiles, moveMap);
                         LogFileWriter.LogMessage($"Uploaded file with new path: {newRelativePath}");
                     }
 
@@ -1342,6 +1309,20 @@ namespace LeoAISwPdmAddIn
 
             LogFileWriter.LogMessage($"Found {oldFilePaths.Count} files to move");
 
+            // Build mapping of files being moved (new relative path -> old relative path)
+            // This is used to identify if a dependency is part of this folder move operation
+            Dictionary<string, string> moveMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (int i = 0; i < oldFilePaths.Count; i++)
+            {
+                string oldRelPath = GetRelativePath(vault.RootFolderPath, oldFilePaths[i]);
+                string newRelPath = GetRelativePath(vault.RootFolderPath, newFilePaths[i]);
+                moveMap[newRelPath] = oldRelPath;
+            }
+
+            // IMPORTANT: Share processedFiles across all files in this folder move
+            // This prevents re-processing dependencies that were already handled
+            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
             // Process each file individually
             int processed = 0;
             int total = oldFilePaths.Count > 0 ? oldFilePaths.Count : 1; // Prevent division by zero
@@ -1361,7 +1342,8 @@ namespace LeoAISwPdmAddIn
                     // Upload with new path first - check if exists in vault
                     if (FileExistsInVault(vault, newFilePath))
                     {
-                        await UpdateFilesToLeoAI(vault, new[] { newFilePath }, vault.RootFolderPath);
+                        // Pass move map and shared processedFiles so dependencies can be identified and tracked
+                        await UploadFileWithDependencies(vault, newFilePath, vault.RootFolderPath, processedFiles, moveMap);
                         LogFileWriter.LogMessage($"Uploaded: {newRelativePath}");
                     }
 
@@ -1435,11 +1417,6 @@ namespace LeoAISwPdmAddIn
                    ext == ".DOCX";
         }
 
-        private async Task ExecuteRename(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files, Dictionary<string, string> additionalData)
-        {
-            LogFileWriter.LogMessage("=== ExecuteRename: Using same logic as Move ===");
-            await ExecuteMove(vault, taskInstance, files, additionalData);
-        }
 
         private async Task ExecuteCompleteSync(IEdmVault11 vault, IEdmTaskInstance taskInstance, EdmCmdData[] files)
         {
@@ -1589,13 +1566,16 @@ namespace LeoAISwPdmAddIn
 
             try
             {
+                // Ensure we have full path for GetFileFromPath
+                string fullPath = EnsureFullPath(vault, filePath);
+
                 // Get file object from vault
                 IEdmFolder5 folder;
-                IEdmFile5 file = vault.GetFileFromPath(filePath, out folder);
+                IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
 
                 if (file == null || folder == null)
                 {
-                    LogFileWriter.LogMessage($"GetFileDependencies: File not found: {filePath}");
+                    LogFileWriter.LogMessage($"GetFileDependencies: File not found: {fullPath}");
                     return new List<string>();
                 }
 
@@ -1826,19 +1806,22 @@ namespace LeoAISwPdmAddIn
             return directoryId;
         }
 
-        private async Task UpdateFilesToLeoAI(IEdmVault11 vault, string[] filePaths, string vaultRootPath)
+        private async Task UpdateFilesToLeoAI(IEdmVault11 vault, string[] filePaths, string vaultRootPath, HashSet<string> alreadyOnServer = null)
         {
             LogFileWriter.LogMessage($"Updating {filePaths.Length} files to Leo AI");
 
             // Track uploaded files to avoid re-uploading dependencies multiple times
-            HashSet<string> uploadedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Start with files that are already on server (from initial sync comparison)
+            HashSet<string> uploadedFiles = alreadyOnServer != null
+                ? new HashSet<string>(alreadyOnServer, StringComparer.OrdinalIgnoreCase)
+                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             // Upload each file with its dependencies (dependencies uploaded first, recursively)
             foreach (string filePath in filePaths)
             {
                 try
                 {
-                    await UploadFileWithDependencies(vault, filePath, vaultRootPath, uploadedFiles);
+                    await UploadFileWithDependencies(vault, filePath, vaultRootPath, uploadedFiles, null);
                 }
                 catch (Exception ex)
                 {
@@ -1851,11 +1834,40 @@ namespace LeoAISwPdmAddIn
         }
 
         /// <summary>
+        /// Updates files to Leo AI with move/rename context
+        /// moveMap contains new relative path -> old relative path for files being moved
+        /// </summary>
+        private async Task UpdateFilesToLeoAIWithMoveContext(IEdmVault11 vault, string[] filePaths, string vaultRootPath, Dictionary<string, string> moveMap)
+        {
+            LogFileWriter.LogMessage($"Updating {filePaths.Length} files to Leo AI (move/rename context)");
+
+            // Track processed files to avoid re-processing dependencies
+            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            // Upload each file with its dependencies (dependencies uploaded first, recursively)
+            foreach (string filePath in filePaths)
+            {
+                try
+                {
+                    await UploadFileWithDependencies(vault, filePath, vaultRootPath, processedFiles, moveMap);
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+                    throw; // Propagate error to fail the operation
+                }
+            }
+
+            LogFileWriter.LogMessage($"Processed {processedFiles.Count} unique files (including dependencies)");
+        }
+
+        /// <summary>
         /// Recursively uploads a file and all its dependencies
         /// Dependencies are uploaded first before the file that depends on them
         /// Uses uploadedFiles set to track what's been uploaded and avoid duplicates
+        /// moveMap (optional): new relative path -> old relative path for files being moved/renamed
         /// </summary>
-        private async Task UploadFileWithDependencies(IEdmVault11 vault, string filePath, string vaultRootPath, HashSet<string> uploadedFiles)
+        private async Task UploadFileWithDependencies(IEdmVault11 vault, string filePath, string vaultRootPath, HashSet<string> uploadedFiles, Dictionary<string, string> moveMap)
         {
             string relativePath = GetRelativePath(vaultRootPath, filePath);
 
@@ -1885,20 +1897,48 @@ namespace LeoAISwPdmAddIn
                         continue;
                     }
 
-                    // Convert relative path back to full path for recursive call
-                    string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
+                    // Check if this dependency is part of a move/rename operation
+                    bool isDependencyBeingMoved = moveMap != null && moveMap.ContainsKey(depRelativePath);
 
-                    try
+                    if (isDependencyBeingMoved)
                     {
-                        // Recursively upload this dependency (and its dependencies)
-                        // The recursive call will skip if already in uploadedFiles set
-                        await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles);
+                        // Dependency is being moved - check if we can use UpdateFileLocationAsync
+                        string oldDepRelativePath = moveMap[depRelativePath];
+                        LogFileWriter.LogMessage($"  Dependency is being moved: {oldDepRelativePath} -> {depRelativePath}");
+
+                        // This will be handled by the recursive call - just call UploadFileWithDependencies
+                        // which will check checksums and decide whether to use UpdateFileLocationAsync or full upload
+                        string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
+
+                        try
+                        {
+                            // Recursively process this dependency (will check checksum and choose upload method)
+                            await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, moveMap);
+                        }
+                        catch (Exception ex)
+                        {
+                            LogFileWriter.LogError($"Failed to process moved dependency {depRelativePath}: {ex.Message}");
+                            LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
+                        }
                     }
-                    catch (Exception ex)
+                    else
                     {
-                        // Log error but continue - missing dependencies shouldn't fail the entire operation
-                        LogFileWriter.LogError($"Failed to upload dependency {depRelativePath}: {ex.Message}");
-                        LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
+                        // Dependency is new or already exists - use normal upload flow
+                        // Convert relative path back to full path for recursive call
+                        string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
+
+                        try
+                        {
+                            // Recursively upload this dependency (and its dependencies)
+                            // The recursive call will skip if already in uploadedFiles set
+                            await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, moveMap);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Log error but continue - missing dependencies shouldn't fail the entire operation
+                            LogFileWriter.LogError($"Failed to upload dependency {depRelativePath}: {ex.Message}");
+                            LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
+                        }
                     }
                 }
             }
@@ -1930,12 +1970,139 @@ namespace LeoAISwPdmAddIn
                 }
             }
 
-            // Now upload the file itself (with dependency info)
-            await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums);
+            // Check if this file itself is being moved
+            bool isFileBeingMoved = moveMap != null && moveMap.ContainsKey(relativePath);
 
-            // Mark as uploaded
-            uploadedFiles.Add(relativePath);
-            LogFileWriter.LogMessage($"File uploaded successfully: {relativePath}");
+            if (isFileBeingMoved)
+            {
+                // File is being moved - but first verify it can use UpdateFileLocationAsync
+                // This is only valid if the old file exists on server with the same checksum
+                string oldRelativePath = moveMap[relativePath];
+                bool canUseUpdateLocation = false;
+                bool hasInErrorStatus = false;
+                string oldChecksum = null; // Store the old checksum to send to UpdateFileLocationAsync
+
+                try
+                {
+                    LogFileWriter.LogMessage($"File is being moved - checking if can use UpdateFileLocationAsync");
+
+                    // Get old file from server
+                    var oldFileOnServer = await _leoClient.GetFileInfoByPathAsync(_directoryId, oldRelativePath);
+
+                    if (oldFileOnServer != null)
+                    {
+                        // Store the old checksum - this is what we'll send to the server
+                        oldChecksum = oldFileOnServer.CheckSum;
+
+                        // Check for IN_ERROR status - delete old path first, then upload new one
+                        if (oldFileOnServer.ParentStatus == "IN_ERROR")
+                        {
+                            LogFileWriter.LogMessage($"File has IN_ERROR status on server - will delete old path first, then upload");
+                            hasInErrorStatus = true;
+                            canUseUpdateLocation = false;
+                        }
+                        else
+                        {
+                            // Calculate current checksum from archive (contains latest version after move)
+                            string actualFilePath = null;
+                            bool needsCleanup = false;
+
+                            string fullPath = EnsureFullPath(vault, filePath);
+                            IEdmFolder5 folder;
+                            IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+
+                            if (file != null && folder != null)
+                            {
+                                (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
+                                var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
+
+                                LogFileWriter.LogMessage($"Comparing checksums: server={oldFileOnServer.CheckSum}, current={localFileInfo.CheckSum}");
+
+                                if (oldFileOnServer.CheckSum == localFileInfo.CheckSum)
+                                {
+                                    canUseUpdateLocation = true;
+                                    LogFileWriter.LogMessage($"Checksums match - can use UpdateFileLocationAsync");
+                                }
+                                else
+                                {
+                                    LogFileWriter.LogMessage($"Checksums differ - must upload with file content");
+                                }
+
+                                // Clean up temp file if needed
+                                if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
+                                {
+                                    DeleteTempFile(actualFilePath);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LogFileWriter.LogMessage($"Old file not found on server at {oldRelativePath} - must upload with file content");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogMessage($"Error checking old file on server: {ex.Message} - will upload with file content");
+                }
+
+                // If IN_ERROR status, delete old path BEFORE uploading
+                if (hasInErrorStatus)
+                {
+                    LogFileWriter.LogMessage($"Deleting old path due to IN_ERROR status: {oldRelativePath}");
+                    bool deleteSuccess = await _leoClient.DeleteFileAsync(_directoryId, oldRelativePath);
+                    if (deleteSuccess)
+                    {
+                        LogFileWriter.LogMessage($"Successfully deleted old path: {oldRelativePath}");
+                    }
+                    else
+                    {
+                        LogFileWriter.LogError($"Failed to delete old path: {oldRelativePath}");
+                    }
+                }
+
+                if (canUseUpdateLocation)
+                {
+                    // Use fast UpdateFileLocationAsync (no file content)
+                    // Pass the OLD checksum (from server) so backend can identify the file
+                    LogFileWriter.LogMessage($"Using UpdateFileLocationAsync for move with checksum: {oldChecksum}");
+                    await _leoClient.UpdateFileLocationAsync(_directoryId, vaultRootPath, filePath, oldChecksum, dependenciesWithChecksums);
+                    uploadedFiles.Add(relativePath);
+                    LogFileWriter.LogMessage($"File location updated: {relativePath}");
+                }
+                else
+                {
+                    // Checksum changed or old file doesn't exist - must upload with file content
+                    LogFileWriter.LogMessage($"Using full upload (file content changed during move)");
+                    bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums);
+
+                    if (uploadSuccess)
+                    {
+                        uploadedFiles.Add(relativePath);
+                        LogFileWriter.LogMessage($"File uploaded with new content: {relativePath}");
+                    }
+                    else
+                    {
+                        LogFileWriter.LogError($"File upload failed: {relativePath}");
+                    }
+                }
+            }
+            else
+            {
+                // Normal upload flow
+                bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums);
+
+                // Mark as uploaded (even if skipped, because it exists on server)
+                if (uploadSuccess)
+                {
+                    uploadedFiles.Add(relativePath);
+                    LogFileWriter.LogMessage($"File upload completed (or skipped if unchanged): {relativePath}");
+                }
+                else
+                {
+                    LogFileWriter.LogError($"File upload failed: {relativePath}");
+                }
+            }
         }
 
         /// <summary>
@@ -1989,9 +2156,11 @@ namespace LeoAISwPdmAddIn
 
         /// <summary>
         /// Uploads a single file with proper error handling and dependency information
+        /// ALWAYS checks if file exists on server first, compares checksums, and deletes old version if needed
         /// Deletes temp file immediately after upload if it was copied to local view
+        /// Returns true if file was uploaded or already exists (skipped), false if failed
         /// </summary>
-        private async Task UploadSingleFile(IEdmVault11 vault, string filePath, string vaultRootPath, Dictionary<string, string> dependencies)
+        private async Task<bool> UploadSingleFile(IEdmVault11 vault, string filePath, string vaultRootPath, Dictionary<string, string> dependencies)
         {
             string relativePath = GetRelativePath(vaultRootPath, filePath);
             LogFileWriter.LogMessage($"Uploading file: {relativePath}");
@@ -2018,6 +2187,71 @@ namespace LeoAISwPdmAddIn
                     // Fallback: use the provided path directly
                     actualFilePath = filePath;
                     LogFileWriter.LogMessage($"Could not get file from vault, using path directly: {actualFilePath}");
+                }
+
+                // ALWAYS check if file exists on server and compare checksums before uploading
+                LogFileWriter.LogMessage($"Checking if file exists on server: {relativePath}");
+                try
+                {
+                    var serverFile = await _leoClient.GetFileInfoByPathAsync(_directoryId, relativePath);
+
+                    if (serverFile != null)
+                    {
+                        LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
+
+                        // Calculate local file checksum
+                        var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
+                        string localChecksum = localFileInfo.CheckSum;
+                        LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
+
+                        // Check if file needs reupload
+                        bool needsReupload = false;
+                        string reason = "";
+
+                        if (serverFile.ParentStatus == "IN_ERROR")
+                        {
+                            needsReupload = true;
+                            reason = "file has IN_ERROR status";
+                            LogFileWriter.LogMessage($"File has IN_ERROR status - forcing reupload");
+                        }
+                        else if (serverFile.CheckSum != localChecksum)
+                        {
+                            needsReupload = true;
+                            reason = "checksum changed";
+                        }
+
+                        if (!needsReupload && serverFile.CheckSum == localChecksum)
+                        {
+                            LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - skipping upload");
+                            // Don't upload - file already exists with same content
+                            // Return true because file exists on server (treated as success for dependency tracking)
+                            return true;
+                        }
+
+                        if (needsReupload)
+                        {
+                            LogFileWriter.LogMessage($"File changed ({reason}) - deleting old version before upload");
+
+                            // Delete the old version first
+                            bool deleted = await _leoClient.DeleteFileAsync(_directoryId, relativePath);
+                            if (deleted)
+                            {
+                                LogFileWriter.LogMessage($"Deleted old version: {relativePath}");
+                            }
+                            else
+                            {
+                                LogFileWriter.LogMessage($"Warning: Failed to delete old version: {relativePath}");
+                            }
+                        }
+                    }
+                    else
+                    {
+                        LogFileWriter.LogMessage($"File does not exist on server - uploading as new file");
+                    }
+                }
+                catch (Exception checkEx)
+                {
+                    LogFileWriter.LogMessage($"Could not check server file (treating as new): {checkEx.Message}");
                 }
 
                 // CreateFileAsync handles both create and update (with automatic retry for rate limits)
@@ -2047,6 +2281,9 @@ namespace LeoAISwPdmAddIn
                         LogFileWriter.LogError($"Failed to delete temp file {actualFilePath}: {delEx.Message}");
                     }
                 }
+
+                // Upload successful
+                return true;
             }
             catch (Exception ex)
             {
