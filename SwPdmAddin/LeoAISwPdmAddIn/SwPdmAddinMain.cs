@@ -1,6 +1,4 @@
 using EPDM.Interop.epdm;
-using LeoAICadDataClient;
-using LeoAICadDataClient.Utilities;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -10,15 +8,6 @@ using Microsoft.Win32;
 
 namespace LeoAISwPdmAddIn
 {
-    /// <summary>
-    /// Authentication configuration model for Leo AI
-    /// </summary>
-    public class LeoAuthConfig
-    {
-        public string ApiKey { get; set; }
-        public string ProjectId { get; set; }
-    }
-
     /// <summary>
     /// Represents a single file operation with its status
     /// </summary>
@@ -733,85 +722,6 @@ namespace LeoAISwPdmAddIn
 
         #endregion
 
-        #region Folder Event Handling
-
-        /// <summary>
-        /// Processes folder rename/move events by finding first file in folder as dummy for RunTask
-        /// </summary>
-        private void ProcessFolderEvent(EdmCmd poCmd, EdmCmdData[] folderData, string operation)
-        {
-            try
-            {
-                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
-
-                foreach (EdmCmdData folder in folderData)
-                {
-                    int folderID = folder.mlObjectID1;
-                    string oldFolderName = folder.mbsStrData1;
-                    string newFolderName = folder.mbsStrData2;
-
-                    LogFileWriter.LogMessage($"Processing folder {operation}: {oldFolderName} -> {newFolderName}, FolderID: {folderID}");
-
-                    // Get folder object
-                    IEdmFolder5 edmFolder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
-                    if (edmFolder == null)
-                    {
-                        LogFileWriter.LogError($"Could not get folder object with ID: {folderID}");
-                        continue;
-                    }
-
-                    // Get first file in folder to use as dummy for RunTask
-                    IEdmPos5 pos = edmFolder.GetFirstFilePosition();
-                    if (pos.IsNull)
-                    {
-                        LogFileWriter.LogMessage($"Folder is empty, using vault root file as dummy");
-                        // Use file from vault root as fallback
-                        IEdmFolder5 rootFolder = vault.RootFolder;
-                        pos = rootFolder.GetFirstFilePosition();
-                        if (pos.IsNull)
-                        {
-                            LogFileWriter.LogError("Cannot process folder event: vault is completely empty");
-                            continue;
-                        }
-                        IEdmFile5 rootFile = rootFolder.GetNextFile(pos);
-                        EdmCmdData dummyData = new EdmCmdData();
-                        dummyData.mlObjectID1 = rootFile.ID;
-                        dummyData.mlObjectID2 = rootFolder.ID;
-
-                        var folderEventData = new Dictionary<string, string>();
-                        folderEventData["OldPaths"] = oldFolderName;
-                        folderEventData["NewPaths"] = newFolderName;
-                        folderEventData["IsFolder"] = "true";
-
-                        ExecuteSyncTask(poCmd, new EdmCmdData[] { dummyData }, operation, folderEventData);
-                    }
-                    else
-                    {
-                        IEdmFile5 firstFile = edmFolder.GetNextFile(pos);
-                        EdmCmdData dummyData = new EdmCmdData();
-                        dummyData.mlObjectID1 = firstFile.ID;
-                        dummyData.mlObjectID2 = folderID;
-
-                        var folderEventData = new Dictionary<string, string>();
-                        folderEventData["OldPaths"] = oldFolderName;
-                        folderEventData["NewPaths"] = newFolderName;
-                        folderEventData["IsFolder"] = "true";
-
-                        LogFileWriter.LogMessage($"Using dummy file: {firstFile.Name} (ID: {firstFile.ID}) from folder ID: {folderID}");
-
-                        ExecuteSyncTask(poCmd, new EdmCmdData[] { dummyData }, operation, folderEventData);
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error processing folder event: {ex.Message}");
-                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
-            }
-        }
-
-        #endregion
-
         #region Task Execution Methods (Client-Side)
 
         /// <summary>
@@ -901,78 +811,6 @@ namespace LeoAISwPdmAddIn
 
         #endregion
 
-        #region Configuration Helpers
-
-        /// <summary>
-        /// Reads the Leo AI authentication configuration from JSON file
-        /// </summary>
-        private LeoAuthConfig ReadAuthConfig()
-        {
-            try
-            {
-                string configFilePath = null;
-
-                // First, try to read the path from environment variable
-                string envPath = LeoAIDataUtilities.ReadEnvVariableByName("LEO_AUTH_KEY", false);
-                if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath))
-                {
-                    configFilePath = envPath;
-                    LogFileWriter.LogMessage($"Using auth config from environment variable path: {configFilePath}");
-                }
-                else
-                {
-                    // Fallback to default location
-                    string defaultPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
-                    if (File.Exists(defaultPath))
-                    {
-                        configFilePath = defaultPath;
-                        LogFileWriter.LogMessage($"Using auth config from default path: {configFilePath}");
-                    }
-                    else
-                    {
-                        LogFileWriter.LogError($"Auth config not found. Tried environment variable and default path: {defaultPath}");
-                        return null;
-                    }
-                }
-
-                // Read and parse the config file
-                string jsonContent = File.ReadAllText(configFilePath);
-                return ParseAuthConfig(jsonContent);
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Failed to read auth config: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Parses the authentication configuration JSON
-        /// </summary>
-        private LeoAuthConfig ParseAuthConfig(string jsonContent)
-        {
-            try
-            {
-                var config = Newtonsoft.Json.JsonConvert.DeserializeObject<LeoAuthConfig>(jsonContent);
-
-                if (string.IsNullOrEmpty(config.ApiKey) || string.IsNullOrEmpty(config.ProjectId))
-                {
-                    LogFileWriter.LogError("Auth config is missing ApiKey or ProjectId");
-                    return null;
-                }
-
-                LogFileWriter.LogMessage("Auth config parsed successfully");
-                return config;
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Failed to parse auth config: {ex.Message}");
-                return null;
-            }
-        }
-
-        #endregion
-
         #region Registry Helpers
 
         /// <summary>
@@ -996,30 +834,6 @@ namespace LeoAISwPdmAddIn
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Failed to register vault installation: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Unregisters vault installation from the registry
-        /// </summary>
-        private void UnregisterVaultInstallation(string vaultName)
-        {
-            try
-            {
-                string registryPath = @"SOFTWARE\LeoAI\SwPdmAddIn\Vaults";
-
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(registryPath, true))
-                {
-                    if (key != null && key.GetValue(vaultName) != null)
-                    {
-                        key.DeleteValue(vaultName);
-                        LogFileWriter.LogMessage($"Unregistered vault installation: {vaultName}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Failed to unregister vault installation: {ex.Message}");
             }
         }
 

@@ -1,7 +1,6 @@
 ﻿using System;
 using System.IO;
 using System.IO.Hashing;
-using LeoAICadDataClient.Utilities;
 
 namespace LeoAICadDataClient
 {

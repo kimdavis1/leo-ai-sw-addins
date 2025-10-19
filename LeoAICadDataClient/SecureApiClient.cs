@@ -124,48 +124,6 @@ namespace LeoAICadDataClient
         }
 
         /// <summary>
-        /// Executes an async action with retry logic for rate limit errors (HTTP 429)
-        /// </summary>
-        private async Task ExecuteWithRetryAsync(Func<Task> operation, string operationName)
-        {
-            int retryDelay = InitialRetryDelayMs;
-
-            for (int attempt = 0; attempt <= MaxRetries; attempt++)
-            {
-                try
-                {
-                    await operation();
-                    return;
-                }
-                catch (Exception ex)
-                {
-                    // Check if it's a rate limit error (HTTP 429)
-                    bool isRateLimit = ex.Message.Contains("429") ||
-                                      ex.Message.ToLower().Contains("rate limit") ||
-                                      ex.Message.ToLower().Contains("too many requests");
-
-                    if (isRateLimit && attempt < MaxRetries)
-                    {
-                        // Exponential backoff for rate limits
-                        Logger.Info($"Rate limit hit for {operationName}, retrying in {retryDelay}ms (attempt {attempt + 1}/{MaxRetries})");
-                        await Task.Delay(retryDelay);
-                        retryDelay *= 2; // Exponential backoff
-                        continue;
-                    }
-
-                    // For all other errors or exhausted retries, re-throw
-                    throw;
-                }
-            }
-        }
-
-        public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string filePath, Dictionary<string, string> childInfos = null)
-        {
-            // Default: read from same path as logical path
-            return await CreateFileAsync(directoryId, vaultPath, filePath, filePath, childInfos);
-        }
-
-        /// <summary>
         /// Creates a file in Leo AI with separate logical and physical paths.
         /// logicalFilePath: The path shown to user/API (relative path calculated from this)
         /// actualFilePath: The actual file system path to read file content from (can be archive path or temp path)
