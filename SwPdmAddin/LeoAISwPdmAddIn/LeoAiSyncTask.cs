@@ -301,8 +301,10 @@ namespace LeoAISwPdmAddIn
 
                 taskInstance.SetProgressPos(15, "Getting directory ID...");
 
-                // Get or create directory
-                _directoryId = GetOrCreateDirectoryId(vault.RootFolderPath).Result;
+                // Get or create directory using swpdm/{vault_name} format
+                string directoryPath = $"swpdm/{vault.Name}";
+                LogFileWriter.LogMessage($"Using directory path: {directoryPath}");
+                _directoryId = GetOrCreateDirectoryId(directoryPath).Result;
                 LogFileWriter.LogMessage($"Directory ID: {_directoryId}");
 
                 taskInstance.SetProgressPos(20, "Processing operations...");
@@ -1577,6 +1579,7 @@ namespace LeoAISwPdmAddIn
                 bool canUseUpdateLocation = false;
                 bool hasInErrorStatus = false;
                 string oldChecksum = null; // Store the old checksum to send to UpdateFileLocationAsync
+                string externalId = ""; // Store the PDM file ID
 
                 try
                 {
@@ -1609,10 +1612,11 @@ namespace LeoAISwPdmAddIn
 
                             if (file != null && folder != null)
                             {
+                                externalId = file.ID.ToString();
                                 (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
                                 var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
 
-                                LogFileWriter.LogMessage($"Comparing checksums: server={oldFileOnServer.CheckSum}, current={localFileInfo.CheckSum}");
+                                LogFileWriter.LogMessage($"Comparing checksums: server={oldFileOnServer.CheckSum}, current={localFileInfo.CheckSum} (PDM File ID: {externalId})");
 
                                 if (oldFileOnServer.CheckSum == localFileInfo.CheckSum)
                                 {
@@ -1661,8 +1665,8 @@ namespace LeoAISwPdmAddIn
                 {
                     // Use fast UpdateFileLocationAsync (no file content)
                     // Pass the OLD checksum (from server) so backend can identify the file
-                    LogFileWriter.LogMessage($"Using UpdateFileLocationAsync for move with checksum: {oldChecksum}");
-                    await _leoClient.UpdateFileLocationAsync(_directoryId, vaultRootPath, filePath, oldChecksum, dependenciesWithChecksums);
+                    LogFileWriter.LogMessage($"Using UpdateFileLocationAsync for move with checksum: {oldChecksum}, externalId: {externalId}");
+                    await _leoClient.UpdateFileLocationAsync(_directoryId, vaultRootPath, filePath, oldChecksum, externalId, dependenciesWithChecksums);
                     uploadedFiles.Add(relativePath);
                     LogFileWriter.LogMessage($"File location updated: {relativePath}");
                 }
@@ -1772,11 +1776,13 @@ namespace LeoAISwPdmAddIn
                 // Get readable file path (archive or temp copy)
                 IEdmFolder5 folder;
                 IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
+                string externalId = "";
 
                 if (file != null && folder != null)
                 {
+                    externalId = file.ID.ToString();
                     (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID);
-                    LogFileWriter.LogMessage($"File path for upload: {actualFilePath} (cleanup: {needsCleanup})");
+                    LogFileWriter.LogMessage($"File path for upload: {actualFilePath} (cleanup: {needsCleanup}, PDM File ID: {externalId})");
                 }
                 else
                 {
@@ -1852,7 +1858,7 @@ namespace LeoAISwPdmAddIn
 
                 // CreateFileAsync handles both create and update (with automatic retry for rate limits)
                 // Pass dependencies dictionary - will be converted to proper format and sent to server
-                var fileInfo = await _leoClient.CreateFileAsync(_directoryId, vaultRootPath, filePath, actualFilePath, dependencies);
+                var fileInfo = await _leoClient.CreateFileAsync(_directoryId, vaultRootPath, filePath, actualFilePath, externalId, dependencies);
 
                 if (fileInfo != null)
                 {

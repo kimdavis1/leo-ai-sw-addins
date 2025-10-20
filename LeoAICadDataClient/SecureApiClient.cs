@@ -127,8 +127,9 @@ namespace LeoAICadDataClient
         /// Creates a file in Leo AI with separate logical and physical paths.
         /// logicalFilePath: The path shown to user/API (relative path calculated from this)
         /// actualFilePath: The actual file system path to read file content from (can be archive path or temp path)
+        /// externalId: The unique PDM file ID
         /// </summary>
-        public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string logicalFilePath, string actualFilePath, Dictionary<string, string> childInfos = null)
+        public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string logicalFilePath, string actualFilePath, string externalId, Dictionary<string, string> childInfos = null)
         {
             await RefreshTokenIfRequiredAsync();
 
@@ -142,7 +143,7 @@ namespace LeoAICadDataClient
                     string memeType = LeoAIMemeType.GetMemeType(logicalFilePath); // Use logical path for extension
 
                     // Log API request parameters
-                    Logger.Info($"[API CALL] CreateFile: path={NormalizeFilePathForApi(relativePath)}, checksum={fInfo.CheckSum}, mimeType={memeType}, hasFileContent=true");
+                    Logger.Info($"[API CALL] CreateFile: path={NormalizeFilePathForApi(relativePath)}, checksum={fInfo.CheckSum}, mimeType={memeType}, externalId={externalId}, hasFileContent=true");
                     if (childInfos != null && childInfos.Count > 0)
                     {
                         Logger.Info($"[API CALL] CreateFile dependencies: {JsonConvert.SerializeObject(childInfos)}");
@@ -153,6 +154,7 @@ namespace LeoAICadDataClient
                         content.Add(new StringContent(memeType), "mimeType");
                         content.Add(new StringContent(fInfo.CheckSum), "checkSum");
                         content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
+                        content.Add(new StringContent(externalId), "externalId");
 
                         var fileBytes = Convert.FromBase64String(fInfo.Base64EncodedFile);
                         content.Add(new ByteArrayContent(fileBytes), "file", Path.GetFileName(logicalFilePath));
@@ -435,8 +437,9 @@ namespace LeoAICadDataClient
         /// Updates file location (move/rename) - sends checksum to identify the file but NOT the file content
         /// Backend uses checksum to attach new path to existing file
         /// checksum: The checksum from the OLD file location (to identify which file to update)
+        /// externalId: The unique PDM file ID
         /// </summary>
-        public async Task<LeoAICadDataClient.Utilities.FileInfo> UpdateFileLocationAsync(string directoryId, string vaultPath, string filePath, string checksum, Dictionary<string, string> childInfos = null)
+        public async Task<LeoAICadDataClient.Utilities.FileInfo> UpdateFileLocationAsync(string directoryId, string vaultPath, string filePath, string checksum, string externalId, Dictionary<string, string> childInfos = null)
         {
             await RefreshTokenIfRequiredAsync();
 
@@ -452,7 +455,7 @@ namespace LeoAICadDataClient
                     string mimeType = LeoAIMemeType.GetMemeType(filePath);
 
                     // Log API request parameters
-                    Logger.Info($"[API CALL] UpdateFileLocation: path={NormalizeFilePathForApi(relativePath)}, checksum={checksum}, mimeType={mimeType}, hasFileContent=false");
+                    Logger.Info($"[API CALL] UpdateFileLocation: path={NormalizeFilePathForApi(relativePath)}, checksum={checksum}, mimeType={mimeType}, externalId={externalId}, hasFileContent=false");
                     if (childInfos != null && childInfos.Count > 0)
                     {
                         Logger.Info($"[API CALL] UpdateFileLocation dependencies: {JsonConvert.SerializeObject(childInfos)}");
@@ -463,6 +466,7 @@ namespace LeoAICadDataClient
                         content.Add(new StringContent(mimeType), "mimeType");
                         content.Add(new StringContent(checksum), "checkSum");
                         content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
+                        content.Add(new StringContent(externalId), "externalId");
 
                         // NOTE: We send checkSum so backend can identify which file to attach the new path to
                         // We do NOT send file content (no ByteArrayContent with Base64EncodedFile)
