@@ -28,6 +28,88 @@ namespace LeoAICadDataClient
             _httpClient = new HttpClient { BaseAddress = new Uri(_baseApiUrl) };
             _httpClient.DefaultRequestHeaders.ExpectContinue = false; // Explicitly disable Expect: 100-continue
             Logger.Info("SecureApiClient initialized with standard HttpClient.");
+
+            // Initialize Sentry for API error tracking
+            SentryApiErrorHandler.Initialize("Production");
+        }
+
+        /// <summary>
+        /// Creates a SecureApiClient from a config file containing ApiKey and ProjectId
+        /// </summary>
+        /// <param name="configFilePath">Path to LeoAuthKey.json file</param>
+        /// <returns>Initialized SecureApiClient</returns>
+        public static SecureApiClient CreateFromConfigFile(string configFilePath)
+        {
+            if (string.IsNullOrEmpty(configFilePath))
+            {
+                throw new ArgumentNullException(nameof(configFilePath), "Config file path cannot be null or empty");
+            }
+
+            if (!File.Exists(configFilePath))
+            {
+                throw new FileNotFoundException($"Auth config not found: {configFilePath}");
+            }
+
+            Logger.Info($"Reading auth config from: {configFilePath}");
+            string json = File.ReadAllText(configFilePath);
+            var config = JsonConvert.DeserializeObject<LeoAuthConfig>(json);
+
+            if (config == null || string.IsNullOrEmpty(config.ApiKey) || string.IsNullOrEmpty(config.ProjectId))
+            {
+                throw new Exception($"Invalid auth config in {configFilePath} - missing ApiKey or ProjectId");
+            }
+
+            Logger.Info($"Auth config loaded successfully - ProjectId: {config.ProjectId}");
+            return new SecureApiClient(config.ApiKey, config.ProjectId);
+        }
+
+        /// <summary>
+        /// Creates a SecureApiClient by searching for config in standard locations
+        /// Priority: 1) Provided path, 2) Default installation folder
+        /// </summary>
+        /// <param name="vaultConfigPath">Optional path to vault config file</param>
+        /// <returns>Initialized SecureApiClient</returns>
+        public static SecureApiClient CreateFromStandardLocations(string vaultConfigPath = null)
+        {
+            // Try vault config path first if provided
+            if (!string.IsNullOrEmpty(vaultConfigPath) && File.Exists(vaultConfigPath))
+            {
+                Logger.Info($"Using vault config path: {vaultConfigPath}");
+                return CreateFromConfigFile(vaultConfigPath);
+            }
+
+            // Try environment variable
+            string envPath = LeoAIDataUtilities.ReadEnvVariableByName("LEO_AUTH_KEY", false);
+            if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath))
+            {
+                Logger.Info($"Using config from environment variable: {envPath}");
+                return CreateFromConfigFile(envPath);
+            }
+
+            // Fallback to default installation folder
+            string defaultPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
+            if (File.Exists(defaultPath))
+            {
+                Logger.Info($"Using config from default installation folder: {defaultPath}");
+                return CreateFromConfigFile(defaultPath);
+            }
+
+            // No config found
+            throw new FileNotFoundException(
+                "Leo AI authentication configuration not found!\n\n" +
+                "Please place the LeoAuthKey.json file in one of the following locations:\n" +
+                "1. Vault location: <vault_root>/LeoAI_TaskData/LeoAuthKey.json\n" +
+                "2. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\LeoAuthKey.json\n" +
+                "3. Custom location specified in LEO_AUTH_KEY environment variable");
+        }
+
+        /// <summary>
+        /// Authentication configuration model
+        /// </summary>
+        private class LeoAuthConfig
+        {
+            public string ApiKey { get; set; }
+            public string ProjectId { get; set; }
         }
 
         public void SetJwtToken(string token)
@@ -176,6 +258,14 @@ namespace LeoAICadDataClient
                         else
                         {
                             Logger.Error($"Failed to create file: {logicalFilePath}. Status: {response.StatusCode}, Response: {responseString}");
+
+                            // Capture unexpected API errors to Sentry (excluding rate limits which are handled separately)
+                            if ((int)response.StatusCode != 429)
+                            {
+                                SentryApiErrorHandler.CaptureApiError("CreateFile", (int)response.StatusCode, responseString,
+                                    new Dictionary<string, string> { { "file", logicalFilePath }, { "directoryId", directoryId } });
+                            }
+
                             if ((int)response.StatusCode == 429)
                             {
                                 throw new Exception($"Rate limit (429): {responseString}");
@@ -188,6 +278,15 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"An exception occurred in CreateFile: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "CreateFile" },
+                        { "file", logicalFilePath },
+                        { "directoryId", directoryId }
+                    });
+
                     throw;
                 }
             }, $"CreateFile({Path.GetFileName(logicalFilePath)})");
@@ -251,6 +350,14 @@ namespace LeoAICadDataClient
                     else
                     {
                         Logger.Error($"Failed to create directory. Status: {response.StatusCode}, Response: {responseString}");
+
+                        // Capture unexpected API errors to Sentry
+                        if ((int)response.StatusCode != 429)
+                        {
+                            SentryApiErrorHandler.CaptureApiError("CreateDirectory", (int)response.StatusCode, responseString,
+                                new Dictionary<string, string> { { "machineId", machineId }, { "uri", uri } });
+                        }
+
                         if ((int)response.StatusCode == 429)
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
@@ -261,6 +368,15 @@ namespace LeoAICadDataClient
                 catch (Exception ex)
                 {
                     Logger.Error($"CreateDirectory failed: {ex.Message}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "CreateDirectory" },
+                        { "machineId", machineId },
+                        { "uri", uri }
+                    });
+
                     throw;
                 }
             }, $"CreateDirectory({machineId})");
@@ -285,6 +401,14 @@ namespace LeoAICadDataClient
                     else
                     {
                         Logger.Error($"GetDirectoryInfo failed. Status: {response.StatusCode}, Response: {responseString}");
+
+                        // Capture unexpected API errors to Sentry
+                        if ((int)response.StatusCode != 429)
+                        {
+                            SentryApiErrorHandler.CaptureApiError("GetDirectoryInfo", (int)response.StatusCode, responseString,
+                                new Dictionary<string, string> { { "machineId", machineId } });
+                        }
+
                         if ((int)response.StatusCode == 429)
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
@@ -295,6 +419,14 @@ namespace LeoAICadDataClient
                 catch (Exception ex)
                 {
                     Logger.Error($"Error in GetDirectoryInfo: {ex.Message}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "GetDirectoryInfo" },
+                        { "machineId", machineId }
+                    });
+
                     throw;
                 }
             }, $"GetDirectoryInfo({machineId})");
@@ -376,6 +508,14 @@ namespace LeoAICadDataClient
                     else
                     {
                         Logger.Error($"GetSyncMetadata failed. Status: {response.StatusCode}, Body: {responseString}");
+
+                        // Capture unexpected API errors to Sentry
+                        if ((int)response.StatusCode != 429)
+                        {
+                            SentryApiErrorHandler.CaptureApiError("GetSyncMetadata", (int)response.StatusCode, responseString,
+                                new Dictionary<string, string> { { "directoryId", directoryId }, { "filepath", filepathInDirectory ?? "all" } });
+                        }
+
                         if ((int)response.StatusCode == 429)
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
@@ -386,6 +526,15 @@ namespace LeoAICadDataClient
                 catch (Exception ex)
                 {
                     Logger.Error($"GetSyncMetadata: Exception occurred: {ex.Message}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "GetSyncMetadata" },
+                        { "directoryId", directoryId },
+                        { "filepath", filepathInDirectory ?? "all" }
+                    });
+
                     throw;
                 }
             }, $"GetSyncMetadata({directoryId}, {filepathInDirectory ?? "all"})");
@@ -417,6 +566,14 @@ namespace LeoAICadDataClient
                     {
                         var errorContent = await response.Content.ReadAsStringAsync();
                         Logger.Error($"Failed to delete file: {normalizedPath}. Status: {response.StatusCode}, Response: {errorContent}");
+
+                        // Capture unexpected API errors to Sentry
+                        if ((int)response.StatusCode != 429)
+                        {
+                            SentryApiErrorHandler.CaptureApiError("DeleteFile", (int)response.StatusCode, errorContent,
+                                new Dictionary<string, string> { { "file", normalizedPath }, { "directoryId", directoryId } });
+                        }
+
                         if ((int)response.StatusCode == 429)
                         {
                             throw new Exception($"Rate limit (429): {errorContent}");
@@ -428,6 +585,15 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"An exception occurred in DeleteFile: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "DeleteFile" },
+                        { "file", filePathInDirectory },
+                        { "directoryId", directoryId }
+                    });
+
                     throw;
                 }
             }, $"DeleteFile({filePathInDirectory})");
@@ -488,6 +654,14 @@ namespace LeoAICadDataClient
                         else
                         {
                             Logger.Error($"Failed to update file location: {filePath}. Status: {response.StatusCode}, Response: {responseString}");
+
+                            // Capture unexpected API errors to Sentry
+                            if ((int)response.StatusCode != 429)
+                            {
+                                SentryApiErrorHandler.CaptureApiError("UpdateFileLocation", (int)response.StatusCode, responseString,
+                                    new Dictionary<string, string> { { "file", filePath }, { "directoryId", directoryId }, { "checksum", checksum } });
+                            }
+
                             if ((int)response.StatusCode == 429)
                             {
                                 throw new Exception($"Rate limit (429): {responseString}");
@@ -500,6 +674,15 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"An exception occurred in UpdateFileLocation: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "UpdateFileLocation" },
+                        { "file", filePath },
+                        { "directoryId", directoryId }
+                    });
+
                     throw;
                 }
             }, $"UpdateFileLocation({Path.GetFileName(filePath)})");
@@ -525,6 +708,14 @@ namespace LeoAICadDataClient
                     {
                         var errorContent = await response.Content.ReadAsStringAsync();
                         Logger.Error($"Failed to delete directory: {directoryId}. Status: {response.StatusCode}, Response: {errorContent}");
+
+                        // Capture unexpected API errors to Sentry
+                        if ((int)response.StatusCode != 429)
+                        {
+                            SentryApiErrorHandler.CaptureApiError("DeleteDirectory", (int)response.StatusCode, errorContent,
+                                new Dictionary<string, string> { { "directoryId", directoryId } });
+                        }
+
                         if ((int)response.StatusCode == 429)
                         {
                             throw new Exception($"Rate limit (429): {errorContent}");
@@ -536,6 +727,14 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"An exception occurred in DeleteDirectory: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "DeleteDirectory" },
+                        { "directoryId", directoryId }
+                    });
+
                     throw;
                 }
             }, $"DeleteDirectory({directoryId})");

@@ -17,12 +17,6 @@ namespace LeoAISwPdmAddIn
     /// </summary>
     public class LeoAIUnsync
     {
-        // Add LeoAuthConfig definition for use in this file
-        public class LeoAuthConfig {
-            public string ApiKey { get; set; }
-            public string ProjectId { get; set; }
-        }
-
         [STAThread]
         static void Main(string[] args)
         {
@@ -65,15 +59,20 @@ namespace LeoAISwPdmAddIn
                     PrintCompletionMessage();
                     return;
                 }
-                var authConfig = ReadAuthConfig();
-                if (authConfig == null)
+                SecureApiClient client;
+                try
                 {
-                    Console.WriteLine("No valid authentication configuration found. Cannot proceed.");
+                    client = SecureApiClient.CreateFromStandardLocations();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"No valid authentication configuration found: {ex.Message}");
+                    Console.WriteLine("Cannot proceed.");
                     PrintCompletionMessage();
                     return;
                 }
 
-                var directories = GetLeoAIDirectories(authConfig);
+                var directories = GetLeoAIDirectories(client);
                 if (directories == null)
                 {
                     PrintCompletionMessage();
@@ -87,7 +86,7 @@ namespace LeoAISwPdmAddIn
                     PrintCompletionMessage();
                     return;
                 }
-                await UnsyncVaults(selectedVaultPaths, directories, authConfig);
+                await UnsyncVaults(selectedVaultPaths, directories, client);
                 PrintCompletionMessage();
             }
             catch (Exception ex)
@@ -200,7 +199,7 @@ namespace LeoAISwPdmAddIn
         }
 
         // Performs the unsync operation for each selected vault path
-        static async Task UnsyncVaults(List<string> selectedVaultPaths, List<LeoDirectoryInfo> directories, LeoAuthConfig authConfig)
+        static async Task UnsyncVaults(List<string> selectedVaultPaths, List<LeoDirectoryInfo> directories, SecureApiClient leoClient)
         {
             foreach (var vaultPath in selectedVaultPaths)
             {
@@ -211,7 +210,6 @@ namespace LeoAISwPdmAddIn
                     continue;
                 }
                 Console.WriteLine($"Deleting Leo AI index for vault path '{vaultPath}' (directory: {dir.Uri})...");
-                var leoClient = new SecureApiClient(authConfig.ApiKey, authConfig.ProjectId);
                 bool success = await leoClient.DeleteDirectoryAsync(dir.Id);
                 if (success)
                 {
@@ -330,74 +328,10 @@ namespace LeoAISwPdmAddIn
             }
         }
 
-        // Exact auth config loading logic from SwPdmAddinMain
-        private static LeoAuthConfig ReadAuthConfig()
-        {
-            try
-            {
-                string configFilePath = null;
-                // First, try to read the path from environment variable
-                string envPath = LeoAIDataUtilities.ReadEnvVariableByName("LEO_AUTH_KEY", false);
-                if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath))
-                {
-                    configFilePath = envPath;
-                }
-                else
-                {
-                    // Fallback to default location
-                    string defaultPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
-                    if (File.Exists(defaultPath))
-                    {
-                        configFilePath = defaultPath;
-                    }
-                }
-                if (string.IsNullOrEmpty(configFilePath))
-                {
-                    Console.WriteLine("Leo AI authentication configuration not found!\n\n" +
-                        "Please place the auth.json file in one of the following locations:\n" +
-                        "1. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\LeoAuthKey.json\n" +
-                        "2. Custom location specified in LEO_AUTH_KEY environment variable\n\n" +
-                        "The auth.json file should contain:\n" +
-                        "{\n  \"ApiKey\": \"your-api-key\",\n  \"ProjectId\": \"your-project-id\"\n}\n\n" +
-                        "You can get the authentication keys from the Leo AI Admin Dashboard\n(available in Leo Business/Enterprise accounts).");
-                    return null;
-                }
-                string jsonContent = File.ReadAllText(configFilePath);
-                LeoAuthConfig config = ParseAuthConfig(jsonContent);
-                if (config == null || string.IsNullOrEmpty(config.ApiKey) || string.IsNullOrEmpty(config.ProjectId))
-                {
-                    Console.WriteLine($"Invalid Leo AI authentication configuration in file: {configFilePath}\n\n" +
-                        "The auth.json file should contain:\n" +
-                        "{\n  \"ApiKey\": \"your-api-key\",\n  \"ProjectId\": \"your-project-id\"\n}\n\n" +
-                        "Both ApiKey and ProjectId are required and cannot be empty.\n" +
-                        "You can get the authentication keys from the Leo AI Admin Dashboard\n(available in Leo Business/Enterprise accounts).");
-                    return null;
-                }
-                return config;
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Error reading Leo AI authentication configuration: {ex.Message}\n\n" +
-                    "Please ensure the auth.json file is properly formatted:\n" +
-                    "{\n  \"ApiKey\": \"your-api-key\",\n  \"ProjectId\": \"your-project-id\"\n}\n\n" +
-                    "You can get the authentication keys from the Leo AI Admin Dashboard\n(available in Leo Business/Enterprise accounts).");
-                return null;
-            }
-        }
-        private static LeoAuthConfig ParseAuthConfig(string jsonContent)
-        {
-            try
-            {
-                var dict = Newtonsoft.Json.JsonConvert.DeserializeObject<Dictionary<string, string>>(jsonContent);
-                return new LeoAuthConfig { ApiKey = dict["ApiKey"], ProjectId = dict["ProjectId"] };
-            }
-            catch { return null; }
-        }
 
         // Handles all Leo AI API interactions and error handling
-        static List<LeoDirectoryInfo> GetLeoAIDirectories(LeoAuthConfig authConfig)
+        static List<LeoDirectoryInfo> GetLeoAIDirectories(SecureApiClient leoClient)
         {
-            var leoClient = new SecureApiClient(authConfig.ApiKey, authConfig.ProjectId);
             string macAddress = LeoAIDataUtilities.GetFormattedMacAddress();
             
             Console.WriteLine("Connecting to Leo AI server...");
