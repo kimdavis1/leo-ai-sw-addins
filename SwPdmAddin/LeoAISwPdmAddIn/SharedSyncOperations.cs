@@ -686,6 +686,7 @@ namespace LeoAISwPdmAddIn
                 }
 
                 // Calculate checksums for all vault files using archive-first approach
+                // Use streaming checksums for memory efficiency with large files
                 int checksumProgress = 0;
                 foreach (var vaultFile in vaultFiles)
                 {
@@ -701,7 +702,8 @@ namespace LeoAISwPdmAddIn
                             bool needsCleanup;
                             (readablePath, needsCleanup) = GetReadableFilePath(vault, vaultFile.file, folder.ID, tryArchiveFirst);
 
-                            var fileInfo = LeoFileInfo.GetFileInfo(readablePath);
+                            // Use streaming checksum for memory efficiency (doesn't load entire file into RAM)
+                            var fileInfo = LeoFileInfo.GetFileInfoStreaming(readablePath);
                             vaultFile.checkSum = fileInfo.CheckSum;
 
                             if (needsCleanup)
@@ -717,7 +719,8 @@ namespace LeoAISwPdmAddIn
                     }
 
                     checksumProgress++;
-                    if (checksumProgress % 10 == 0)
+                    // Report progress every 100 files instead of every 10 to reduce overhead
+                    if (checksumProgress % 100 == 0)
                     {
                         try
                         {
@@ -741,12 +744,12 @@ namespace LeoAISwPdmAddIn
                     LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
                 }
 
-                // Get all files from server
-                var serverData = await leoClient.GetSyncMetadataAsync(directoryId);
+                // Get all files from server using pagination
+                var serverFilesList = await leoClient.GetAllSyncMetadataAsync(directoryId);
                 Dictionary<string, SyncMetadataFile> serverFiles = new Dictionary<string, SyncMetadataFile>(StringComparer.OrdinalIgnoreCase);
-                if (serverData?.Files != null)
+                if (serverFilesList != null)
                 {
-                    foreach (var file in serverData.Files)
+                    foreach (var file in serverFilesList)
                     {
                         try
                         {
@@ -931,14 +934,19 @@ namespace LeoAISwPdmAddIn
                         // Pass alreadyOnServer set so dependencies that exist on server aren't re-uploaded
                         await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath, leoClient, directoryId, tryArchiveFirst, alreadyOnServer);
                         uploaded++;
-                        try
+
+                        // Report progress every 100 files instead of every file to reduce overhead
+                        if (uploaded % 100 == 0 || uploaded == totalFilesToUpload)
                         {
-                            int progress = 60 + (int)((uploaded / (float)uploadTotal) * 20);
-                            taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{totalFilesToUpload} files");
-                        }
-                        catch (Exception progEx)
-                        {
-                            LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
+                            try
+                            {
+                                int progress = 60 + (int)((uploaded / (float)uploadTotal) * 20);
+                                taskInstance.SetProgressPos(progress, $"Uploaded {uploaded}/{totalFilesToUpload} files");
+                            }
+                            catch (Exception progEx)
+                            {
+                                LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
+                            }
                         }
                     }
                     catch (Exception ex)
@@ -974,14 +982,19 @@ namespace LeoAISwPdmAddIn
                         {
                             LogFileWriter.LogMessage($"Failed to delete from server: {relativePath}");
                         }
-                        try
+
+                        // Report progress every 100 files instead of every file to reduce overhead
+                        if (deleted % 100 == 0 || deleted == filesToDelete.Count)
                         {
-                            int progress = 80 + (int)((deleted / (float)deleteTotal) * 10);
-                            taskInstance.SetProgressPos(progress, $"Deleted {deleted}/{filesToDelete.Count} files");
-                        }
-                        catch (Exception progEx)
-                        {
-                            LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
+                            try
+                            {
+                                int progress = 80 + (int)((deleted / (float)deleteTotal) * 10);
+                                taskInstance.SetProgressPos(progress, $"Deleted {deleted}/{filesToDelete.Count} files");
+                            }
+                            catch (Exception progEx)
+                            {
+                                LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
+                            }
                         }
                     }
                     catch (Exception ex)

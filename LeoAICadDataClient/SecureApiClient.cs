@@ -236,7 +236,7 @@ namespace LeoAICadDataClient
                         content.Add(new StringContent(memeType), "mimeType");
                         content.Add(new StringContent(fInfo.CheckSum), "checkSum");
                         content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
-                        content.Add(new StringContent(externalId), "externalId");
+                        // content.Add(new StringContent(externalId), "externalId");
 
                         var fileBytes = Convert.FromBase64String(fInfo.Base64EncodedFile);
                         content.Add(new ByteArrayContent(fileBytes), "file", Path.GetFileName(logicalFilePath));
@@ -481,9 +481,121 @@ namespace LeoAICadDataClient
             }
         }
 
+        // Default page size for pagination - adjust this value for testing
+        private const int DEFAULT_SYNC_METADATA_PAGE_SIZE = 1000;
+
         public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId)
         {
             return await GetSyncMetadataAsync(directoryId, null);
+        }
+
+        /// <summary>
+        /// Get sync metadata with pagination support.
+        /// </summary>
+        /// <param name="directoryId">Directory ID</param>
+        /// <param name="page">Page number (1-based)</param>
+        /// <param name="limit">Number of files per page</param>
+        /// <returns>Page of sync metadata</returns>
+        public async Task<SyncMetadataResponse> GetSyncMetadataPagedAsync(string directoryId, int page, int limit)
+        {
+            await RefreshTokenIfRequiredAsync();
+
+            return await ExecuteWithRetryAsync(async () =>
+            {
+                try
+                {
+                    string url = $"api/v1/synced-directories/{directoryId}/files/sync-metadata?page={page}&limit={limit}";
+                    Logger.Info($"GetSyncMetadataPaged: Fetching page {page} (limit {limit}) for directory {directoryId}");
+
+                    var response = await _httpClient.GetAsync(url);
+                    var responseString = await response.Content.ReadAsStringAsync();
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        return JsonConvert.DeserializeObject<SyncMetadataResponse>(responseString);
+                    }
+                    else
+                    {
+                        Logger.Error($"GetSyncMetadataPaged failed. Status: {response.StatusCode}, Body: {responseString}");
+
+                        // Capture unexpected API errors to Sentry
+                        if ((int)response.StatusCode != 429)
+                        {
+                            SentryApiErrorHandler.CaptureApiError("GetSyncMetadataPaged", (int)response.StatusCode, responseString,
+                                new Dictionary<string, string>
+                                {
+                                    { "directoryId", directoryId },
+                                    { "page", page.ToString() },
+                                    { "limit", limit.ToString() }
+                                });
+                        }
+
+                        if ((int)response.StatusCode == 429)
+                        {
+                            throw new Exception($"Rate limit (429): {responseString}");
+                        }
+                        return null;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"GetSyncMetadataPaged: Exception occurred: {ex.Message}");
+
+                    // Capture exception to Sentry
+                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "GetSyncMetadataPaged" },
+                        { "directoryId", directoryId },
+                        { "page", page.ToString() },
+                        { "limit", limit.ToString() }
+                    });
+
+                    throw;
+                }
+            }, $"GetSyncMetadataPaged({directoryId}, page={page}, limit={limit})");
+        }
+
+        /// <summary>
+        /// Get all sync metadata by fetching all pages.
+        /// Aggregates results from multiple API calls.
+        /// </summary>
+        /// <param name="directoryId">Directory ID</param>
+        /// <param name="pageSize">Number of files per page (default 1000)</param>
+        /// <returns>List of all files</returns>
+        public async Task<List<SyncMetadataFile>> GetAllSyncMetadataAsync(string directoryId, int pageSize = DEFAULT_SYNC_METADATA_PAGE_SIZE)
+        {
+            var allFiles = new List<SyncMetadataFile>();
+            int page = 0;
+            int totalFetched = 0;
+
+            Logger.Info($"GetAllSyncMetadata: Starting paginated fetch for directory {directoryId} (page size: {pageSize})");
+
+            while (true)
+            {
+                var response = await GetSyncMetadataPagedAsync(directoryId, page, pageSize);
+
+                if (response?.Files == null || response.Files.Count == 0)
+                {
+                    Logger.Info($"GetAllSyncMetadata: Page {page} returned no files - finished");
+                    break;
+                }
+
+                allFiles.AddRange(response.Files);
+                totalFetched += response.Files.Count;
+                Logger.Info($"GetAllSyncMetadata: Fetched page {page}, total files so far: {totalFetched}");
+
+                // If we got fewer files than page size, this was the last page
+                if (response.Files.Count < pageSize)
+                {
+                    Logger.Info($"GetAllSyncMetadata: Page {page} had {response.Files.Count} files (< {pageSize}) - last page");
+                    break;
+                }
+
+                page++;
+            }
+
+            Logger.Info($"GetAllSyncMetadata: Completed - fetched {allFiles.Count} files across {page} pages");
+            return allFiles;
         }
 
         public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId, string filepathInDirectory)
@@ -642,7 +754,7 @@ namespace LeoAICadDataClient
                         content.Add(new StringContent(mimeType), "mimeType");
                         content.Add(new StringContent(checksum), "checkSum");
                         content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
-                        content.Add(new StringContent(externalId), "externalId");
+                        // content.Add(new StringContent(externalId), "externalId");
 
                         // NOTE: We send checkSum so backend can identify which file to attach the new path to
                         // We do NOT send file content (no ByteArrayContent with Base64EncodedFile)
