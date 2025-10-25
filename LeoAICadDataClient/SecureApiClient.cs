@@ -279,13 +279,23 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in CreateFile: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Capture exception to Sentry with detailed context
+                    var errorContext = new Dictionary<string, string>
                     {
                         { "operation", "CreateFile" },
                         { "file", logicalFilePath },
-                        { "directoryId", directoryId }
-                    });
+                        { "directoryId", directoryId },
+                        { "error_type", ex.GetType().Name }
+                    };
+
+                    // Add inner exception details if available
+                    if (ex.InnerException != null)
+                    {
+                        errorContext.Add("inner_error", ex.InnerException.Message);
+                        errorContext.Add("inner_error_type", ex.InnerException.GetType().Name);
+                    }
+
+                    SentryApiErrorHandler.CaptureException(ex, errorContext);
 
                     throw;
                 }

@@ -56,13 +56,28 @@ namespace LeoAICadDataClient
 
             try
             {
-                // Simple capture without lambda expressions
+                // Add context as tags
+                if (context != null && context.Count > 0)
+                {
+                    foreach (var kvp in context)
+                    {
+                        SentrySdk.ConfigureScope(scope =>
+                        {
+                            scope.SetTag(kvp.Key, kvp.Value);
+                        });
+                    }
+                }
+
+                // Capture the exception
                 SentrySdk.CaptureException(exception);
 
                 // Flush immediately to ensure event is sent (API calls are often short-lived)
                 SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait();
 
-                Logger.Info($"Exception captured by Sentry: {exception.Message}");
+                string contextInfo = context != null && context.Count > 0
+                    ? $" (Context: {string.Join(", ", context.Keys)})"
+                    : "";
+                Logger.Info($"Exception captured by Sentry{contextInfo}: {exception.Message}");
             }
             catch (Exception ex)
             {
@@ -71,7 +86,7 @@ namespace LeoAICadDataClient
         }
 
         /// <summary>
-        /// Capture API error (non-exception) to Sentry.
+        /// Capture API error (non-exception) to Sentry with HTTP details.
         /// </summary>
         public static void CaptureApiError(string operation, int statusCode, string responseBody, Dictionary<string, string> context = null)
         {
@@ -82,6 +97,29 @@ namespace LeoAICadDataClient
 
             try
             {
+                // Add HTTP details to context
+                var enrichedContext = context != null ? new Dictionary<string, string>(context) : new Dictionary<string, string>();
+                enrichedContext["http_status_code"] = statusCode.ToString();
+                enrichedContext["operation"] = operation;
+
+                // Add truncated response body (limit to 500 chars to avoid huge Sentry events)
+                if (!string.IsNullOrEmpty(responseBody))
+                {
+                    string truncatedBody = responseBody.Length > 500
+                        ? responseBody.Substring(0, 500) + "..."
+                        : responseBody;
+                    enrichedContext["response_body"] = truncatedBody;
+                }
+
+                // Add context as tags
+                foreach (var kvp in enrichedContext)
+                {
+                    SentrySdk.ConfigureScope(scope =>
+                    {
+                        scope.SetTag(kvp.Key, kvp.Value);
+                    });
+                }
+
                 string message = $"API Error in {operation}: HTTP {statusCode}";
                 SentrySdk.CaptureMessage(message, SentryLevel.Error);
 
@@ -93,6 +131,45 @@ namespace LeoAICadDataClient
             catch (Exception ex)
             {
                 Logger.Error($"Failed to capture API error in Sentry: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add a breadcrumb for tracking API operation flow.
+        /// Breadcrumbs are automatically included when an exception is captured.
+        /// </summary>
+        public static void AddBreadcrumb(string message, string category = null, Dictionary<string, string> data = null)
+        {
+            if (!_isInitialized) return;
+
+            try
+            {
+                // Add breadcrumb to Sentry (will be included with any future errors)
+                SentrySdk.AddBreadcrumb(message, category, level: BreadcrumbLevel.Info, data: data);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed to add breadcrumb in Sentry: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add a breadcrumb for a key API operation milestone.
+        /// </summary>
+        public static void AddApiOperationBreadcrumb(string apiMethod, string message, Dictionary<string, string> data = null)
+        {
+            if (!_isInitialized) return;
+
+            try
+            {
+                var breadcrumbData = data != null ? new Dictionary<string, string>(data) : new Dictionary<string, string>();
+                breadcrumbData["api_method"] = apiMethod;
+
+                SentrySdk.AddBreadcrumb(message, "api", level: BreadcrumbLevel.Info, data: breadcrumbData);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Failed to add API operation breadcrumb in Sentry: {ex.Message}");
             }
         }
 

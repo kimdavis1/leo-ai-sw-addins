@@ -73,6 +73,17 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"  NewPath: {operation.NewPath ?? "N/A"}");
                 LogFileWriter.LogMessage($"  Timestamp: {operation.Timestamp}");
 
+                // Add breadcrumb with operation details
+                SentryErrorHandler.AddOperationBreadcrumb(
+                    operation.Operation,
+                    $"Processing {operation.Operation} operation",
+                    new Dictionary<string, string>
+                    {
+                        { "operation_type", operation.Operation },
+                        { "file", operation.NewPath ?? operation.OldPath ?? "unknown" }
+                    }
+                );
+
                 // Event operations use local-first mode (tryArchiveFirst = false)
                 bool tryArchiveFirst = false;
 
@@ -80,6 +91,7 @@ namespace LeoAISwPdmAddIn
                 {
                     case "Add":
                     case "Upload":
+                        SentryErrorHandler.AddOperationBreadcrumb("Upload", "Starting upload operation");
                         ProcessUploadOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
                         break;
 
@@ -1637,6 +1649,17 @@ namespace LeoAISwPdmAddIn
             string relativePath = GetRelativePath(vaultRootPath, filePath);
             LogFileWriter.LogMessage($"Uploading file: {relativePath}");
 
+            // Add breadcrumb for file upload start
+            SentryErrorHandler.AddOperationBreadcrumb(
+                "UploadFile",
+                $"Starting upload: {relativePath}",
+                new Dictionary<string, string>
+                {
+                    { "file", relativePath },
+                    { "has_dependencies", dependencies != null && dependencies.Count > 0 ? "yes" : "no" }
+                }
+            );
+
             string actualFilePath = null;
             bool needsCleanup = false;
 
@@ -1652,6 +1675,7 @@ namespace LeoAISwPdmAddIn
 
                 if (file != null && folder != null)
                 {
+                    SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Getting readable file path");
                     (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
 
                     // Calculate checksum to include in externalId
@@ -1671,6 +1695,8 @@ namespace LeoAISwPdmAddIn
 
                 // ALWAYS check if file exists on server and compare checksums before uploading
                 LogFileWriter.LogMessage($"Checking if file exists on server: {relativePath}");
+                SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Checking if file exists on server");
+
                 try
                 {
                     var serverFile = await leoClient.GetFileInfoByPathAsync(directoryId, relativePath);
@@ -1678,6 +1704,7 @@ namespace LeoAISwPdmAddIn
                     if (serverFile != null)
                     {
                         LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
+                        SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File found on server - comparing checksums");
 
                         // Calculate local file checksum
                         var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
@@ -1703,6 +1730,7 @@ namespace LeoAISwPdmAddIn
                         if (!needsReupload && serverFile.CheckSum == localChecksum)
                         {
                             LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - skipping upload");
+                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File unchanged - skipping upload");
                             // Don't upload - file already exists with same content
                             // Return true because file exists on server (treated as success for dependency tracking)
                             return true;
@@ -1711,6 +1739,7 @@ namespace LeoAISwPdmAddIn
                         if (needsReupload)
                         {
                             LogFileWriter.LogMessage($"File changed ({reason}) - deleting old version before upload");
+                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", $"Deleting old version: {reason}");
 
                             // Delete the old version first
                             bool deleted = await leoClient.DeleteFileAsync(directoryId, relativePath);
@@ -1727,6 +1756,7 @@ namespace LeoAISwPdmAddIn
                     else
                     {
                         LogFileWriter.LogMessage($"File does not exist on server - uploading as new file");
+                        SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File not found on server - new upload");
                     }
                 }
                 catch (Exception checkEx)
@@ -1736,11 +1766,23 @@ namespace LeoAISwPdmAddIn
 
                 // CreateFileAsync handles both create and update (with automatic retry for rate limits)
                 // Pass dependencies dictionary - will be converted to proper format and sent to server
+                SentryErrorHandler.AddOperationBreadcrumb(
+                    "UploadFile",
+                    "Calling API to create/update file",
+                    new Dictionary<string, string>
+                    {
+                        { "file", relativePath },
+                        { "dependency_count", dependencies?.Count.ToString() ?? "0" }
+                    }
+                );
+
                 var fileInfo = await leoClient.CreateFileAsync(directoryId, vaultRootPath, filePath, actualFilePath, externalId, dependencies);
 
                 if (fileInfo != null)
                 {
                     LogFileWriter.LogMessage($"File synced to server: {relativePath} (ID: {fileInfo.ComponentId})");
+                    SentryErrorHandler.AddOperationBreadcrumb("UploadFile", $"Upload successful: {relativePath}");
+
                     if (dependencies != null && dependencies.Count > 0)
                     {
                         LogFileWriter.LogMessage($"  With {dependencies.Count} dependencies attached");
@@ -1768,6 +1810,27 @@ namespace LeoAISwPdmAddIn
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Failed to upload file {filePath}: {ex.Message}");
+
+                // Capture detailed error context to Sentry
+                var errorContext = new Dictionary<string, string>
+                {
+                    { "operation", "UploadSingleFile" },
+                    { "file_path", filePath },
+                    { "relative_path", relativePath },
+                    { "directory_id", directoryId },
+                    { "has_dependencies", dependencies != null && dependencies.Count > 0 ? "yes" : "no" },
+                    { "dependency_count", dependencies?.Count.ToString() ?? "0" },
+                    { "used_temp_file", needsCleanup ? "yes" : "no" },
+                    { "error_type", ex.GetType().Name }
+                };
+
+                // Add API error details if available
+                if (ex.InnerException != null)
+                {
+                    errorContext.Add("inner_error", ex.InnerException.Message);
+                }
+
+                SentryErrorHandler.CaptureException(ex, errorContext);
 
                 // Still try to clean up temp file even if upload failed
                 if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
@@ -2020,12 +2083,41 @@ namespace LeoAISwPdmAddIn
                 {
                     // Handle specific PDM COM errors
                     LogFileWriter.LogError($"PDM COM error for {logicalPath}: HRESULT 0x{comEx.ErrorCode:X8}, Message: {comEx.Message}");
+
+                    // Capture detailed PDM error context to Sentry
+                    var errorContext = new Dictionary<string, string>
+                    {
+                        { "operation", "GetFileCopy" },
+                        { "file_path", logicalPath },
+                        { "folder_id", folderID.ToString() },
+                        { "hresult", $"0x{comEx.ErrorCode:X8}" },
+                        { "error_type", "PDM_COM_Error" },
+                        { "try_archive_first", tryArchiveFirst ? "yes" : "no" }
+                    };
+
+                    SentryErrorHandler.CaptureException(comEx, errorContext);
+
                     throw new Exception($"PDM error accessing file: {comEx.Message}", comEx);
                 }
             }
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Failed to get readable file path for {logicalPath}: {ex.Message}");
+
+                // Capture generic error if not already captured
+                if (!(ex is System.Runtime.InteropServices.COMException))
+                {
+                    var errorContext = new Dictionary<string, string>
+                    {
+                        { "operation", "GetReadableFilePath" },
+                        { "file_path", logicalPath },
+                        { "folder_id", folderID.ToString() },
+                        { "error_type", ex.GetType().Name }
+                    };
+
+                    SentryErrorHandler.CaptureException(ex, errorContext);
+                }
+
                 throw;
             }
         }

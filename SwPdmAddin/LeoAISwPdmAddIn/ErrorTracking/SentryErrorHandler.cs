@@ -84,14 +84,29 @@ namespace LeoAISwPdmAddIn.ErrorTracking
 
             try
             {
-                // Simple capture without context to avoid lambdas
+                // Add context data without using lambdas
+                if (context != null && context.Count > 0)
+                {
+                    foreach (var kvp in context)
+                    {
+                        SentrySdk.ConfigureScope(scope =>
+                        {
+                            scope.SetTag(kvp.Key, kvp.Value);
+                        });
+                    }
+                }
+
+                // Capture the exception
                 SentrySdk.CaptureException(exception);
 
                 // Flush immediately to ensure event is sent (PDM events are short-lived)
                 SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait();
 
                 // Also log locally for redundancy
-                LogFileWriter.LogError($"Exception tracked to Sentry: {exception.Message}");
+                string contextInfo = context != null && context.Count > 0
+                    ? $" (Context: {string.Join(", ", context.Keys)})"
+                    : "";
+                LogFileWriter.LogError($"Exception tracked to Sentry{contextInfo}: {exception.Message}");
             }
             catch (Exception ex)
             {
@@ -118,7 +133,8 @@ namespace LeoAISwPdmAddIn.ErrorTracking
         }
 
         /// <summary>
-        /// Add a breadcrumb for tracking user flow
+        /// Add a breadcrumb for tracking operation flow.
+        /// Breadcrumbs are automatically included when an exception is captured.
         /// </summary>
         public static void AddBreadcrumb(string message, string category = null, Dictionary<string, string> data = null)
         {
@@ -126,11 +142,33 @@ namespace LeoAISwPdmAddIn.ErrorTracking
 
             try
             {
+                // Add breadcrumb to Sentry (will be included with any future errors)
                 SentrySdk.AddBreadcrumb(message, category, level: BreadcrumbLevel.Info, data: data);
             }
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Failed to add breadcrumb in Sentry: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Add a breadcrumb for a key operation milestone.
+        /// Use this to track the main steps in a process.
+        /// </summary>
+        public static void AddOperationBreadcrumb(string operation, string message, Dictionary<string, string> data = null)
+        {
+            if (!_isInitialized) return;
+
+            try
+            {
+                var breadcrumbData = data != null ? new Dictionary<string, string>(data) : new Dictionary<string, string>();
+                breadcrumbData["operation"] = operation;
+
+                SentrySdk.AddBreadcrumb(message, "operation", level: BreadcrumbLevel.Info, data: breadcrumbData);
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to add operation breadcrumb in Sentry: {ex.Message}");
             }
         }
 
