@@ -35,11 +35,19 @@ namespace LeoAICadDataClient
 		/// <summary>
 		/// Original method - loads entire file into memory.
 		/// Use this for event-based operations where we need the Base64 content immediately.
+		/// Uses FileShare.Read to allow reading files that are open in other processes (e.g., SOLIDWORKS).
 		/// </summary>
 		public static LeoFileInformation GetFileInfo(string filePath)
 		{
-			// Read file as byte array
-			byte[] fileBytes = File.ReadAllBytes(filePath);
+			byte[] fileBytes;
+
+			// Read file with FileShare.ReadWrite to allow access even if file is open in SOLIDWORKS
+			// Must use ReadWrite because SOLIDWORKS may have the file open for writing
+			using (FileStream fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+			{
+				fileBytes = new byte[fs.Length];
+				fs.Read(fileBytes, 0, (int)fs.Length);
+			}
 
 			// Compute xxHash64 checksum with hex output (to match Electron app)
 			string checkSum = ComputeXXHash64Hex(fileBytes);
@@ -58,10 +66,12 @@ namespace LeoAICadDataClient
 
 		/// <summary>
 		/// Compute xxHash64 by streaming file in chunks (memory-efficient).
+		/// Uses FileShare.ReadWrite to allow reading files that are open for writing in SOLIDWORKS.
 		/// </summary>
 		static string ComputeXXHash64HexStreaming(string filePath)
 		{
-			using (var stream = File.OpenRead(filePath))
+			// Must use FileShare.ReadWrite to read files that SOLIDWORKS has open for writing
+			using (var stream = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
 			{
 				var xxHash = new XxHash64(UNIVERSAL_FILE_HASHING_SEED);
 				byte[] buffer = new byte[STREAM_BUFFER_SIZE];
