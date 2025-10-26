@@ -1142,12 +1142,17 @@ namespace LeoAISwPdmAddIn
 
         /// <summary>
         /// Gets all file dependencies (references) for a given file
-        /// Returns a list of relative paths (checksums calculated later when uploading)
+        /// Returns dependencies organized by level (depth in dependency tree)
+        /// Level 0 = direct dependencies, Level 1 = dependencies of dependencies, etc.
+        /// Higher levels (deeper in tree) should be processed first as they have no subdependencies
         /// Uses recursive traversal of the PDM reference tree
         /// </summary>
-        private static List<string> GetFileDependencies(IEdmVault11 vault, string filePath, string vaultRootPath)
+        private static Dictionary<int, List<string>> GetFileDependencies(IEdmVault11 vault, string filePath, string vaultRootPath)
         {
-            HashSet<string> dependencies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Dictionary: level -> list of file paths at that level
+            // Also track which files we've seen to avoid duplicates
+            Dictionary<int, List<string>> dependenciesByLevel = new Dictionary<int, List<string>>();
+            HashSet<string> seenFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             try
             {
@@ -1161,7 +1166,7 @@ namespace LeoAISwPdmAddIn
                 if (file == null || folder == null)
                 {
                     LogFileWriter.LogMessage($"GetFileDependencies: File not found: {fullPath}");
-                    return new List<string>();
+                    return dependenciesByLevel;
                 }
 
                 // Get the reference tree for this file
@@ -1170,28 +1175,29 @@ namespace LeoAISwPdmAddIn
                 if (referenceTree == null)
                 {
                     LogFileWriter.LogMessage($"GetFileDependencies: No reference tree for: {filePath}");
-                    return new List<string>();
+                    return dependenciesByLevel;
                 }
 
-                // Recursively traverse the reference tree to collect dependency paths
-                TraverseReferences(vault, referenceTree, "", 0, true, vaultRootPath, dependencies);
+                // Recursively traverse the reference tree to collect dependency paths by level
+                TraverseReferences(vault, referenceTree, "", 0, true, vaultRootPath, dependenciesByLevel, seenFiles);
 
-                LogFileWriter.LogMessage($"GetFileDependencies: Found {dependencies.Count} dependencies for {filePath}");
+                int totalCount = dependenciesByLevel.Values.Sum(list => list.Count);
+                LogFileWriter.LogMessage($"GetFileDependencies: Found {totalCount} dependencies across {dependenciesByLevel.Count} levels for {filePath}");
             }
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"GetFileDependencies failed for {filePath}: {ex.Message}");
-                // Return empty list - file will be uploaded without dependencies
+                // Return empty dictionary - file will be uploaded without dependencies
             }
 
-            return new List<string>(dependencies);
+            return dependenciesByLevel;
         }
 
         /// <summary>
-        /// Recursively traverses the PDM reference tree to extract all dependency paths
+        /// Recursively traverses the PDM reference tree to extract all dependency paths organized by level
         /// Filters out invalid references like weldment cut-list items
         /// </summary>
-        private static void TraverseReferences(IEdmVault11 vault, IEdmReference10 reference, string projectName, int level, bool isTop, string vaultRootPath, HashSet<string> dependencies)
+        private static void TraverseReferences(IEdmVault11 vault, IEdmReference10 reference, string projectName, int level, bool isTop, string vaultRootPath, Dictionary<int, List<string>> dependenciesByLevel, HashSet<string> seenFiles)
         {
             try
             {
@@ -1210,15 +1216,23 @@ namespace LeoAISwPdmAddIn
                             {
                                 string relativePath = GetRelativePath(vaultRootPath, childRef.FoundPath);
 
-                                // Add dependency if not already added
-                                if (!dependencies.Contains(relativePath))
+                                // Add dependency if not already seen
+                                if (!seenFiles.Contains(relativePath))
                                 {
-                                    dependencies.Add(relativePath);
+                                    seenFiles.Add(relativePath);
+
+                                    // Add to the appropriate level list
+                                    if (!dependenciesByLevel.ContainsKey(level))
+                                    {
+                                        dependenciesByLevel[level] = new List<string>();
+                                    }
+                                    dependenciesByLevel[level].Add(relativePath);
+
                                     LogFileWriter.LogMessage($"  Dependency (level {level}): {relativePath}");
                                 }
 
                                 // Recursively traverse this child's dependencies
-                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependencies);
+                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependenciesByLevel, seenFiles);
                             }
                             else
                             {
@@ -1242,15 +1256,23 @@ namespace LeoAISwPdmAddIn
                             {
                                 string relativePath = GetRelativePath(vaultRootPath, childRef.FoundPath);
 
-                                // Add dependency if not already added
-                                if (!dependencies.Contains(relativePath))
+                                // Add dependency if not already seen
+                                if (!seenFiles.Contains(relativePath))
                                 {
-                                    dependencies.Add(relativePath);
+                                    seenFiles.Add(relativePath);
+
+                                    // Add to the appropriate level list
+                                    if (!dependenciesByLevel.ContainsKey(level))
+                                    {
+                                        dependenciesByLevel[level] = new List<string>();
+                                    }
+                                    dependenciesByLevel[level].Add(relativePath);
+
                                     LogFileWriter.LogMessage($"  Dependency (level {level}): {relativePath}");
                                 }
 
                                 // Recursively traverse this child's dependencies
-                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependencies);
+                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependenciesByLevel, seenFiles);
                             }
                             else
                             {
@@ -1373,65 +1395,71 @@ namespace LeoAISwPdmAddIn
 
             LogFileWriter.LogMessage($"=== Processing file: {relativePath} ===");
 
-            // Get dependencies for this file (just paths, no checksums yet)
-            List<string> dependencyPaths = GetFileDependencies(vault, filePath, vaultRootPath);
+            // Get dependencies for this file organized by level (depth in dependency tree)
+            Dictionary<int, List<string>> dependenciesByLevel = GetFileDependencies(vault, filePath, vaultRootPath);
 
-            // If file has dependencies, upload them first (recursively)
-            if (dependencyPaths.Count > 0)
+            // If file has dependencies, upload them first (level by level, deepest first)
+            int totalDependencies = dependenciesByLevel.Values.Sum(list => list.Count);
+            if (totalDependencies > 0)
             {
-                LogFileWriter.LogMessage($"File has {dependencyPaths.Count} dependencies - uploading dependencies first");
+                LogFileWriter.LogMessage($"File has {totalDependencies} dependencies across {dependenciesByLevel.Count} levels - uploading dependencies level-by-level (deepest first)");
 
-                foreach (var depRelativePath in dependencyPaths)
+                // Process levels from highest (deepest) to lowest (direct dependencies)
+                // This ensures dependencies are uploaded before files that depend on them
+                var sortedLevels = dependenciesByLevel.Keys.OrderByDescending(level => level).ToList();
+
+                foreach (var level in sortedLevels)
                 {
-                    // Skip if already uploaded - the recursive call will handle this check too
-                    if (uploadedFiles.Contains(depRelativePath))
+                    var filesAtLevel = dependenciesByLevel[level];
+                    LogFileWriter.LogMessage($"Processing level {level} ({filesAtLevel.Count} files) in parallel");
+
+                    // Process all files at this level in parallel
+                    var uploadTasks = new List<Task>();
+
+                    foreach (var depRelativePath in filesAtLevel)
                     {
-                        LogFileWriter.LogMessage($"  Dependency already uploaded, skipping: {depRelativePath}");
-                        continue;
-                    }
+                        // Skip if already uploaded
+                        if (uploadedFiles.Contains(depRelativePath))
+                        {
+                            LogFileWriter.LogMessage($"  [Level {level}] Dependency already uploaded, skipping: {depRelativePath}");
+                            continue;
+                        }
 
-                    // Check if this dependency is part of a move/rename operation
-                    bool isDependencyBeingMoved = moveMap != null && moveMap.ContainsKey(depRelativePath);
+                        // Check if this dependency is part of a move/rename operation
+                        bool isDependencyBeingMoved = moveMap != null && moveMap.ContainsKey(depRelativePath);
 
-                    if (isDependencyBeingMoved)
-                    {
-                        // Dependency is being moved - check if we can use UpdateFileLocationAsync
-                        string oldDepRelativePath = moveMap[depRelativePath];
-                        LogFileWriter.LogMessage($"  Dependency is being moved: {oldDepRelativePath} -> {depRelativePath}");
-
-                        // This will be handled by the recursive call - just call UploadFileWithDependencies
-                        // which will check checksums and decide whether to use UpdateFileLocationAsync or full upload
+                        // Convert relative path back to full path
                         string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
 
-                        try
+                        if (isDependencyBeingMoved)
                         {
-                            // Recursively process this dependency (will check checksum and choose upload method)
-                            await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
+                            string oldDepRelativePath = moveMap[depRelativePath];
+                            LogFileWriter.LogMessage($"  [Level {level}] Dependency is being moved: {oldDepRelativePath} -> {depRelativePath}");
                         }
-                        catch (Exception ex)
-                        {
-                            LogFileWriter.LogError($"Failed to process moved dependency {depRelativePath}: {ex.Message}");
-                            LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
-                        }
-                    }
-                    else
-                    {
-                        // Dependency is new or already exists - use normal upload flow
-                        // Convert relative path back to full path for recursive call
-                        string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
 
-                        try
+                        // Create upload task for this dependency
+                        var uploadTask = Task.Run(async () =>
                         {
-                            // Recursively upload this dependency (and its dependencies)
-                            // The recursive call will skip if already in uploadedFiles set
-                            await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
-                        }
-                        catch (Exception ex)
-                        {
-                            // Log error but continue - missing dependencies shouldn't fail the entire operation
-                            LogFileWriter.LogError($"Failed to upload dependency {depRelativePath}: {ex.Message}");
-                            LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
-                        }
+                            try
+                            {
+                                // Recursively process this dependency (will check checksum and choose upload method)
+                                await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
+                            }
+                            catch (Exception ex)
+                            {
+                                LogFileWriter.LogError($"[Level {level}] Failed to upload dependency {depRelativePath}: {ex.Message}");
+                                LogFileWriter.LogMessage($"Continuing without dependency: {depRelativePath}");
+                            }
+                        });
+
+                        uploadTasks.Add(uploadTask);
+                    }
+
+                    // Wait for all files at this level to complete before moving to next level
+                    if (uploadTasks.Count > 0)
+                    {
+                        await Task.WhenAll(uploadTasks);
+                        LogFileWriter.LogMessage($"Level {level} completed ({uploadTasks.Count} parallel uploads)");
                     }
                 }
             }
@@ -1439,7 +1467,11 @@ namespace LeoAISwPdmAddIn
             // Build dependency dictionary with checksums for files that were uploaded
             // Dictionary format: Key = checksum, Value = filePath (for ChildData constructor)
             Dictionary<string, string> dependenciesWithChecksums = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var depRelativePath in dependencyPaths)
+
+            // Flatten all dependency paths from all levels
+            var allDependencyPaths = dependenciesByLevel.Values.SelectMany(list => list).ToList();
+
+            foreach (var depRelativePath in allDependencyPaths)
             {
                 // Only include dependencies that were successfully uploaded
                 if (uploadedFiles.Contains(depRelativePath))
