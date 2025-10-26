@@ -967,15 +967,44 @@ namespace LeoAISwPdmAddIn
         /// </summary>
         private OperationMetadata CreateOperationMetadata(string operationType, EdmCmdData cmdData, IEdmVault5 vault)
         {
-            // For Upload operations, mbsStrData2 is empty - use mbsStrData1 as NewPath
-            // For Move/Rename, mbsStrData1 = old path, mbsStrData2 = new path
-            string newPath = string.IsNullOrEmpty(cmdData.mbsStrData2) ? cmdData.mbsStrData1 : cmdData.mbsStrData2;
+            // For PostAdd events:
+            //   mbsStrData1 = vault path (where file was added TO)
+            //   mbsStrData2 = local/source path (where it came FROM) or empty
+            // For Upload/PostUnlock events:
+            //   mbsStrData1 = vault path
+            //   mbsStrData2 = empty
+            // For Move/Rename events:
+            //   mbsStrData1 = old path
+            //   mbsStrData2 = new path
+
+            string oldPath, newPath;
+
+            if (operationType == "Add")
+            {
+                // For Add: file is being added TO vault
+                // NewPath = where it's going (vault path in mbsStrData1)
+                // OldPath = where it came from (local path in mbsStrData2, or empty)
+                newPath = cmdData.mbsStrData1;  // vault path
+                oldPath = cmdData.mbsStrData2;  // local/source path (may be empty)
+            }
+            else if (string.IsNullOrEmpty(cmdData.mbsStrData2))
+            {
+                // Upload/PostUnlock: only mbsStrData1 is set (vault path)
+                newPath = cmdData.mbsStrData1;
+                oldPath = cmdData.mbsStrData1;
+            }
+            else
+            {
+                // Move/Rename: mbsStrData1 = old, mbsStrData2 = new
+                oldPath = cmdData.mbsStrData1;
+                newPath = cmdData.mbsStrData2;
+            }
 
             return new OperationMetadata
             {
                 Id = Guid.NewGuid().ToString(),
                 Operation = operationType,
-                OldPath = cmdData.mbsStrData1,
+                OldPath = oldPath,
                 NewPath = newPath,
                 FileID = cmdData.mlObjectID1,
                 FolderID = cmdData.mlObjectID2,
