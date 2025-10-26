@@ -1,6 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using EPDM.Interop.epdm;
 using LeoAICadDataClient;
 
@@ -10,6 +13,7 @@ namespace LeoAISwPdmAddIn
     {
         private IEdmVault5 swPdmVault;
 
+        // Use ConcurrentBag for thread-safe parallel operations
         public List<FileData> FilesInfo { get; set; }
 
         public SolidWorksPdmHelper(IEdmVault5 edmVault)
@@ -90,11 +94,35 @@ namespace LeoAISwPdmAddIn
         {
             try
             {
-            FilesInfo = new List<FileData>();
-            IEdmFolder5 rootFolder = edmVault.RootFolder;
-                ListFoldersAndFiles(rootFolder, edmVault);
-            return true;
-        }
+                FilesInfo = new List<FileData>();
+                IEdmFolder5 rootFolder = edmVault.RootFolder;
+
+                // Step 1: Collect all folders (must be sequential due to COM threading)
+                List<IEdmFolder5> allFolders = new List<IEdmFolder5>();
+                CollectAllFolders(rootFolder, allFolders);
+                LogFileWriter.LogMessage($"Found {allFolders.Count} folders to process");
+
+                // Step 2: Process folders in parallel
+                ConcurrentBag<FileData> concurrentResults = new ConcurrentBag<FileData>();
+
+                Parallel.ForEach(allFolders, folder =>
+                {
+                    try
+                    {
+                        ProcessSingleFolder(folder, edmVault, concurrentResults);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Error processing folder in parallel: {ex.Message}");
+                    }
+                });
+
+                // Convert ConcurrentBag to List
+                FilesInfo = concurrentResults.ToList();
+                LogFileWriter.LogMessage($"Processed {FilesInfo.Count} files from {allFolders.Count} folders");
+
+                return true;
+            }
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Error processing folders: {ex.Message}");
@@ -102,26 +130,63 @@ namespace LeoAISwPdmAddIn
             }
         }
 
-        private void ListFoldersAndFiles(IEdmFolder5 folder, IEdmVault5 vault)
+        /// <summary>
+        /// Recursively collect all folders (must run on main thread due to COM)
+        /// </summary>
+        private void CollectAllFolders(IEdmFolder5 folder, List<IEdmFolder5> folderList)
         {
             try
             {
+                folderList.Add(folder);
+
+                IEdmPos5 subFolderPos = folder.GetFirstSubFolderPosition();
+                while (!subFolderPos.IsNull)
+                {
+                    IEdmFolder5 subFolder = folder.GetNextSubFolder(subFolderPos);
+                    CollectAllFolders(subFolder, folderList);
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error collecting folders: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Process files in a single folder (thread-safe, can run in parallel)
+        /// </summary>
+        private void ProcessSingleFolder(IEdmFolder5 folder, IEdmVault5 vault, ConcurrentBag<FileData> results)
+        {
+            try
+            {
+                // Step 1: Collect all file references sequentially (COM requirement)
+                List<Tuple<IEdmFile5, string>> filesToProcess = new List<Tuple<IEdmFile5, string>>();
+
                 IEdmPos5 pos = folder.GetFirstFilePosition();
                 while (!pos.IsNull)
                 {
                     IEdmFile5 file = folder.GetNextFile(pos);
-                        string filePath = file.GetLocalPath(folder.ID);
+                    string filePath = file.GetLocalPath(folder.ID);
 
                     if (!string.IsNullOrEmpty(filePath) && IsProcessableFile(filePath))
                     {
-                        // Store file with null checksum - will be calculated later by caller if needed
-                        // This is because checksum calculation requires archive access which
-                        // the helper class doesn't have (it's in LeoAiSyncTask)
+                        filesToProcess.Add(Tuple.Create(file, filePath));
+                    }
+                }
+
+                // Step 2: Process all files in parallel
+                Parallel.ForEach(filesToProcess, fileInfo =>
+                {
+                    try
+                    {
+                        IEdmFile5 file = fileInfo.Item1;
+                        string filePath = fileInfo.Item2;
+
                         var fileData = new FileData
                         {
                             file = filePath,
                             mimeType = LeoAIMemeType.GetMemeType(filePath),
-                            checkSum = null, // Will be calculated by caller using archive-first approach
+                            checkSum = null,
                             children = new List<ChildData>()
                         };
 
@@ -129,7 +194,6 @@ namespace LeoAISwPdmAddIn
                         {
                             try
                             {
-                                // Use as operator for safer casting - returns null if interface not supported
                                 IEdmReference10 reference = file as IEdmReference10;
                                 if (reference != null)
                                 {
@@ -142,20 +206,17 @@ namespace LeoAISwPdmAddIn
                             }
                         }
 
-                        FilesInfo.Add(fileData);
+                        results.Add(fileData);
                     }
-                        }
-
-                IEdmPos5 subFolderPos = folder.GetFirstSubFolderPosition();
-                while (!subFolderPos.IsNull)
-                {
-                    IEdmFolder5 subFolder = folder.GetNextSubFolder(subFolderPos);
-                    ListFoldersAndFiles(subFolder, vault);
-                }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Error processing individual file: {ex.Message}");
+                    }
+                });
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Error listing folder contents: {ex.Message}");
+                LogFileWriter.LogError($"Error processing folder files: {ex.Message}");
             }
         }
     }
