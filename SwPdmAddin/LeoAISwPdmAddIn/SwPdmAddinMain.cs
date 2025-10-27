@@ -914,14 +914,6 @@ namespace LeoAISwPdmAddIn
                 vault = cmd.mpoVault as IEdmVault5;
                 if (vault == null) return;
 
-                EnsureClientInitialized(vault);
-
-                if (!_isClientInitialized)
-                {
-                    LogFileWriter.LogWarning($"Client not initialized - cannot process {operationType} event");
-                    return;
-                }
-
                 foreach (EdmCmdData cmdData in data)
                 {
                     string filePath = cmdData.mbsStrData1;
@@ -936,10 +928,20 @@ namespace LeoAISwPdmAddIn
                     }
 
                     // Run async operation without blocking PDM
+                    // IMPORTANT: Initialize client INSIDE Task.Run to avoid STA thread deadlock with Descope auth
                     Task.Run(async () =>
                     {
                         try
                         {
+                            // Ensure client is initialized on thread pool thread (not PDM STA thread)
+                            EnsureClientInitialized(vault);
+
+                            if (!_isClientInitialized)
+                            {
+                                LogFileWriter.LogWarning($"Client not initialized - cannot process {operationType} event");
+                                return;
+                            }
+
                             var operation = CreateOperationMetadata(operationType, cmdData, vault);
                             await ProcessOperationAsync(vault, operation);
                         }

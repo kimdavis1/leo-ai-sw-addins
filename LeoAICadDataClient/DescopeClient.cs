@@ -24,28 +24,38 @@ namespace LeoAICadDataClient
 
         public async Task<string> ExchangeTokenAsync(string accessKey)
         {
-            var handler = new HttpClientHandler { UseProxy = false };
+            Logger.Info("Starting token exchange");
+
+            var handler = new HttpClientHandler
+            {
+                UseDefaultCredentials = true
+            };
+
+            Logger.Info("Creating HttpClient with default settings, timeout=30s");
 
             using (var httpClient = new HttpClient(handler))
             {
+                // Set 30 second timeout to prevent hanging indefinitely
+                httpClient.Timeout = TimeSpan.FromSeconds(30);
                 httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36");
                 try
                 {
                     Logger.Info("Attempting to exchange token with Descope using HttpClient.");
                     var requestUrl = $"{_descopeApiUrl}/v1/auth/accesskey/exchange";
-                    
+                    Logger.Info($"Request URL: {requestUrl}");
+
                     var request = new HttpRequestMessage(HttpMethod.Post, requestUrl);
-                    
+
                     request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", $"{_projectId}:{accessKey}");
                     request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                    
+
                     request.Content = new StringContent("{}", Encoding.UTF8, "application/json");
 
                     Logger.Info($"Sending request to Descope API...");
-                    
-                    using (var response = await httpClient.SendAsync(request))
+
+                    using (var response = await httpClient.SendAsync(request).ConfigureAwait(false))
                     {
-                        var responseContent = await response.Content.ReadAsStringAsync();
+                        var responseContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         Logger.Info($"Received response with status code: {response.StatusCode}. Response: {responseContent}");
 
                         if (response.IsSuccessStatusCode)
@@ -55,15 +65,27 @@ namespace LeoAICadDataClient
                         }
                         else
                         {
-                            Logger.Error("Failed to exchange token.");
+                            Logger.Error($"Failed to exchange token. Status: {response.StatusCode}, Response: {responseContent}");
                             return null;
                         }
                     }
                 }
+                catch (TaskCanceledException ex)
+                {
+                    Logger.Error($"Token exchange timed out after 30 seconds.");
+                    Logger.Error($"Exception: {ex}");
+                    return null;
+                }
+                catch (HttpRequestException ex)
+                {
+                    Logger.Error($"Network error during token exchange: {ex.Message}");
+                    Logger.Error($"Exception: {ex}");
+                    return null;
+                }
                 catch (Exception ex)
                 {
                     Logger.Error($"An exception occurred during token exchange: {ex.Message}");
-                    Logger.Error($"Exception Details: {ex}");
+                    Logger.Error($"Exception: {ex}");
                     return null;
                 }
             }

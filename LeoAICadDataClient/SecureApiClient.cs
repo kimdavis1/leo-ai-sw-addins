@@ -4,6 +4,7 @@ namespace LeoAICadDataClient
     using System.Collections.Generic;
     using System.IO;
     using System.Linq;
+    using System.Net;
     using System.Net.Http;
     using System.Net.Http.Headers;
     using System.Text;
@@ -25,9 +26,22 @@ namespace LeoAICadDataClient
         {
             _projectId = projectId;
             _apiKey = apiKey;
-            _httpClient = new HttpClient { BaseAddress = new Uri(_baseApiUrl) };
-            _httpClient.DefaultRequestHeaders.ExpectContinue = false; // Explicitly disable Expect: 100-continue
-            Logger.Info("SecureApiClient initialized with standard HttpClient.");
+
+            Logger.Info("Initializing SecureApiClient");
+
+            // Just use default system settings
+            var handler = new HttpClientHandler
+            {
+                UseDefaultCredentials = true
+            };
+
+            _httpClient = new HttpClient(handler)
+            {
+                BaseAddress = new Uri(_baseApiUrl),
+                Timeout = TimeSpan.FromSeconds(120)
+            };
+            _httpClient.DefaultRequestHeaders.ExpectContinue = false;
+            Logger.Info("SecureApiClient initialized successfully");
 
             // Initialize Sentry for API error tracking
             SentryApiErrorHandler.Initialize("Production");
@@ -141,9 +155,9 @@ namespace LeoAICadDataClient
                     var descopeClient = new DescopeClient(_projectId, "https://api.descope.com");
 
                     var tokenTask = descopeClient.ExchangeTokenAsync(_apiKey);
-                    if (await Task.WhenAny(tokenTask, Task.Delay(10000)) == tokenTask)
+                    if (await Task.WhenAny(tokenTask, Task.Delay(10000)).ConfigureAwait(false) == tokenTask)
                     {
-                        string newJwtToken = await tokenTask;
+                        string newJwtToken = await tokenTask.ConfigureAwait(false);
                         if (!string.IsNullOrEmpty(newJwtToken))
                         {
                             _jwtToken = newJwtToken;
@@ -178,7 +192,7 @@ namespace LeoAICadDataClient
             {
                 try
                 {
-                    return await operation();
+                    return await operation().ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -191,7 +205,7 @@ namespace LeoAICadDataClient
                     {
                         // Exponential backoff for rate limits
                         Logger.Info($"Rate limit hit for {operationName}, retrying in {retryDelay}ms (attempt {attempt + 1}/{MaxRetries})");
-                        await Task.Delay(retryDelay);
+                        await Task.Delay(retryDelay).ConfigureAwait(false);
                         retryDelay *= 2; // Exponential backoff
                         continue;
                     }
@@ -213,7 +227,7 @@ namespace LeoAICadDataClient
         /// </summary>
         public async Task<LeoAICadDataClient.Utilities.FileInfo> CreateFileAsync(string directoryId, string vaultPath, string logicalFilePath, string actualFilePath, string externalId, Dictionary<string, string> childInfos = null)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -247,8 +261,8 @@ namespace LeoAICadDataClient
                             content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
                         }
 
-                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content);
-                        var responseString = await response.Content.ReadAsStringAsync();
+                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content).ConfigureAwait(false);
+                        var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                         if (response.IsSuccessStatusCode)
                         {
@@ -259,8 +273,10 @@ namespace LeoAICadDataClient
                         {
                             Logger.Error($"Failed to create file: {logicalFilePath}. Status: {response.StatusCode}, Response: {responseString}");
 
-                            // Capture unexpected API errors to Sentry (excluding rate limits which are handled separately)
-                            if ((int)response.StatusCode != 429)
+                            // Capture unexpected API errors to Sentry (excluding rate limits and conflicts which are handled separately)
+                            // 429 = Rate limit (handled by retry logic)
+                            // 409 = Conflict (expected when file already exists - handled by optimistic upload logic)
+                            if ((int)response.StatusCode != 429 && (int)response.StatusCode != 409)
                             {
                                 SentryApiErrorHandler.CaptureApiError("CreateFile", (int)response.StatusCode, responseString,
                                     new Dictionary<string, string> { { "file", logicalFilePath }, { "directoryId", directoryId } });
@@ -332,7 +348,7 @@ namespace LeoAICadDataClient
 
         public async Task<string> CreateDirectoryAsync(string machineId, string uri)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -348,8 +364,8 @@ namespace LeoAICadDataClient
                     var jsonPayload = JsonConvert.SerializeObject(new { machineId, uri });
                     var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
 
-                    var response = await _httpClient.PostAsync("api/v1/synced-directories", content);
-                    var responseString = await response.Content.ReadAsStringAsync();
+                    var response = await _httpClient.PostAsync("api/v1/synced-directories", content).ConfigureAwait(false);
+                    var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -394,15 +410,15 @@ namespace LeoAICadDataClient
 
         public async Task<List<LeoDirectoryInfo>> GetDirectoryInfoAsync(string machineId)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
                 try
                 {
                     Logger.Info($"GetDirectoryInfo: Starting to fetch directory info for machine {machineId}");
-                    var response = await _httpClient.GetAsync("api/v1/synced-directories");
-                    var responseString = await response.Content.ReadAsStringAsync();
+                    var response = await _httpClient.GetAsync("api/v1/synced-directories").ConfigureAwait(false);
+                    var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -450,7 +466,7 @@ namespace LeoAICadDataClient
 
                 // Fetch specific file using filepath_in_directory query parameter
                 string normalizedPath = NormalizeFilePathForApi(relativePath);
-                var syncMetadata = await GetSyncMetadataAsync(directoryId, normalizedPath);
+                var syncMetadata = await GetSyncMetadataAsync(directoryId, normalizedPath).ConfigureAwait(false);
 
                 if (syncMetadata == null || syncMetadata.Files == null || syncMetadata.Files.Count == 0)
                 {
@@ -486,7 +502,7 @@ namespace LeoAICadDataClient
 
         public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId)
         {
-            return await GetSyncMetadataAsync(directoryId, null);
+            return await GetSyncMetadataAsync(directoryId, null).ConfigureAwait(false);
         }
 
         /// <summary>
@@ -498,7 +514,7 @@ namespace LeoAICadDataClient
         /// <returns>Page of sync metadata</returns>
         public async Task<SyncMetadataResponse> GetSyncMetadataPagedAsync(string directoryId, int page, int limit)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -507,8 +523,8 @@ namespace LeoAICadDataClient
                     string url = $"api/v1/synced-directories/{directoryId}/files/sync-metadata?page={page}&limit={limit}";
                     Logger.Info($"GetSyncMetadataPaged: Fetching page {page} (limit {limit}) for directory {directoryId}");
 
-                    var response = await _httpClient.GetAsync(url);
-                    var responseString = await response.Content.ReadAsStringAsync();
+                    var response = await _httpClient.GetAsync(url).ConfigureAwait(false);
+                    var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -572,7 +588,7 @@ namespace LeoAICadDataClient
 
             while (true)
             {
-                var response = await GetSyncMetadataPagedAsync(directoryId, page, pageSize);
+                var response = await GetSyncMetadataPagedAsync(directoryId, page, pageSize).ConfigureAwait(false);
 
                 if (response?.Files == null || response.Files.Count == 0)
                 {
@@ -600,7 +616,7 @@ namespace LeoAICadDataClient
 
         public async Task<SyncMetadataResponse> GetSyncMetadataAsync(string directoryId, string filepathInDirectory)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -618,8 +634,8 @@ namespace LeoAICadDataClient
                         Logger.Info($"GetSyncMetadata: Fetching all sync metadata for directory {directoryId}");
                     }
 
-                    var response = await _httpClient.GetAsync(url);
-                    var responseString = await response.Content.ReadAsStringAsync();
+                    var response = await _httpClient.GetAsync(url).ConfigureAwait(false);
+                    var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -664,7 +680,7 @@ namespace LeoAICadDataClient
 
         public async Task<bool> DeleteFileAsync(string directoryId, string filePathInDirectory)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -677,7 +693,7 @@ namespace LeoAICadDataClient
                     Logger.Info($"[API CALL] DeleteFile: path={normalizedPath}, directoryId={directoryId}");
                     Logger.Info($"Sending DELETE request to: {requestUri}");
 
-                    var response = await _httpClient.DeleteAsync(requestUri);
+                    var response = await _httpClient.DeleteAsync(requestUri).ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -686,11 +702,13 @@ namespace LeoAICadDataClient
                     }
                     else
                     {
-                        var errorContent = await response.Content.ReadAsStringAsync();
+                        var errorContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         Logger.Error($"Failed to delete file: {normalizedPath}. Status: {response.StatusCode}, Response: {errorContent}");
 
-                        // Capture unexpected API errors to Sentry
-                        if ((int)response.StatusCode != 429)
+                        // Capture unexpected API errors to Sentry (excluding expected errors)
+                        // 429 = Rate limit (handled by retry logic)
+                        // 404 = Not found (expected when trying to delete old path that doesn't exist on server)
+                        if ((int)response.StatusCode != 429 && (int)response.StatusCode != 404)
                         {
                             SentryApiErrorHandler.CaptureApiError("DeleteFile", (int)response.StatusCode, errorContent,
                                 new Dictionary<string, string> { { "file", normalizedPath }, { "directoryId", directoryId } });
@@ -729,7 +747,7 @@ namespace LeoAICadDataClient
         /// </summary>
         public async Task<LeoAICadDataClient.Utilities.FileInfo> UpdateFileLocationAsync(string directoryId, string vaultPath, string filePath, string checksum, string externalId, Dictionary<string, string> childInfos = null)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
@@ -765,8 +783,8 @@ namespace LeoAICadDataClient
                             content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
                         }
 
-                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content);
-                        var responseString = await response.Content.ReadAsStringAsync();
+                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content).ConfigureAwait(false);
+                        var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                         if (response.IsSuccessStatusCode)
                         {
@@ -777,8 +795,25 @@ namespace LeoAICadDataClient
                         {
                             Logger.Error($"Failed to update file location: {filePath}. Status: {response.StatusCode}, Response: {responseString}");
 
-                            // Capture unexpected API errors to Sentry
-                            if ((int)response.StatusCode != 429)
+                            // Capture unexpected API errors to Sentry (excluding expected errors)
+                            // 429 = Rate limit (handled by retry logic)
+                            // 409 = Conflict (expected when destination path already exists - handled by optimistic upload logic)
+                            // 400 with "File is required" = Bad request (expected when server needs file content because checksum doesn't match)
+                            bool shouldReport = true;
+                            if ((int)response.StatusCode == 429)
+                            {
+                                shouldReport = false;
+                            }
+                            else if ((int)response.StatusCode == 409)
+                            {
+                                shouldReport = false;
+                            }
+                            else if ((int)response.StatusCode == 400 && responseString != null && responseString.Contains("File is required"))
+                            {
+                                shouldReport = false;
+                            }
+
+                            if (shouldReport)
                             {
                                 SentryApiErrorHandler.CaptureApiError("UpdateFileLocation", (int)response.StatusCode, responseString,
                                     new Dictionary<string, string> { { "file", filePath }, { "directoryId", directoryId }, { "checksum", checksum } });
@@ -812,14 +847,14 @@ namespace LeoAICadDataClient
 
         public async Task<bool> DeleteDirectoryAsync(string directoryId)
         {
-            await RefreshTokenIfRequiredAsync();
+            await RefreshTokenIfRequiredAsync().ConfigureAwait(false);
 
             return await ExecuteWithRetryAsync(async () =>
             {
                 try
                 {
                     Logger.Info($"Attempting to delete directory: {directoryId}");
-                    var response = await _httpClient.DeleteAsync($"api/v1/synced-directories/{directoryId}");
+                    var response = await _httpClient.DeleteAsync($"api/v1/synced-directories/{directoryId}").ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -828,7 +863,7 @@ namespace LeoAICadDataClient
                     }
                     else
                     {
-                        var errorContent = await response.Content.ReadAsStringAsync();
+                        var errorContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         Logger.Error($"Failed to delete directory: {directoryId}. Status: {response.StatusCode}, Response: {errorContent}");
 
                         // Capture unexpected API errors to Sentry

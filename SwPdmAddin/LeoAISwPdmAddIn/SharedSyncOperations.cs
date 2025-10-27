@@ -199,99 +199,8 @@ namespace LeoAISwPdmAddIn
             string relativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
             LogFileWriter.LogMessage($"Processing upload for: {relativePath}");
 
-            // Always check if file exists on server and compare checksums
-            // This handles all cases: new files, updates, renames, moves, replaces, etc
-            LogFileWriter.LogMessage($"Checking if file exists on server: {relativePath}");
-
-            try
-            {
-                var serverFile = await leoClient.GetFileInfoByPathAsync(directoryId, relativePath);
-
-                if (serverFile != null)
-                {
-                    LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
-
-                    // Calculate local file checksum - use GetReadableFilePath to access from archive or temp copy
-                    string localChecksum = null;
-                    try
-                    {
-                        string fullPath = EnsureFullPath(vault, operation.NewPath);
-                        IEdmFolder5 folder;
-                        IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
-
-                        if (file != null && folder != null)
-                        {
-                            string readablePath;
-                            bool needsCleanup;
-                            (readablePath, needsCleanup) = GetReadableFilePath(vault, operation.NewPath, folder.ID, tryArchiveFirst);
-
-                            var fileInfo = LeoFileInfo.GetFileInfo(readablePath);
-                            localChecksum = fileInfo.CheckSum;
-
-                            if (needsCleanup)
-                            {
-                                DeleteTempFile(readablePath);
-                            }
-                        }
-                    }
-                    catch (Exception csEx)
-                    {
-                        LogFileWriter.LogError($"Failed to compute checksum for {operation.NewPath}: {csEx.Message}");
-                        throw;
-                    }
-
-                    LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
-
-                    // Check if file needs reupload
-                    bool needsReupload = false;
-                    string reason = "";
-
-                    if (serverFile.ParentStatus == "IN_ERROR")
-                    {
-                        needsReupload = true;
-                        reason = "file has IN_ERROR status";
-                        LogFileWriter.LogMessage($"File has IN_ERROR status - forcing reupload even though checksum may match");
-                    }
-                    else if (serverFile.CheckSum != localChecksum)
-                    {
-                        needsReupload = true;
-                        reason = "checksum changed";
-                    }
-
-                    if (!needsReupload && serverFile.CheckSum == localChecksum)
-                    {
-                        LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - skipping upload");
-                        // TODO: Check if metadata changed and update if needed
-                        return;
-                    }
-
-                    if (needsReupload)
-                    {
-                        LogFileWriter.LogMessage($"File changed ({reason}) - deleting old version before upload");
-
-                        // Delete the old version first
-                        bool deleted = await leoClient.DeleteFileAsync(directoryId, relativePath);
-                        if (deleted)
-                        {
-                            LogFileWriter.LogMessage($"Deleted old version: {relativePath}");
-                        }
-                        else
-                        {
-                            LogFileWriter.LogMessage($"Warning: Failed to delete old version: {relativePath}");
-                        }
-                    }
-                }
-                else
-                {
-                    LogFileWriter.LogMessage($"File does not exist on server - uploading as new file");
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogMessage($"Could not check server file (treating as new): {ex.Message}");
-            }
-
-            // Upload the file
+            // Optimistic upload: Try to upload directly, handle conflicts if they occur
+            // UpdateFilesToLeoAI will handle the 409 conflict check internally
             LogFileWriter.LogMessage($"Uploading: {relativePath}");
             await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath, leoClient, directoryId, tryArchiveFirst);
 
@@ -436,17 +345,8 @@ namespace LeoAISwPdmAddIn
                 return;
             }
 
-            // Check if destination already exists on server
-            var serverFile = await leoClient.GetFileInfoByPathAsync(directoryId, newRelativePath);
-
-            // If destination already exists on server, delete it first
-            if (serverFile != null)
-            {
-                LogFileWriter.LogMessage($"Destination already exists on server - deleting before upload");
-                await leoClient.DeleteFileAsync(directoryId, newRelativePath);
-            }
-
-            // Upload the copied file
+            // Optimistic upload: Try to upload the copied file directly
+            // If it conflicts (409), UpdateFilesToLeoAI will handle it
             await UpdateFilesToLeoAI(vault, new[] { operation.NewPath }, vault.RootFolderPath, leoClient, directoryId, tryArchiveFirst);
             LogFileWriter.LogMessage($"Copy completed: {newRelativePath}");
         }
@@ -722,6 +622,13 @@ namespace LeoAISwPdmAddIn
                     // Report progress every 100 files instead of every 10 to reduce overhead
                     if (checksumProgress % 100 == 0)
                     {
+                        // Check for cancellation
+                        if (IsTaskCancelled(taskInstance))
+                        {
+                            LogFileWriter.LogMessage("Task cancelled by user during checksum calculation");
+                            throw new OperationCanceledException("Task cancelled by user");
+                        }
+
                         try
                         {
                             int progress = 35 + (int)((checksumProgress / (float)vaultFiles.Count) * 5);
@@ -886,6 +793,13 @@ namespace LeoAISwPdmAddIn
                     int deletedModified = 0;
                     foreach (var filePath in modifiedFilesToUpload)
                     {
+                        // Check for cancellation every 10 deletes
+                        if (deletedModified % 10 == 0 && IsTaskCancelled(taskInstance))
+                        {
+                            LogFileWriter.LogMessage("Task cancelled by user during modified files deletion");
+                            throw new OperationCanceledException("Task cancelled by user");
+                        }
+
                         try
                         {
                             string relativePath = GetRelativePath(vault.RootFolderPath, filePath);
@@ -929,6 +843,13 @@ namespace LeoAISwPdmAddIn
 
                 foreach (var filePath in allFilesToUpload)
                 {
+                    // Check for cancellation every 10 uploads
+                    if (uploaded % 10 == 0 && IsTaskCancelled(taskInstance))
+                    {
+                        LogFileWriter.LogMessage("Task cancelled by user during file upload");
+                        throw new OperationCanceledException("Task cancelled by user");
+                    }
+
                     try
                     {
                         // Pass alreadyOnServer set so dependencies that exist on server aren't re-uploaded
@@ -970,6 +891,13 @@ namespace LeoAISwPdmAddIn
                 int deleteTotal = filesToDelete.Count > 0 ? filesToDelete.Count : 1;
                 foreach (var relativePath in filesToDelete)
                 {
+                    // Check for cancellation every 10 deletes
+                    if (deleted % 10 == 0 && IsTaskCancelled(taskInstance))
+                    {
+                        LogFileWriter.LogMessage("Task cancelled by user during file deletion");
+                        throw new OperationCanceledException("Task cancelled by user");
+                    }
+
                     try
                     {
                         bool success = await leoClient.DeleteFileAsync(directoryId, relativePath);
@@ -1500,119 +1428,141 @@ namespace LeoAISwPdmAddIn
 
             if (isFileBeingMoved)
             {
-                // File is being moved - but first verify it can use UpdateFileLocationAsync
-                // This is only valid if the old file exists on server with the same checksum
+                // Optimistic move: Try UpdateFileLocationAsync first without checking server
                 string oldRelativePath = moveMap[relativePath];
-                bool canUseUpdateLocation = false;
-                bool hasInErrorStatus = false;
-                string oldChecksum = null; // Store the old checksum to send to UpdateFileLocationAsync
-                string externalId = ""; // Store the PDM file ID
+                string currentChecksum = null;
+                string externalId = "";
 
+                // Get current file info for checksum and externalId
                 try
                 {
-                    LogFileWriter.LogMessage($"File is being moved - checking if can use UpdateFileLocationAsync");
+                    string fullPath = EnsureFullPath(vault, filePath);
+                    IEdmFolder5 folder;
+                    IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
 
-                    // Get old file from server
-                    var oldFileOnServer = await leoClient.GetFileInfoByPathAsync(directoryId, oldRelativePath);
-
-                    if (oldFileOnServer != null)
+                    if (file != null && folder != null)
                     {
-                        // Store the old checksum - this is what we'll send to the server
-                        oldChecksum = oldFileOnServer.CheckSum;
+                        string actualFilePath;
+                        bool needsCleanup;
+                        (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
+                        var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
+                        currentChecksum = localFileInfo.CheckSum;
 
-                        // Check for IN_ERROR status - delete old path first, then upload new one
-                        if (oldFileOnServer.ParentStatus == "IN_ERROR")
+                        // Build externalId: fileID_versionnum_checksum
+                        externalId = $"{file.ID}_{file.CurrentVersion}_{currentChecksum}";
+
+                        // Clean up temp file if needed
+                        if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
                         {
-                            LogFileWriter.LogMessage($"File has IN_ERROR status on server - will delete old path first, then upload");
-                            hasInErrorStatus = true;
-                            canUseUpdateLocation = false;
+                            DeleteTempFile(actualFilePath);
                         }
-                        else
-                        {
-                            // Calculate current checksum from archive (contains latest version after move)
-                            string actualFilePath = null;
-                            bool needsCleanup = false;
-
-                            string fullPath = EnsureFullPath(vault, filePath);
-                            IEdmFolder5 folder;
-                            IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
-
-                            if (file != null && folder != null)
-                            {
-                                (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
-                                var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
-
-                                // Build externalId: fileID_versionnum_checksum
-                                externalId = $"{file.ID}_{file.CurrentVersion}_{localFileInfo.CheckSum}";
-
-                                LogFileWriter.LogMessage($"Comparing checksums: server={oldFileOnServer.CheckSum}, current={localFileInfo.CheckSum} (externalId: {externalId})");
-
-                                if (oldFileOnServer.CheckSum == localFileInfo.CheckSum)
-                                {
-                                    canUseUpdateLocation = true;
-                                    LogFileWriter.LogMessage($"Checksums match - can use UpdateFileLocationAsync");
-                                }
-                                else
-                                {
-                                    LogFileWriter.LogMessage($"Checksums differ - must upload with file content");
-                                }
-
-                                // Clean up temp file if needed
-                                if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
-                                {
-                                    DeleteTempFile(actualFilePath);
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        LogFileWriter.LogMessage($"Old file not found on server at {oldRelativePath} - must upload with file content");
                     }
                 }
                 catch (Exception ex)
                 {
-                    LogFileWriter.LogMessage($"Error checking old file on server: {ex.Message} - will upload with file content");
+                    LogFileWriter.LogError($"Error getting file info for move: {ex.Message}");
                 }
 
-                // If IN_ERROR status, delete old path BEFORE uploading
-                if (hasInErrorStatus)
-                {
-                    LogFileWriter.LogMessage($"Deleting old path due to IN_ERROR status: {oldRelativePath}");
-                    bool deleteSuccess = await leoClient.DeleteFileAsync(directoryId, oldRelativePath);
-                    if (deleteSuccess)
-                    {
-                        LogFileWriter.LogMessage($"Successfully deleted old path: {oldRelativePath}");
-                    }
-                    else
-                    {
-                        LogFileWriter.LogError($"Failed to delete old path: {oldRelativePath}");
-                    }
-                }
+                // Try optimistic update (without file content)
+                LogFileWriter.LogMessage($"Attempting optimistic UpdateFileLocationAsync with checksum: {currentChecksum}, externalId: {externalId}");
+                var updateResult = await leoClient.UpdateFileLocationAsync(directoryId, vaultRootPath, filePath, currentChecksum, externalId, dependenciesWithChecksums);
 
-                if (canUseUpdateLocation)
+                if (updateResult != null)
                 {
-                    // Use fast UpdateFileLocationAsync (no file content)
-                    // Pass the OLD checksum (from server) so backend can identify the file
-                    LogFileWriter.LogMessage($"Using UpdateFileLocationAsync for move with checksum: {oldChecksum}, externalId: {externalId}");
-                    await leoClient.UpdateFileLocationAsync(directoryId, vaultRootPath, filePath, oldChecksum, externalId, dependenciesWithChecksums);
+                    // Success - file location updated
                     uploadedFiles.Add(relativePath);
-                    LogFileWriter.LogMessage($"File location updated: {relativePath}");
+                    LogFileWriter.LogMessage($"File location updated successfully: {relativePath}");
                 }
                 else
                 {
-                    // Checksum changed or old file doesn't exist - must upload with file content
-                    LogFileWriter.LogMessage($"Using full upload (file content changed during move)");
-                    bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums, leoClient, directoryId, tryArchiveFirst);
+                    // Update failed - check NEW path on server and handle accordingly
+                    LogFileWriter.LogMessage($"UpdateFileLocationAsync returned null - checking NEW path on server: {relativePath}");
 
-                    if (uploadSuccess)
+                    try
                     {
-                        uploadedFiles.Add(relativePath);
-                        LogFileWriter.LogMessage($"File uploaded with new content: {relativePath}");
+                        var newFileOnServer = await leoClient.GetFileInfoByPathAsync(directoryId, relativePath);
+
+                        if (newFileOnServer != null)
+                        {
+                            LogFileWriter.LogMessage($"NEW path exists on server with checksum: {newFileOnServer.CheckSum}, status: {newFileOnServer.ParentStatus}");
+
+                            // Check if file at new path needs to be deleted and reuploaded
+                            bool needsDelete = false;
+                            string reason = "";
+
+                            if (newFileOnServer.ParentStatus == "IN_ERROR")
+                            {
+                                needsDelete = true;
+                                reason = "file has IN_ERROR status";
+                                LogFileWriter.LogMessage($"NEW path has IN_ERROR status - will delete and reupload");
+                            }
+                            else if (newFileOnServer.CheckSum != currentChecksum)
+                            {
+                                needsDelete = true;
+                                reason = "checksum differs";
+                                LogFileWriter.LogMessage($"NEW path checksum differs (server: {newFileOnServer.CheckSum}, current: {currentChecksum}) - will delete and reupload");
+                            }
+
+                            if (needsDelete)
+                            {
+                                LogFileWriter.LogMessage($"Deleting NEW path ({reason}): {relativePath}");
+                                bool deleted = await leoClient.DeleteFileAsync(directoryId, relativePath);
+                                if (deleted)
+                                {
+                                    LogFileWriter.LogMessage($"Deleted NEW path: {relativePath}");
+                                }
+                                else
+                                {
+                                    LogFileWriter.LogMessage($"Delete returned false for NEW path: {relativePath}");
+                                }
+                            }
+
+                            // Do full upload with file content
+                            LogFileWriter.LogMessage($"Performing full upload to NEW path");
+                            bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums, leoClient, directoryId, tryArchiveFirst);
+
+                            if (uploadSuccess)
+                            {
+                                uploadedFiles.Add(relativePath);
+                                LogFileWriter.LogMessage($"File uploaded to NEW path: {relativePath}");
+                            }
+                            else
+                            {
+                                LogFileWriter.LogError($"File upload failed: {relativePath}");
+                            }
+                        }
+                        else
+                        {
+                            // NEW path doesn't exist on server - do full upload
+                            LogFileWriter.LogMessage($"NEW path not found on server - doing full upload");
+                            bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums, leoClient, directoryId, tryArchiveFirst);
+
+                            if (uploadSuccess)
+                            {
+                                uploadedFiles.Add(relativePath);
+                                LogFileWriter.LogMessage($"File uploaded to NEW path: {relativePath}");
+                            }
+                            else
+                            {
+                                LogFileWriter.LogError($"File upload failed: {relativePath}");
+                            }
+                        }
+
+                        // After successful upload to NEW path, delete OLD path
+                        LogFileWriter.LogMessage($"Deleting OLD path from server: {oldRelativePath}");
+                        bool oldDeleted = await leoClient.DeleteFileAsync(directoryId, oldRelativePath);
+                        if (oldDeleted)
+                        {
+                            LogFileWriter.LogMessage($"Successfully deleted OLD path: {oldRelativePath}");
+                        }
+                        else
+                        {
+                            LogFileWriter.LogMessage($"Delete returned false for OLD path (might be 404 - file didn't exist): {oldRelativePath}");
+                        }
                     }
-                    else
+                    catch (Exception checkEx)
                     {
-                        LogFileWriter.LogError($"File upload failed: {relativePath}");
+                        LogFileWriter.LogError($"Error handling failed UpdateFileLocationAsync: {checkEx.Message}");
                     }
                 }
             }
@@ -1738,82 +1688,14 @@ namespace LeoAISwPdmAddIn
                     LogFileWriter.LogMessage($"Could not get file from vault, using path directly: {actualFilePath}");
                 }
 
-                // ALWAYS check if file exists on server and compare checksums before uploading
-                LogFileWriter.LogMessage($"Checking if file exists on server: {relativePath}");
-                SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Checking if file exists on server");
+                // Optimistic upload: Try to upload directly first
+                // Only check server if we get a 409 conflict
+                LogFileWriter.LogMessage($"Attempting optimistic upload: {relativePath}");
+                SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Attempting optimistic upload");
 
-                try
-                {
-                    var serverFile = await leoClient.GetFileInfoByPathAsync(directoryId, relativePath);
-
-                    if (serverFile != null)
-                    {
-                        LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
-                        SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File found on server - comparing checksums");
-
-                        // Calculate local file checksum
-                        var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
-                        string localChecksum = localFileInfo.CheckSum;
-                        LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
-
-                        // Check if file needs reupload
-                        bool needsReupload = false;
-                        string reason = "";
-
-                        if (serverFile.ParentStatus == "IN_ERROR")
-                        {
-                            needsReupload = true;
-                            reason = "file has IN_ERROR status";
-                            LogFileWriter.LogMessage($"File has IN_ERROR status - forcing reupload");
-                        }
-                        else if (serverFile.CheckSum != localChecksum)
-                        {
-                            needsReupload = true;
-                            reason = "checksum changed";
-                        }
-
-                        if (!needsReupload && serverFile.CheckSum == localChecksum)
-                        {
-                            LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - skipping upload");
-                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File unchanged - skipping upload");
-                            // Don't upload - file already exists with same content
-                            // Return true because file exists on server (treated as success for dependency tracking)
-                            return true;
-                        }
-
-                        if (needsReupload)
-                        {
-                            LogFileWriter.LogMessage($"File changed ({reason}) - deleting old version before upload");
-                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", $"Deleting old version: {reason}");
-
-                            // Delete the old version first
-                            bool deleted = await leoClient.DeleteFileAsync(directoryId, relativePath);
-                            if (deleted)
-                            {
-                                LogFileWriter.LogMessage($"Deleted old version: {relativePath}");
-                            }
-                            else
-                            {
-                                LogFileWriter.LogMessage($"Warning: Failed to delete old version: {relativePath}");
-                            }
-                        }
-                    }
-                    else
-                    {
-                        LogFileWriter.LogMessage($"File does not exist on server - uploading as new file");
-                        SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File not found on server - new upload");
-                    }
-                }
-                catch (Exception checkEx)
-                {
-                    LogFileWriter.LogMessage($"Could not check server file (treating as new): {checkEx.Message}");
-                }
-
-                // CreateFileAsync handles both create and update (with automatic retry for rate limits)
-                // Pass dependencies dictionary - will be converted to proper format and sent to server
                 SentryErrorHandler.AddOperationBreadcrumb(
                     "UploadFile",
-                    "Calling API to create/update file",
+                    "Calling API to create file",
                     new Dictionary<string, string>
                     {
                         { "file", relativePath },
@@ -1822,6 +1704,79 @@ namespace LeoAISwPdmAddIn
                 );
 
                 var fileInfo = await leoClient.CreateFileAsync(directoryId, vaultRootPath, filePath, actualFilePath, externalId, dependencies);
+
+                // If upload failed, check if it's a conflict (409) and handle it
+                if (fileInfo == null)
+                {
+                    LogFileWriter.LogMessage($"Initial upload returned null - checking if file exists on server");
+                    SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Upload returned null - checking server");
+
+                    try
+                    {
+                        var serverFile = await leoClient.GetFileInfoByPathAsync(directoryId, relativePath);
+
+                        if (serverFile != null)
+                        {
+                            LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
+                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File found on server - comparing checksums");
+
+                            // Calculate local file checksum
+                            var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
+                            string localChecksum = localFileInfo.CheckSum;
+                            LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
+
+                            // Check if file needs reupload
+                            bool needsReupload = false;
+                            string reason = "";
+
+                            if (serverFile.ParentStatus == "IN_ERROR")
+                            {
+                                needsReupload = true;
+                                reason = "file has IN_ERROR status";
+                                LogFileWriter.LogMessage($"File has IN_ERROR status - forcing reupload");
+                            }
+                            else if (serverFile.CheckSum != localChecksum)
+                            {
+                                needsReupload = true;
+                                reason = "checksum changed";
+                            }
+
+                            if (!needsReupload && serverFile.CheckSum == localChecksum)
+                            {
+                                LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - treating as success");
+                                SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File unchanged - skipping reupload");
+                                // File already exists with same content - treat as success
+                                fileInfo = new LeoAICadDataClient.Utilities.FileInfo { ComponentId = serverFile.ComponentId };
+                            }
+                            else if (needsReupload)
+                            {
+                                LogFileWriter.LogMessage($"File changed ({reason}) - deleting old version before reupload");
+                                SentryErrorHandler.AddOperationBreadcrumb("UploadFile", $"Deleting old version: {reason}");
+
+                                // Delete the old version first
+                                bool deleted = await leoClient.DeleteFileAsync(directoryId, relativePath);
+                                if (deleted)
+                                {
+                                    LogFileWriter.LogMessage($"Deleted old version: {relativePath} - retrying upload");
+                                    // Retry upload after deletion
+                                    fileInfo = await leoClient.CreateFileAsync(directoryId, vaultRootPath, filePath, actualFilePath, externalId, dependencies);
+                                }
+                                else
+                                {
+                                    LogFileWriter.LogError($"Failed to delete old version: {relativePath}");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            LogFileWriter.LogError($"Upload failed and file not found on server: {relativePath}");
+                        }
+                    }
+                    catch (Exception checkEx)
+                    {
+                        LogFileWriter.LogError($"Error checking server file after failed upload: {checkEx.Message}");
+                    }
+                }
 
                 if (fileInfo != null)
                 {
@@ -2319,6 +2274,28 @@ namespace LeoAISwPdmAddIn
             // Last resort: use path as-is and hope for the best
             LogFileWriter.LogMessage($"EnsureFullPath: Could not normalize path - using as-is: '{filePath}'");
             return filePath;
+        }
+
+        /// <summary>
+        /// Checks if the task has been cancelled by the user
+        /// </summary>
+        private static bool IsTaskCancelled(IEdmTaskInstance taskInstance)
+        {
+            if (taskInstance == null)
+                return false;
+
+            try
+            {
+                // Check task status - user clicked cancel or task is already cancelled
+                EdmTaskStatus status = taskInstance.GetStatus();
+                return status == EdmTaskStatus.EdmTaskStat_CancelPending ||
+                       status == EdmTaskStatus.EdmTaskStat_DoneCancelled;
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to check task cancellation status: {ex.Message}");
+                return false; // Assume not cancelled if we can't check
+            }
         }
 
         #endregion

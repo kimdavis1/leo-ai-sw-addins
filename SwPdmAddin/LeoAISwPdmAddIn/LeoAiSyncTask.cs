@@ -104,6 +104,7 @@ namespace LeoAISwPdmAddIn
             LogFileWriter.LogMessage("=== OnTaskRun: Starting complete sync operation ===");
 
             IEdmTaskInstance taskInstance = null;
+            IEdmVault11 vault = null;
 
             try
             {
@@ -115,30 +116,48 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"Task Instance GUID: {taskInstance.InstanceGUID}");
                 LogFileWriter.LogMessage($"Task Name: {taskInstance.TaskName}");
 
-                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
+                vault = (IEdmVault11)poCmd.mpoVault;
                 LogFileWriter.LogMessage($"Vault: {vault.Name}");
                 LogFileWriter.LogMessage($"Vault Root Path: {vault.RootFolderPath}");
 
-                taskInstance.SetProgressPos(10, "Initializing Leo AI client...");
+                // IMPORTANT: Run in Task.Run to avoid STA thread deadlock with Descope auth
+                System.Threading.Tasks.Task.Run(async () =>
+                {
+                    try
+                    {
+                        taskInstance.SetProgressPos(10, "Initializing Leo AI client...");
 
-                string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.json");
-                _leoClient = SecureApiClient.CreateFromStandardLocations(configPath);
-                LogFileWriter.LogMessage("SecureApiClient initialized");
+                        string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.json");
+                        _leoClient = SecureApiClient.CreateFromStandardLocations(configPath);
+                        LogFileWriter.LogMessage("SecureApiClient initialized");
 
-                string dirPath = $"swpdm/{vault.Name}";
-                _directoryId = SharedSyncOperations.GetOrCreateDirectoryId(_leoClient, dirPath).Result;
-                LogFileWriter.LogMessage($"Directory ID: {_directoryId}");
+                        string dirPath = $"swpdm/{vault.Name}";
+                        _directoryId = await SharedSyncOperations.GetOrCreateDirectoryId(_leoClient, dirPath).ConfigureAwait(false);
+                        LogFileWriter.LogMessage($"Directory ID: {_directoryId}");
 
-                taskInstance.SetProgressPos(20, "Running complete sync...");
+                        taskInstance.SetProgressPos(20, "Running complete sync...");
 
-                SharedSyncOperations.ProcessCompleteSyncOperation(vault, taskInstance, _leoClient, _directoryId).Wait();
+                        await SharedSyncOperations.ProcessCompleteSyncOperation(vault, taskInstance, _leoClient, _directoryId).ConfigureAwait(false);
 
-                taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneOK, 0, "Complete sync finished successfully");
-                LogFileWriter.LogMessage("=== OnTaskRun: Complete sync finished successfully ===");
+                        taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneOK, 0, "Complete sync finished successfully");
+                        LogFileWriter.LogMessage("=== OnTaskRun: Complete sync finished successfully ===");
+                    }
+                    catch (OperationCanceledException ex)
+                    {
+                        LogFileWriter.LogMessage($"OnTaskRun cancelled by user: {ex.Message}");
+                        taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneCancelled, 0, "Task cancelled by user");
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"OnTaskRun failed: {ex.Message}");
+                        LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+                        taskInstance.SetStatus(EdmTaskStatus.EdmTaskStat_DoneFailed, 0, $"Sync failed: {ex.Message}");
+                    }
+                }).Wait(); // Wait for completion before returning from OnTaskRun
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"OnTaskRun failed: {ex.Message}");
+                LogFileWriter.LogError($"OnTaskRun outer exception: {ex.Message}");
                 LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
 
                 if (taskInstance != null)
