@@ -15,4 +15,8 @@
   <ItemGroup>
     <Reference Include="System.Windows.Forms" />
   </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\LeoAICadDataClient\LeoAICadDataClient.csproj" />
+  </ItemGroup>
 </Project>

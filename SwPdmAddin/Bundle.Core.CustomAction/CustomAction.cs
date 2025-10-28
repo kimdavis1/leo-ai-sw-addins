@@ -9,6 +9,7 @@ using System.Threading.Tasks;
 //using static System.Net.Mime.MediaTypeNames;
 using System.Windows.Forms;
 using WixToolset.Dtf.WindowsInstaller;
+using LeoAICadDataClient.Utilities;
 
 namespace Bundle.Core.CustomAction
 {
@@ -56,7 +57,7 @@ namespace Bundle.Core.CustomAction
                 }
 
                 // Optional: Check if it's empty
-                if (new FileInfo(filePath).Length == 0)
+                if (new System.IO.FileInfo(filePath).Length == 0)
                 {
                     MessageBox.Show("The selected JSON file is empty.", "Validation Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return ActionResult.Success;
@@ -152,14 +153,29 @@ namespace Bundle.Core.CustomAction
             // Clear environment variable
             Environment.SetEnvironmentVariable("LEO_AUTH_KEY", null, EnvironmentVariableTarget.Machine);
 
-            // Delete LeoAuthKey.json file if it exists
-            string authKeyPath = Path.Combine(cleanFolder, "LeoAuthKey.json");
-            if (File.Exists(authKeyPath))
+            // Delete both .txt and .json auth files if they exist
+            string authKeyTxtPath = Path.Combine(cleanFolder, "LeoAuthKey.txt");
+            string authKeyJsonPath = Path.Combine(cleanFolder, "LeoAuthKey.json");
+
+            if (File.Exists(authKeyTxtPath))
             {
                 try
                 {
-                    File.Delete(authKeyPath);
-                    session.Log($"Deleted LeoAuthKey.json from: {authKeyPath}");
+                    File.Delete(authKeyTxtPath);
+                    session.Log($"Deleted LeoAuthKey.txt from: {authKeyTxtPath}");
+                }
+                catch (Exception ex)
+                {
+                    session.Log($"WARNING: Could not delete LeoAuthKey.txt: {ex.Message}");
+                }
+            }
+
+            if (File.Exists(authKeyJsonPath))
+            {
+                try
+                {
+                    File.Delete(authKeyJsonPath);
+                    session.Log($"Deleted LeoAuthKey.json from: {authKeyJsonPath}");
                 }
                 catch (Exception ex)
                 {
@@ -370,7 +386,7 @@ namespace Bundle.Core.CustomAction
         [CustomAction]
         public static ActionResult CopySelectedJson(Session session)
         {
-            
+
             session.Log("Begin CopySelectedJson");
 
             string sourcePath = session.CustomActionData["SELECTED_FILE"];
@@ -384,13 +400,18 @@ namespace Bundle.Core.CustomAction
 
             try
             {
-                // Always copy as "LeoAuthKey.json" regardless of source filename
-                string destPath = Path.Combine(installFolder, "LeoAuthKey.json");
-                session.Log($"Copying from '{sourcePath}' to '{destPath}'");
-                File.Copy(sourcePath, destPath, overwrite: true);
-                session.Log("JSON copy succeeded - file saved as LeoAuthKey.json");
+                // Read the source JSON file (plaintext)
+                session.Log($"Reading JSON from: {sourcePath}");
+                string jsonContent = File.ReadAllText(sourcePath);
 
-                // Set environment variable to point to the copied file location (not the original source)
+                // Save as encrypted .txt file instead of plaintext .json
+                string destPath = Path.Combine(installFolder, "LeoAuthKey.txt");
+                session.Log($"Encrypting and saving to: {destPath}");
+
+                AuthFileEncryption.EncryptToFile(jsonContent, destPath);
+                session.Log("JSON encrypted and saved successfully as LeoAuthKey.txt");
+
+                // Set environment variable to point to the encrypted file location
                 Environment.SetEnvironmentVariable("LEO_AUTH_KEY", destPath, EnvironmentVariableTarget.Machine);
                 session.Log($"Set LEO_AUTH_KEY environment variable to: {destPath}");
 
@@ -398,14 +419,27 @@ namespace Bundle.Core.CustomAction
             }
             catch (Exception ex)
             {
-                session.Log($"ERROR copying JSON: {ex}");
+                session.Log($"ERROR encrypting JSON: {ex}");
+                session.Log($"StackTrace: {ex.StackTrace}");
 
-                // Fallback: point to original source location if copy failed
-                session.Log($"Falling back to original source location: {sourcePath}");
-                Environment.SetEnvironmentVariable("LEO_AUTH_KEY", sourcePath, EnvironmentVariableTarget.Machine);
-                session.Log($"Set LEO_AUTH_KEY environment variable to original location: {sourcePath}");
-
-                return ActionResult.Failure;
+                // Fallback: try to copy as plaintext .json if encryption failed
+                try
+                {
+                    string fallbackPath = Path.Combine(installFolder, "LeoAuthKey.json");
+                    session.Log($"Encryption failed - falling back to plaintext copy: {fallbackPath}");
+                    File.Copy(sourcePath, fallbackPath, overwrite: true);
+                    Environment.SetEnvironmentVariable("LEO_AUTH_KEY", fallbackPath, EnvironmentVariableTarget.Machine);
+                    session.Log($"Set LEO_AUTH_KEY environment variable to fallback location: {fallbackPath}");
+                    return ActionResult.Success;
+                }
+                catch (Exception fallbackEx)
+                {
+                    session.Log($"Fallback copy also failed: {fallbackEx.Message}");
+                    // Last resort: point to original source location
+                    Environment.SetEnvironmentVariable("LEO_AUTH_KEY", sourcePath, EnvironmentVariableTarget.Machine);
+                    session.Log($"Set LEO_AUTH_KEY environment variable to original location: {sourcePath}");
+                    return ActionResult.Failure;
+                }
             }
         }
 

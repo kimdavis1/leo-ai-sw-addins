@@ -49,8 +49,12 @@ namespace LeoAICadDataClient
 
         /// <summary>
         /// Creates a SecureApiClient from a config file containing ApiKey and ProjectId
+        /// Supports both:
+        /// - .txt files (encrypted format - preferred)
+        /// - .json files (plaintext format - for dev/backward compatibility)
+        /// If .txt decryption fails, automatically tries .json with same base name
         /// </summary>
-        /// <param name="configFilePath">Path to LeoAuthKey.json file</param>
+        /// <param name="configFilePath">Path to LeoAuthKey.txt or LeoAuthKey.json file</param>
         /// <returns>Initialized SecureApiClient</returns>
         public static SecureApiClient CreateFromConfigFile(string configFilePath)
         {
@@ -65,31 +69,107 @@ namespace LeoAICadDataClient
             }
 
             Logger.Info($"Reading auth config from: {configFilePath}");
-            string json = File.ReadAllText(configFilePath);
+            string json = null;
+            string actualFilePath = configFilePath;
+
+            // Determine file format based on extension
+            if (configFilePath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+            {
+                // New encrypted format - try to decrypt first
+                Logger.Info("Detected encrypted .txt format - decrypting...");
+                try
+                {
+                    json = AuthFileEncryption.DecryptFromFile(configFilePath);
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warning($"Failed to decrypt .txt file: {ex.Message}");
+
+                    // Fallback: try .json with same base name (for dev purposes)
+                    string jsonPath = Path.ChangeExtension(configFilePath, ".json");
+                    if (File.Exists(jsonPath))
+                    {
+                        Logger.Info($"Attempting fallback to plaintext .json file: {jsonPath}");
+                        try
+                        {
+                            json = File.ReadAllText(jsonPath);
+                            actualFilePath = jsonPath;
+                            Logger.Info("Successfully loaded plaintext .json fallback");
+                        }
+                        catch (Exception jsonEx)
+                        {
+                            Logger.Error($"Fallback to .json also failed: {jsonEx.Message}");
+                            throw new Exception($"Failed to decrypt .txt file and fallback .json file also failed. Original error: {ex.Message}", ex);
+                        }
+                    }
+                    else
+                    {
+                        Logger.Error($"No .json fallback file found at: {jsonPath}");
+                        throw new Exception($"Failed to decrypt .txt file and no .json fallback found at {jsonPath}. Error: {ex.Message}", ex);
+                    }
+                }
+            }
+            else if (configFilePath.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            {
+                // Legacy plaintext format - read directly
+                Logger.Info("Detected legacy .json format - reading plaintext...");
+                json = File.ReadAllText(configFilePath);
+            }
+            else
+            {
+                // Unknown extension - try to read as plaintext first, then try decrypt
+                Logger.Info($"Unknown file extension '{Path.GetExtension(configFilePath)}' - attempting to read as plaintext...");
+                try
+                {
+                    json = File.ReadAllText(configFilePath);
+                }
+                catch
+                {
+                    Logger.Info("Plaintext read failed - attempting to decrypt...");
+                    json = AuthFileEncryption.DecryptFromFile(configFilePath);
+                }
+            }
+
             var config = JsonConvert.DeserializeObject<LeoAuthConfig>(json);
 
             if (config == null || string.IsNullOrEmpty(config.ApiKey) || string.IsNullOrEmpty(config.ProjectId))
             {
-                throw new Exception($"Invalid auth config in {configFilePath} - missing ApiKey or ProjectId");
+                throw new Exception($"Invalid auth config in {actualFilePath} - missing ApiKey or ProjectId");
             }
 
-            Logger.Info($"Auth config loaded successfully - ProjectId: {config.ProjectId}");
+            Logger.Info($"Auth config loaded successfully from {actualFilePath} - ProjectId: {config.ProjectId}");
             return new SecureApiClient(config.ApiKey, config.ProjectId);
         }
 
         /// <summary>
         /// Creates a SecureApiClient by searching for config in standard locations
-        /// Priority: 1) Provided path, 2) Default installation folder
+        /// Priority: 1) Provided path, 2) Environment variable, 3) Default installation folder
+        /// Looks for both .txt (encrypted) and .json (plaintext) files
+        /// If provided path is .txt and doesn't exist, also checks for .json with same base name
         /// </summary>
-        /// <param name="vaultConfigPath">Optional path to vault config file</param>
+        /// <param name="vaultConfigPath">Optional path to vault config file (can be .txt or .json)</param>
         /// <returns>Initialized SecureApiClient</returns>
         public static SecureApiClient CreateFromStandardLocations(string vaultConfigPath = null)
         {
             // Try vault config path first if provided
-            if (!string.IsNullOrEmpty(vaultConfigPath) && File.Exists(vaultConfigPath))
+            if (!string.IsNullOrEmpty(vaultConfigPath))
             {
-                Logger.Info($"Using vault config path: {vaultConfigPath}");
-                return CreateFromConfigFile(vaultConfigPath);
+                if (File.Exists(vaultConfigPath))
+                {
+                    Logger.Info($"Using vault config path: {vaultConfigPath}");
+                    return CreateFromConfigFile(vaultConfigPath);
+                }
+
+                // If .txt doesn't exist, try .json with same base name (for dev purposes)
+                if (vaultConfigPath.EndsWith(".txt", StringComparison.OrdinalIgnoreCase))
+                {
+                    string jsonPath = Path.ChangeExtension(vaultConfigPath, ".json");
+                    if (File.Exists(jsonPath))
+                    {
+                        Logger.Info($"Vault .txt not found, using .json fallback: {jsonPath}");
+                        return CreateFromConfigFile(jsonPath);
+                    }
+                }
             }
 
             // Try environment variable
@@ -100,20 +180,27 @@ namespace LeoAICadDataClient
                 return CreateFromConfigFile(envPath);
             }
 
-            // Fallback to default installation folder
-            string defaultPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
-            if (File.Exists(defaultPath))
+            // Fallback to default installation folder - try .txt first (new encrypted format), then .json (plaintext)
+            string defaultTxtPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.txt");
+            if (File.Exists(defaultTxtPath))
             {
-                Logger.Info($"Using config from default installation folder: {defaultPath}");
-                return CreateFromConfigFile(defaultPath);
+                Logger.Info($"Using config from default installation folder: {defaultTxtPath}");
+                return CreateFromConfigFile(defaultTxtPath);
+            }
+
+            string defaultJsonPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
+            if (File.Exists(defaultJsonPath))
+            {
+                Logger.Info($"Using config from default installation folder (plaintext): {defaultJsonPath}");
+                return CreateFromConfigFile(defaultJsonPath);
             }
 
             // No config found
             throw new FileNotFoundException(
                 "Leo AI authentication configuration not found!\n\n" +
-                "Please place the LeoAuthKey.json file in one of the following locations:\n" +
-                "1. Vault location: <vault_root>/LeoAI_TaskData/LeoAuthKey.json\n" +
-                "2. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\LeoAuthKey.json\n" +
+                "Please place the LeoAuthKey.txt or LeoAuthKey.json file in one of the following locations:\n" +
+                "1. Vault location: <vault_root>/LeoAI_TaskData/LeoAuthKey.txt (or .json)\n" +
+                "2. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\LeoAuthKey.txt (or .json)\n" +
                 "3. Custom location specified in LEO_AUTH_KEY environment variable");
         }
 

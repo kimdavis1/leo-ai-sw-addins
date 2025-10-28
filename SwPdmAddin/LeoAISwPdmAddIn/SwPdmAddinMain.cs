@@ -135,17 +135,16 @@ namespace LeoAISwPdmAddIn
                     IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
                     if (vault == null) return;
 
-                    // Trigger complete sync by executing task on LeoAuthKey.json file
-                    // No metadata file needed - task host will run complete sync directly
-                    string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.json");
+                    // Trigger complete sync by executing task on auth key file
+                    string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
                     IEdmFolder5 folder;
                     IEdmFile5 configFile = vault.GetFileFromPath(configPath, out folder);
 
                     if (configFile == null)
                     {
-                        LogFileWriter.LogError("LeoAuthKey.json not found in vault - cannot trigger complete sync");
+                        LogFileWriter.LogError("LeoAuthKey.txt not found in vault - cannot trigger complete sync");
                         System.Windows.Forms.MessageBox.Show(
-                            "LeoAuthKey.json not found in vault. Please reinstall the add-in.",
+                            "LeoAuthKey.txt not found in vault. Please reinstall the add-in.",
                             "Complete Sync Error",
                             System.Windows.Forms.MessageBoxButtons.OK,
                             System.Windows.Forms.MessageBoxIcon.Error);
@@ -238,14 +237,13 @@ namespace LeoAISwPdmAddIn
                         // Register this vault installation in registry for tracking
                         RegisterVaultInstallation(vaultName, vaultRootPath);
 
-                        // Copy LeoAuthKey.json to vault (NEW - for client-side config access)
+                        // Copy LeoAuthKey.txt to vault (NEW - for client-side config access)
                         CopyAuthConfigToVault(vault);
 
-                        // Trigger complete sync by executing task on LeoAuthKey.json file
-                        // No metadata file needed - task host will run complete sync directly
+                        // Trigger complete sync by executing task on auth key file
                         LogFileWriter.LogMessage("Triggering initial complete sync after installation...");
 
-                        string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.json");
+                        string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
                         IEdmFolder5 folder;
                         IEdmFile5 configFile = vault.GetFileFromPath(configPath, out folder);
 
@@ -264,7 +262,7 @@ namespace LeoAISwPdmAddIn
                         }
                         else
                         {
-                            LogFileWriter.LogError("LeoAuthKey.json not found in vault - cannot trigger initial complete sync");
+                            LogFileWriter.LogError("LeoAuthKey.txt not found in vault - cannot trigger initial complete sync");
                             LogFileWriter.LogError("You may need to manually trigger complete sync from the menu");
                         }
                     }
@@ -832,8 +830,7 @@ namespace LeoAISwPdmAddIn
                 {
                     LogFileWriter.LogMessage("Initializing Leo AI client on client side...");
 
-                    // Get the auth key file from vault and ensure it's available locally
-                    string vaultConfigPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.json");
+                    string vaultConfigPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
 
                     // Use PDM API to get local copy if file exists in vault
                     IEdmFolder5 configFolder;
@@ -1097,23 +1094,41 @@ namespace LeoAISwPdmAddIn
         }
 
         /// <summary>
-        /// Copies LeoAuthKey.json from installation folder to vault for client-side access
+        /// Copies LeoAuthKey.txt (encrypted) from installation folder to vault for client-side access
+        /// Supports both .txt (new encrypted format) and .json (legacy) files
         /// </summary>
         private void CopyAuthConfigToVault(IEdmVault5 vault)
         {
             try
             {
-                string sourceConfigPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
+                // Try .txt (encrypted) first, fallback to .json (legacy)
+                string sourceConfigPathTxt = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.txt");
+                string sourceConfigPathJson = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
 
-                if (!File.Exists(sourceConfigPath))
+                string sourceConfigPath;
+                string targetFileName;
+
+                if (File.Exists(sourceConfigPathTxt))
                 {
-                    LogFileWriter.LogWarning($"LeoAuthKey.json not found at: {sourceConfigPath}");
+                    sourceConfigPath = sourceConfigPathTxt;
+                    targetFileName = "LeoAuthKey.txt";
+                    LogFileWriter.LogMessage($"Found encrypted auth file: {sourceConfigPath}");
+                }
+                else if (File.Exists(sourceConfigPathJson))
+                {
+                    sourceConfigPath = sourceConfigPathJson;
+                    targetFileName = "LeoAuthKey.json";
+                    LogFileWriter.LogMessage($"Found legacy auth file: {sourceConfigPath}");
+                }
+                else
+                {
+                    LogFileWriter.LogWarning($"LeoAuthKey.txt (or .json) not found in installation folder");
                     LogFileWriter.LogWarning("Skipping config copy to vault. Client-side events will use installation folder.");
                     return;
                 }
 
                 string vaultLeoFolder = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData");
-                string vaultConfigPath = Path.Combine(vaultLeoFolder, "LeoAuthKey.json");
+                string vaultConfigPath = Path.Combine(vaultLeoFolder, targetFileName);
 
                 // Ensure folder exists
                 if (!Directory.Exists(vaultLeoFolder))
@@ -1128,25 +1143,30 @@ namespace LeoAISwPdmAddIn
 
                 if (existingFile != null)
                 {
-                    LogFileWriter.LogMessage("LeoAuthKey.json already exists in vault - updating it");
+                    // File exists - need to replace it because encryption key changed
+                    // Each build has a different encryption key, so old encrypted file is useless
+                    LogFileWriter.LogMessage($"{targetFileName} already exists in vault - replacing with new version (encryption key changed)");
 
-                    // Check out the file to modify it
-                    try
+                    // Delete local file so we can write fresh copy
+                    if (File.Exists(vaultConfigPath))
                     {
-                        existingFile.LockFile(existingFolder.ID, 0);
-                        LogFileWriter.LogMessage("Checked out existing LeoAuthKey.json");
-                    }
-                    catch (Exception lockEx)
-                    {
-                        LogFileWriter.LogWarning($"Could not check out file (may already be checked out): {lockEx.Message}");
+                        try
+                        {
+                            File.Delete(vaultConfigPath);
+                            LogFileWriter.LogMessage($"Deleted local copy of old {targetFileName}");
+                        }
+                        catch (Exception deleteEx)
+                        {
+                            LogFileWriter.LogWarning($"Could not delete local file: {deleteEx.Message}");
+                        }
                     }
                 }
 
-                // Read source file content
+                // Read source file content (encrypted or plaintext - just copy as-is)
                 string configContent = File.ReadAllText(sourceConfigPath);
                 LogFileWriter.LogMessage($"Read source config from: {sourceConfigPath}");
 
-                // Write to vault folder using FileStream (same approach as metadata files)
+                // Write to vault folder using FileStream
                 using (FileStream fs = new FileStream(vaultConfigPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 using (StreamWriter writer = new StreamWriter(fs))
                 {
@@ -1155,19 +1175,10 @@ namespace LeoAISwPdmAddIn
                 }
                 LogFileWriter.LogMessage($"Wrote config to vault folder: {vaultConfigPath}");
 
-                if (existingFile != null)
-                {
-                    // File exists - just check it back in
-                    LogFileWriter.LogMessage("Checking in updated LeoAuthKey.json");
-                    existingFile.UnlockFile(0, "Updated by Leo AI PDM Add-in during installation", (int)EdmUnlockFlag.EdmUnlock_IgnoreReferences);
-                    LogFileWriter.LogMessage("LeoAuthKey.json updated successfully");
-                }
-                else
-                {
-                    // New file - add to vault and check in using PDM API
-                    AddFileToVault(vault, vaultConfigPath);
-                    LogFileWriter.LogMessage("LeoAuthKey.json added to vault successfully");
-                }
+                // Always add/check in as if it's a new file
+                // This ensures the new encrypted version is properly registered in vault
+                AddFileToVault(vault, vaultConfigPath);
+                LogFileWriter.LogMessage($"{targetFileName} added to vault successfully");
             }
             catch (Exception ex)
             {

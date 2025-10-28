@@ -127,7 +127,8 @@ namespace LeoAISwPdmAddIn
                     {
                         taskInstance.SetProgressPos(10, "Initializing Leo AI client...");
 
-                        string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.json");
+                        // SecureApiClient will auto-detect .txt (encrypted) or .json (legacy) format
+                        string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
                         _leoClient = SecureApiClient.CreateFromStandardLocations(configPath);
                         LogFileWriter.LogMessage("SecureApiClient initialized");
 

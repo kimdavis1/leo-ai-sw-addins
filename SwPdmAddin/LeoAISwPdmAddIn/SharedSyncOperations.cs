@@ -587,7 +587,10 @@ namespace LeoAISwPdmAddIn
 
                 // Calculate checksums for all vault files using archive-first approach
                 // Use streaming checksums for memory efficiency with large files
-                int checksumProgress = 0;
+                // PARALLEL: Checksum calculation is I/O bound and benefits from parallel processing
+
+                // Phase 1: Collect file info sequentially (COM requirement)
+                var fileInfoList = new List<Tuple<FileData, string, bool>>();
                 foreach (var vaultFile in vaultFiles)
                 {
                     try
@@ -602,44 +605,106 @@ namespace LeoAISwPdmAddIn
                             bool needsCleanup;
                             (readablePath, needsCleanup) = GetReadableFilePath(vault, vaultFile.file, folder.ID, tryArchiveFirst);
 
-                            // Use streaming checksum for memory efficiency (doesn't load entire file into RAM)
-                            var fileInfo = LeoFileInfo.GetFileInfoStreaming(readablePath);
-                            vaultFile.checkSum = fileInfo.CheckSum;
-
-                            if (needsCleanup)
-                            {
-                                DeleteTempFile(readablePath);
-                            }
+                            fileInfoList.Add(Tuple.Create(vaultFile, readablePath, needsCleanup));
                         }
                     }
                     catch (Exception csEx)
                     {
-                        LogFileWriter.LogError($"Failed to compute checksum for {vaultFile.file}: {csEx.Message}");
+                        LogFileWriter.LogError($"Failed to get file path for {vaultFile.file}: {csEx.Message}");
                         // Leave checksum as null - will be treated as changed
                     }
+                }
 
-                    checksumProgress++;
-                    // Report progress every 100 files instead of every 10 to reduce overhead
-                    if (checksumProgress % 100 == 0)
+                // Phase 2: Calculate checksums in parallel (thread-safe, no COM)
+                int checksumProgress = 0;
+                object progressLock = new object();
+                bool cancellationRequested = false;
+
+                var parallelOptions = new System.Threading.Tasks.ParallelOptions
+                {
+                    MaxDegreeOfParallelism = System.Environment.ProcessorCount
+                };
+
+                try
+                {
+                    System.Threading.Tasks.Parallel.ForEach(fileInfoList, parallelOptions, (fileInfo, loopState) =>
                     {
-                        // Check for cancellation
-                        if (IsTaskCancelled(taskInstance))
+                        // Check for cancellation at the start of each iteration
+                        if (cancellationRequested || loopState.ShouldExitCurrentIteration)
                         {
-                            LogFileWriter.LogMessage("Task cancelled by user during checksum calculation");
-                            throw new OperationCanceledException("Task cancelled by user");
+                            return;
                         }
 
                         try
                         {
-                            int progress = 35 + (int)((checksumProgress / (float)vaultFiles.Count) * 5);
-                            taskInstance.SetProgressPos(progress, $"Calculated checksums for {checksumProgress}/{vaultFiles.Count} files");
+                            var vaultFile = fileInfo.Item1;
+                            var readablePath = fileInfo.Item2;
+                            var needsCleanup = fileInfo.Item3;
+
+                            // Use streaming checksum for memory efficiency (doesn't load entire file into RAM)
+                            var fileInfoData = LeoFileInfo.GetFileInfoStreaming(readablePath);
+                            vaultFile.checkSum = fileInfoData.CheckSum;
+
+                            if (needsCleanup)
+                            {
+                                try
+                                {
+                                    DeleteTempFile(readablePath);
+                                }
+                                catch (Exception delEx)
+                                {
+                                    LogFileWriter.LogError($"Failed to delete temp file {readablePath}: {delEx.Message}");
+                                    // Continue - temp file cleanup failure shouldn't stop the sync
+                                }
+                            }
                         }
-                        catch (Exception progEx)
+                        catch (Exception csEx)
                         {
-                            LogFileWriter.LogError($"Failed to update progress status: {progEx.Message}");
-                            // Continue - progress update failure shouldn't stop the sync
+                            LogFileWriter.LogError($"Failed to compute checksum for {fileInfo.Item1.file}: {csEx.Message}");
+                            // Leave checksum as null - will be treated as changed
                         }
-                    }
+
+                        // Thread-safe progress tracking
+                        lock (progressLock)
+                        {
+                            checksumProgress++;
+
+                            // Report progress every 100 files instead of every 10 to reduce overhead
+                            if (checksumProgress % 100 == 0)
+                            {
+                                // Check for cancellation
+                                if (IsTaskCancelled(taskInstance))
+                                {
+                                    LogFileWriter.LogMessage("Task cancelled by user during checksum calculation");
+                                    cancellationRequested = true;
+                                    loopState.Stop(); // Stop parallel execution gracefully
+                                    return;
+                                }
+
+                                try
+                                {
+                                    int progress = 35 + (int)((checksumProgress / (float)vaultFiles.Count) * 5);
+                                    taskInstance.SetProgressPos(progress, $"Calculated checksums for {checksumProgress}/{vaultFiles.Count} files");
+                                }
+                                catch (Exception progEx)
+                                {
+                                    LogFileWriter.LogError($"Failed to update progress status: {progEx.Message}");
+                                    // Continue - progress update failure shouldn't stop the sync
+                                }
+                            }
+                        }
+                    });
+                }
+                catch (Exception parallelEx)
+                {
+                    LogFileWriter.LogError($"Error during parallel checksum calculation: {parallelEx.Message}");
+                    // Continue with what we have - partial checksums are okay
+                }
+
+                // Check if cancellation was requested during parallel processing
+                if (cancellationRequested)
+                {
+                    throw new OperationCanceledException("Task cancelled by user during checksum calculation");
                 }
 
                 try
@@ -790,6 +855,8 @@ namespace LeoAISwPdmAddIn
                     {
                         LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
                     }
+
+                    // NOTE: Delete kept sequential - Parallel.ForEach with async doesn't properly await
                     int deletedModified = 0;
                     foreach (var filePath in modifiedFilesToUpload)
                     {
@@ -803,7 +870,7 @@ namespace LeoAISwPdmAddIn
                         try
                         {
                             string relativePath = GetRelativePath(vault.RootFolderPath, filePath);
-                            bool deleteSuccess = await leoClient.DeleteFileAsync(directoryId, relativePath);
+                            bool deleteSuccess = await leoClient.DeleteFileAsync(directoryId, relativePath).ConfigureAwait(false);
                             if (deleteSuccess)
                             {
                                 deletedModified++;
@@ -841,6 +908,9 @@ namespace LeoAISwPdmAddIn
 
                 LogFileWriter.LogMessage($"Initial sync: {alreadyOnServer.Count} files already on server with matching checksums (will be used for dependency tracking)");
 
+                // NOTE: Uploads are kept sequential due to complex dependency handling
+                // UpdateFilesToLeoAI creates a local uploadedFiles HashSet which would cause
+                // race conditions if multiple threads upload files with shared dependencies
                 foreach (var filePath in allFilesToUpload)
                 {
                     // Check for cancellation every 10 uploads
@@ -853,7 +923,7 @@ namespace LeoAISwPdmAddIn
                     try
                     {
                         // Pass alreadyOnServer set so dependencies that exist on server aren't re-uploaded
-                        await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath, leoClient, directoryId, tryArchiveFirst, alreadyOnServer);
+                        await UpdateFilesToLeoAI(vault, new[] { filePath }, vault.RootFolderPath, leoClient, directoryId, tryArchiveFirst, alreadyOnServer).ConfigureAwait(false);
                         uploaded++;
 
                         // Report progress every 100 files instead of every file to reduce overhead
@@ -887,6 +957,8 @@ namespace LeoAISwPdmAddIn
                 {
                     LogFileWriter.LogError($"Failed to update progress: {progEx.Message}");
                 }
+
+                // NOTE: Delete kept sequential - Parallel.ForEach with async doesn't properly await
                 int deleted = 0;
                 int deleteTotal = filesToDelete.Count > 0 ? filesToDelete.Count : 1;
                 foreach (var relativePath in filesToDelete)
@@ -900,7 +972,7 @@ namespace LeoAISwPdmAddIn
 
                     try
                     {
-                        bool success = await leoClient.DeleteFileAsync(directoryId, relativePath);
+                        bool success = await leoClient.DeleteFileAsync(directoryId, relativePath).ConfigureAwait(false);
                         if (success)
                         {
                             deleted++;
