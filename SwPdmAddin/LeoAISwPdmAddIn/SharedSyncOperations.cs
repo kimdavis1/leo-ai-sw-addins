@@ -1517,7 +1517,7 @@ namespace LeoAISwPdmAddIn
                         string actualFilePath;
                         bool needsCleanup;
                         (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
-                        var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
+                        var localFileInfo = LeoFileInfo.GetFileInfoStreaming(actualFilePath);
                         currentChecksum = localFileInfo.CheckSum;
 
                         // Build externalId: fileID_versionnum_checksum
@@ -1674,8 +1674,8 @@ namespace LeoAISwPdmAddIn
                     bool needsCleanup;
                     (readablePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
 
-                    // Reuse existing LeoFileInfo.GetFileInfo to calculate checksum
-                    var fileInfo = LeoFileInfo.GetFileInfo(readablePath);
+                    // Reuse existing LeoFileInfo.GetFileInfoStreaming to calculate checksum
+                    var fileInfo = LeoFileInfo.GetFileInfoStreaming(readablePath);
                     string checksum = fileInfo.CheckSum;
 
                     // Delete temp file immediately after getting checksum
@@ -1746,7 +1746,7 @@ namespace LeoAISwPdmAddIn
                     (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
 
                     // Calculate checksum to include in externalId
-                    var fileInfoForId = LeoFileInfo.GetFileInfo(actualFilePath);
+                    var fileInfoForId = LeoFileInfo.GetFileInfoStreaming(actualFilePath);
 
                     // Build externalId: fileID_versionnum_checksum
                     externalId = $"{file.ID}_{file.CurrentVersion}_{fileInfoForId.CheckSum}";
@@ -1793,7 +1793,7 @@ namespace LeoAISwPdmAddIn
                             SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File found on server - comparing checksums");
 
                             // Calculate local file checksum
-                            var localFileInfo = LeoFileInfo.GetFileInfo(actualFilePath);
+                            var localFileInfo = LeoFileInfo.GetFileInfoStreaming(actualFilePath);
                             string localChecksum = localFileInfo.CheckSum;
                             LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
 

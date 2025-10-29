@@ -1141,44 +1141,67 @@ namespace LeoAISwPdmAddIn
                 IEdmFolder5 existingFolder;
                 IEdmFile5 existingFile = vault.GetFileFromPath(vaultConfigPath, out existingFolder);
 
+                // Read source file content (encrypted or plaintext - just copy as-is)
+                string configContent = File.ReadAllText(sourceConfigPath);
+                LogFileWriter.LogMessage($"Read source config from: {sourceConfigPath}");
+
                 if (existingFile != null)
                 {
                     // File exists - need to replace it because encryption key changed
                     // Each build has a different encryption key, so old encrypted file is useless
                     LogFileWriter.LogMessage($"{targetFileName} already exists in vault - replacing with new version (encryption key changed)");
 
-                    // Delete local file so we can write fresh copy
-                    if (File.Exists(vaultConfigPath))
+                    // Check out the file so we can modify it
+                    try
                     {
-                        try
-                        {
-                            File.Delete(vaultConfigPath);
-                            LogFileWriter.LogMessage($"Deleted local copy of old {targetFileName}");
-                        }
-                        catch (Exception deleteEx)
-                        {
-                            LogFileWriter.LogWarning($"Could not delete local file: {deleteEx.Message}");
-                        }
+                        existingFile.LockFile(existingFolder.ID, 0, (int)EdmLockFlag.EdmLock_Simple);
+                        LogFileWriter.LogMessage($"Checked out {targetFileName} for modification");
+                    }
+                    catch (Exception lockEx)
+                    {
+                        LogFileWriter.LogWarning($"Could not check out file (may already be checked out): {lockEx.Message}");
+                        // Continue anyway - file might already be unlocked
+                    }
+
+                    // Write new content to the local copy
+                    using (FileStream fs = new FileStream(vaultConfigPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (StreamWriter writer = new StreamWriter(fs))
+                    {
+                        writer.Write(configContent);
+                        writer.Flush();
+                    }
+                    LogFileWriter.LogMessage($"Updated local copy of {targetFileName}");
+
+                    // Check in the modified file
+                    try
+                    {
+                        existingFile.UnlockFile(0, "Updated encryption key - Leo AI PDM Add-in", (int)EdmUnlockFlag.EdmUnlock_IgnoreReferences);
+                        LogFileWriter.LogMessage($"Checked in updated {targetFileName}");
+                    }
+                    catch (Exception unlockEx)
+                    {
+                        LogFileWriter.LogError($"Could not check in file: {unlockEx.Message}");
+                        throw;
                     }
                 }
-
-                // Read source file content (encrypted or plaintext - just copy as-is)
-                string configContent = File.ReadAllText(sourceConfigPath);
-                LogFileWriter.LogMessage($"Read source config from: {sourceConfigPath}");
-
-                // Write to vault folder using FileStream
-                using (FileStream fs = new FileStream(vaultConfigPath, FileMode.Create, FileAccess.Write, FileShare.None))
-                using (StreamWriter writer = new StreamWriter(fs))
+                else
                 {
-                    writer.Write(configContent);
-                    writer.Flush();
-                }
-                LogFileWriter.LogMessage($"Wrote config to vault folder: {vaultConfigPath}");
+                    // File doesn't exist - create new one
+                    LogFileWriter.LogMessage($"{targetFileName} doesn't exist in vault - creating new file");
 
-                // Always add/check in as if it's a new file
-                // This ensures the new encrypted version is properly registered in vault
-                AddFileToVault(vault, vaultConfigPath);
-                LogFileWriter.LogMessage($"{targetFileName} added to vault successfully");
+                    // Write to vault folder using FileStream
+                    using (FileStream fs = new FileStream(vaultConfigPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (StreamWriter writer = new StreamWriter(fs))
+                    {
+                        writer.Write(configContent);
+                        writer.Flush();
+                    }
+                    LogFileWriter.LogMessage($"Wrote config to vault folder: {vaultConfigPath}");
+
+                    // Add to vault and check in
+                    AddFileToVault(vault, vaultConfigPath);
+                    LogFileWriter.LogMessage($"{targetFileName} added to vault successfully");
+                }
             }
             catch (Exception ex)
             {
