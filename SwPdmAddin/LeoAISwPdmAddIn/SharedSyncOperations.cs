@@ -596,115 +596,83 @@ namespace LeoAISwPdmAddIn
                     try
                     {
                         string fullPath = EnsureFullPath(vault, vaultFile.file);
-                        IEdmFolder5 folder;
-                        IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
 
-                        if (file != null && folder != null)
-                        {
-                            string readablePath;
-                            bool needsCleanup;
-                            (readablePath, needsCleanup) = GetReadableFilePath(vault, vaultFile.file, folder.ID, tryArchiveFirst);
-
-                            fileInfoList.Add(Tuple.Create(vaultFile, readablePath, needsCleanup));
-                        }
+                        // Just add the file path - no need to get readable path for identifier generation
+                        fileInfoList.Add(Tuple.Create(vaultFile, fullPath, false));
                     }
                     catch (Exception csEx)
                     {
-                        LogFileWriter.LogError($"Failed to get file path for {vaultFile.file}: {csEx.Message}");
+                        LogFileWriter.LogError($"Failed to process file {vaultFile.file}: {csEx.Message}");
                         // Leave checksum as null - will be treated as changed
                     }
                 }
 
-                // Phase 2: Calculate checksums in parallel (thread-safe, no COM)
-                int checksumProgress = 0;
-                object progressLock = new object();
+                // Phase 2: Get FileID_Version identifiers sequentially (COM requirement - must be single-threaded)
+                int identifierProgress = 0;
                 bool cancellationRequested = false;
-
-                var parallelOptions = new System.Threading.Tasks.ParallelOptions
-                {
-                    MaxDegreeOfParallelism = System.Environment.ProcessorCount
-                };
 
                 try
                 {
-                    System.Threading.Tasks.Parallel.ForEach(fileInfoList, parallelOptions, (fileInfo, loopState) =>
+                    foreach (var fileInfo in fileInfoList)
                     {
-                        // Check for cancellation at the start of each iteration
-                        if (cancellationRequested || loopState.ShouldExitCurrentIteration)
+                        // Check for cancellation
+                        if (cancellationRequested)
                         {
-                            return;
+                            break;
                         }
 
                         try
                         {
                             var vaultFile = fileInfo.Item1;
-                            var readablePath = fileInfo.Item2;
-                            var needsCleanup = fileInfo.Item3;
+                            var fullPath = fileInfo.Item2;
 
-                            // Use streaming checksum for memory efficiency (doesn't load entire file into RAM)
-                            var fileInfoData = LeoFileInfo.GetFileInfoStreaming(readablePath);
-                            vaultFile.checkSum = fileInfoData.CheckSum;
-
-                            if (needsCleanup)
-                            {
-                                try
-                                {
-                                    DeleteTempFile(readablePath);
-                                }
-                                catch (Exception delEx)
-                                {
-                                    LogFileWriter.LogError($"Failed to delete temp file {readablePath}: {delEx.Message}");
-                                    // Continue - temp file cleanup failure shouldn't stop the sync
-                                }
-                            }
+                            // Get FileID_Version identifier (fast, no file I/O)
+                            var fileInfoData = GetUniqueIdentifier(vault, fullPath);
+                            vaultFile.checkSum = fileInfoData.CheckSum;  // Now contains "fileID_version"
                         }
                         catch (Exception csEx)
                         {
-                            LogFileWriter.LogError($"Failed to compute checksum for {fileInfo.Item1.file}: {csEx.Message}");
+                            LogFileWriter.LogError($"Failed to get identifier for {fileInfo.Item1.file}: {csEx.Message}");
                             // Leave checksum as null - will be treated as changed
                         }
 
-                        // Thread-safe progress tracking
-                        lock (progressLock)
+                        // Progress tracking
+                        identifierProgress++;
+
+                        // Report progress every 100 files to reduce overhead
+                        if (identifierProgress % 100 == 0)
                         {
-                            checksumProgress++;
-
-                            // Report progress every 100 files instead of every 10 to reduce overhead
-                            if (checksumProgress % 100 == 0)
+                            // Check for cancellation
+                            if (IsTaskCancelled(taskInstance))
                             {
-                                // Check for cancellation
-                                if (IsTaskCancelled(taskInstance))
-                                {
-                                    LogFileWriter.LogMessage("Task cancelled by user during checksum calculation");
-                                    cancellationRequested = true;
-                                    loopState.Stop(); // Stop parallel execution gracefully
-                                    return;
-                                }
+                                LogFileWriter.LogMessage("Task cancelled by user during identifier generation");
+                                cancellationRequested = true;
+                                break;
+                            }
 
-                                try
-                                {
-                                    int progress = 35 + (int)((checksumProgress / (float)vaultFiles.Count) * 5);
-                                    taskInstance.SetProgressPos(progress, $"Calculated checksums for {checksumProgress}/{vaultFiles.Count} files");
-                                }
-                                catch (Exception progEx)
-                                {
-                                    LogFileWriter.LogError($"Failed to update progress status: {progEx.Message}");
-                                    // Continue - progress update failure shouldn't stop the sync
-                                }
+                            try
+                            {
+                                int progress = 35 + (int)((identifierProgress / (float)vaultFiles.Count) * 5);
+                                taskInstance.SetProgressPos(progress, $"Generated identifiers for {identifierProgress}/{vaultFiles.Count} files");
+                            }
+                            catch (Exception progEx)
+                            {
+                                LogFileWriter.LogError($"Failed to update progress status: {progEx.Message}");
+                                // Continue - progress update failure shouldn't stop the sync
                             }
                         }
-                    });
+                    }
                 }
-                catch (Exception parallelEx)
+                catch (Exception ex)
                 {
-                    LogFileWriter.LogError($"Error during parallel checksum calculation: {parallelEx.Message}");
-                    // Continue with what we have - partial checksums are okay
+                    LogFileWriter.LogError($"Error during identifier generation: {ex.Message}");
+                    // Continue with what we have - partial identifiers are okay
                 }
 
-                // Check if cancellation was requested during parallel processing
+                // Check if cancellation was requested
                 if (cancellationRequested)
                 {
-                    throw new OperationCanceledException("Task cancelled by user during checksum calculation");
+                    throw new OperationCanceledException("Task cancelled by user during identifier generation");
                 }
 
                 try
@@ -1464,9 +1432,9 @@ namespace LeoAISwPdmAddIn
                 }
             }
 
-            // Build dependency dictionary with checksums for files that were uploaded
-            // Dictionary format: Key = checksum, Value = filePath (for ChildData constructor)
-            Dictionary<string, string> dependenciesWithChecksums = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            // Build dependency dictionary with FileID_Version identifiers for files that were uploaded
+            // Dictionary format: Key = fileID_version, Value = relative path from assembly (for ChildData constructor)
+            Dictionary<string, string> dependenciesWithIds = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
             // Flatten all dependency paths from all levels
             var allDependencyPaths = dependenciesByLevel.Values.SelectMany(list => list).ToList();
@@ -1478,19 +1446,26 @@ namespace LeoAISwPdmAddIn
                 {
                     try
                     {
-                        // Get checksum from uploaded file
+                        // Get FileID_Version identifier from uploaded file
                         string depFullPath = Path.Combine(vaultRootPath, depRelativePath.Replace('/', Path.DirectorySeparatorChar));
-                        string checksum = await GetFileChecksumForDependency(vault, depFullPath, tryArchiveFirst);
-                        if (!string.IsNullOrEmpty(checksum))
+                        var depFileInfo = GetUniqueIdentifier(vault, depFullPath);
+                        string fileIdVersion = depFileInfo.CheckSum;  // Contains "fileID_version"
+
+                        if (!string.IsNullOrEmpty(fileIdVersion))
                         {
-                            // Key = checksum, Value = filePath (required for ChildData constructor)
-                            dependenciesWithChecksums[checksum] = depRelativePath;
+                            // Calculate relative path from assembly to dependency
+                            string relativePathToAssembly = CalculateRelativePath(relativePath, depRelativePath);
+
+                            // Key = fileID_version, Value = relative path from assembly
+                            dependenciesWithIds[fileIdVersion] = relativePathToAssembly;
+
+                            LogFileWriter.LogDebug($"Dependency [{fileIdVersion}]: {relativePathToAssembly}");
                         }
                     }
                     catch (Exception ex)
                     {
                         // Log error but continue - skip this dependency
-                        LogFileWriter.LogError($"Failed to get checksum for dependency {depRelativePath}: {ex.Message}");
+                        LogFileWriter.LogError($"Failed to get identifier for dependency {depRelativePath}: {ex.Message}");
                     }
                 }
             }
@@ -1505,39 +1480,24 @@ namespace LeoAISwPdmAddIn
                 string currentChecksum = null;
                 string externalId = "";
 
-                // Get current file info for checksum and externalId
+                // Get current file identifier for move operation
                 try
                 {
                     string fullPath = EnsureFullPath(vault, filePath);
-                    IEdmFolder5 folder;
-                    IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
 
-                    if (file != null && folder != null)
-                    {
-                        string actualFilePath;
-                        bool needsCleanup;
-                        (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
-                        var localFileInfo = LeoFileInfo.GetFileInfoStreaming(actualFilePath);
-                        currentChecksum = localFileInfo.CheckSum;
-
-                        // Build externalId: fileID_versionnum_checksum
-                        externalId = $"{file.ID}_{file.CurrentVersion}_{currentChecksum}";
-
-                        // Clean up temp file if needed
-                        if (needsCleanup && !string.IsNullOrEmpty(actualFilePath))
-                        {
-                            DeleteTempFile(actualFilePath);
-                        }
-                    }
+                    // Get FileID_Version identifier (no file I/O needed)
+                    var fileInfo = GetUniqueIdentifier(vault, fullPath);
+                    currentChecksum = fileInfo.CheckSum;  // Contains "fileID_version"
+                    externalId = currentChecksum;  // externalId is now just fileID_version
                 }
                 catch (Exception ex)
                 {
-                    LogFileWriter.LogError($"Error getting file info for move: {ex.Message}");
+                    LogFileWriter.LogError($"Error getting file identifier for move: {ex.Message}");
                 }
 
                 // Try optimistic update (without file content)
                 LogFileWriter.LogMessage($"Attempting optimistic UpdateFileLocationAsync with checksum: {currentChecksum}, externalId: {externalId}");
-                var updateResult = await leoClient.UpdateFileLocationAsync(directoryId, vaultRootPath, filePath, currentChecksum, externalId, dependenciesWithChecksums);
+                var updateResult = await leoClient.UpdateFileLocationAsync(directoryId, vaultRootPath, filePath, currentChecksum, externalId, dependenciesWithIds);
 
                 if (updateResult != null)
                 {
@@ -1591,7 +1551,7 @@ namespace LeoAISwPdmAddIn
 
                             // Do full upload with file content
                             LogFileWriter.LogMessage($"Performing full upload to NEW path");
-                            bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums, leoClient, directoryId, tryArchiveFirst);
+                            bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithIds, leoClient, directoryId, tryArchiveFirst);
 
                             if (uploadSuccess)
                             {
@@ -1607,7 +1567,7 @@ namespace LeoAISwPdmAddIn
                         {
                             // NEW path doesn't exist on server - do full upload
                             LogFileWriter.LogMessage($"NEW path not found on server - doing full upload");
-                            bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums, leoClient, directoryId, tryArchiveFirst);
+                            bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithIds, leoClient, directoryId, tryArchiveFirst);
 
                             if (uploadSuccess)
                             {
@@ -1641,7 +1601,7 @@ namespace LeoAISwPdmAddIn
             else
             {
                 // Normal upload flow
-                bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithChecksums, leoClient, directoryId, tryArchiveFirst);
+                bool uploadSuccess = await UploadSingleFile(vault, filePath, vaultRootPath, dependenciesWithIds, leoClient, directoryId, tryArchiveFirst);
 
                 // Mark as uploaded (even if skipped, because it exists on server)
                 if (uploadSuccess)
@@ -1657,57 +1617,8 @@ namespace LeoAISwPdmAddIn
         }
 
         /// <summary>
-        /// Gets the checksum for a dependency file (reuses existing LeoFileInfo.GetFileInfo)
-        /// Deletes temp file immediately after getting checksum if it was copied to local view
-        /// </summary>
-        private static Task<string> GetFileChecksumForDependency(IEdmVault11 vault, string filePath, bool tryArchiveFirst)
-        {
-            try
-            {
-                string fullPath = EnsureFullPath(vault, filePath);
-                IEdmFolder5 folder;
-                IEdmFile5 file = vault.GetFileFromPath(fullPath, out folder);
-
-                if (file != null && folder != null)
-                {
-                    string readablePath;
-                    bool needsCleanup;
-                    (readablePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
-
-                    // Reuse existing LeoFileInfo.GetFileInfoStreaming to calculate checksum
-                    var fileInfo = LeoFileInfo.GetFileInfoStreaming(readablePath);
-                    string checksum = fileInfo.CheckSum;
-
-                    // Delete temp file immediately after getting checksum
-                    // Only delete if we copied it from archive (needsCleanup = true)
-                    if (needsCleanup && !string.IsNullOrEmpty(readablePath))
-                    {
-                        try
-                        {
-                            DeleteTempFile(readablePath);
-                            LogFileWriter.LogMessage($"Deleted temp file after checksum: {readablePath}");
-                        }
-                        catch (Exception delEx)
-                        {
-                            LogFileWriter.LogError($"Failed to delete temp file {readablePath}: {delEx.Message}");
-                        }
-                    }
-
-                    return Task.FromResult(checksum);
-                }
-
-                return Task.FromResult<string>(null);
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"GetFileChecksumForDependency failed for {filePath}: {ex.Message}");
-                return Task.FromResult<string>(null);
-            }
-        }
-
-        /// <summary>
         /// Uploads a single file with proper error handling and dependency information
-        /// ALWAYS checks if file exists on server first, compares checksums, and deletes old version if needed
+        /// ALWAYS checks if file exists on server first, compares identifiers, and deletes old version if needed
         /// Deletes temp file immediately after upload if it was copied to local view
         /// Returns true if file was uploaded or already exists (skipped), false if failed
         /// </summary>
@@ -1745,11 +1656,9 @@ namespace LeoAISwPdmAddIn
                     SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Getting readable file path");
                     (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
 
-                    // Calculate checksum to include in externalId
-                    var fileInfoForId = LeoFileInfo.GetFileInfoStreaming(actualFilePath);
-
-                    // Build externalId: fileID_versionnum_checksum
-                    externalId = $"{file.ID}_{file.CurrentVersion}_{fileInfoForId.CheckSum}";
+                    // Build externalId: fileID_version (no checksum needed)
+                    var idInfo = GetUniqueIdentifier(vault, fullPath);
+                    externalId = idInfo.CheckSum;  // Contains "fileID_version"
 
                     LogFileWriter.LogMessage($"File path for upload: {actualFilePath} (cleanup: {needsCleanup}, externalId: {externalId})");
                 }
@@ -1789,13 +1698,13 @@ namespace LeoAISwPdmAddIn
 
                         if (serverFile != null)
                         {
-                            LogFileWriter.LogMessage($"File exists on server with checksum: {serverFile.CheckSum}");
-                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File found on server - comparing checksums");
+                            LogFileWriter.LogMessage($"File exists on server with identifier: {serverFile.CheckSum}");
+                            SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File found on server - comparing identifiers");
 
-                            // Calculate local file checksum
-                            var localFileInfo = LeoFileInfo.GetFileInfoStreaming(actualFilePath);
-                            string localChecksum = localFileInfo.CheckSum;
-                            LogFileWriter.LogMessage($"Local file checksum: {localChecksum}");
+                            // Get local file identifier (FileID_Version)
+                            var localFileInfo = GetUniqueIdentifier(vault, fullPath);
+                            string localIdentifier = localFileInfo.CheckSum;  // Contains "fileID_version"
+                            LogFileWriter.LogMessage($"Local file identifier: {localIdentifier}");
 
                             // Check if file needs reupload
                             bool needsReupload = false;
@@ -1807,17 +1716,17 @@ namespace LeoAISwPdmAddIn
                                 reason = "file has IN_ERROR status";
                                 LogFileWriter.LogMessage($"File has IN_ERROR status - forcing reupload");
                             }
-                            else if (serverFile.CheckSum != localChecksum)
+                            else if (serverFile.CheckSum != localIdentifier)
                             {
                                 needsReupload = true;
-                                reason = "checksum changed";
+                                reason = "version changed";
                             }
 
-                            if (!needsReupload && serverFile.CheckSum == localChecksum)
+                            if (!needsReupload && serverFile.CheckSum == localIdentifier)
                             {
-                                LogFileWriter.LogMessage($"File unchanged (checksums match, no errors) - treating as success");
+                                LogFileWriter.LogMessage($"File unchanged (identifiers match, no errors) - treating as success");
                                 SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "File unchanged - skipping reupload");
-                                // File already exists with same content - treat as success
+                                // File already exists with same version - treat as success
                                 fileInfo = new LeoAICadDataClient.Utilities.FileInfo { ComponentId = serverFile.ComponentId };
                             }
                             else if (needsReupload)
@@ -2368,6 +2277,94 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogError($"Failed to check task cancellation status: {ex.Message}");
                 return false; // Assume not cancelled if we can't check
             }
+        }
+
+        /// <summary>
+        /// Gets unique identifier for a PDM file based on FileID and Version
+        /// Replaces checksum-based identification with stable PDM metadata
+        /// </summary>
+        /// <param name="vault">PDM vault instance</param>
+        /// <param name="filePath">Full path to file in vault</param>
+        /// <returns>LeoFileInformation with UniqueId in format "fileID_version"</returns>
+        private static LeoFileInfo.LeoFileInformation GetUniqueIdentifier(IEdmVault11 vault, string filePath)
+        {
+            try
+            {
+                IEdmFolder5 folder;
+                IEdmFile5 file = vault.GetFileFromPath(filePath, out folder);
+
+                if (file == null)
+                {
+                    throw new FileNotFoundException($"File not found in vault: {filePath}");
+                }
+
+                // Build unique identifier from PDM's stable FileID and Version
+                string uniqueId = $"{file.ID}_{file.CurrentVersion}";
+
+                LogFileWriter.LogDebug($"Unique identifier for {Path.GetFileName(filePath)}: {uniqueId}");
+
+                return new LeoFileInfo.LeoFileInformation
+                {
+                    CheckSum = uniqueId  // Reuse CheckSum field to store FileID_Version
+                };
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to get unique identifier for {filePath}: {ex.Message}");
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Calculates relative path from assembly file to dependency file
+        /// Both paths should be vault-root-relative initially
+        /// </summary>
+        /// <param name="assemblyVaultRelPath">Assembly path relative to vault root (e.g., "folder1/folder2/assembly.sldasm")</param>
+        /// <param name="dependencyVaultRelPath">Dependency path relative to vault root (e.g., "folder1/part.sldprt")</param>
+        /// <returns>Relative path from assembly to dependency (e.g., "../part.sldprt")</returns>
+        private static string CalculateRelativePath(string assemblyVaultRelPath, string dependencyVaultRelPath)
+        {
+            // Normalize separators to forward slash and trim leading slashes
+            string normAssembly = assemblyVaultRelPath.Replace('\\', '/').TrimStart('/');
+            string normDependency = dependencyVaultRelPath.Replace('\\', '/').TrimStart('/');
+
+            string[] assemblyParts = normAssembly.Split('/');
+            string[] dependencyParts = normDependency.Split('/');
+
+            // Find common ancestor folder depth (exclude filename from comparison)
+            int commonDepth = 0;
+            int maxCheck = Math.Min(assemblyParts.Length - 1, dependencyParts.Length - 1);
+
+            for (int i = 0; i < maxCheck; i++)
+            {
+                if (assemblyParts[i].Equals(dependencyParts[i], StringComparison.OrdinalIgnoreCase))
+                    commonDepth++;
+                else
+                    break;
+            }
+
+            // Calculate how many levels up from assembly directory to common ancestor
+            int levelsUp = (assemblyParts.Length - 1) - commonDepth;
+
+            // Build relative path
+            List<string> pathParts = new List<string>();
+
+            // Add ".." for each level up
+            for (int i = 0; i < levelsUp; i++)
+            {
+                pathParts.Add("..");
+            }
+
+            // Add path segments from common ancestor to dependency
+            for (int i = commonDepth; i < dependencyParts.Length; i++)
+            {
+                pathParts.Add(dependencyParts[i]);
+            }
+
+            string result = string.Join("/", pathParts);
+            LogFileWriter.LogDebug($"Relative path from {Path.GetFileName(assemblyVaultRelPath)} to {Path.GetFileName(dependencyVaultRelPath)}: {result}");
+
+            return result;
         }
 
         #endregion

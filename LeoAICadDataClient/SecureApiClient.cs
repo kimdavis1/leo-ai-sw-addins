@@ -321,12 +321,15 @@ namespace LeoAICadDataClient
                 try
                 {
                     Logger.Info($"Attempting to create file: {logicalFilePath} (reading from: {actualFilePath}) in directory: {directoryId}");
-                    LeoFileInfo.LeoFileInformation fInfo = LeoFileInfo.GetFileInfo(actualFilePath); // Read from actual path
+
+                    // Read file and encode to Base64, using provided externalId as the identifier (FileID_Version)
+                    LeoFileInfo.LeoFileInformation fInfo = LeoFileInfo.GetFileForUpload(actualFilePath, externalId);
+
                     string relativePath = GetRelativePath(vaultPath, logicalFilePath); // Use logical path for API
                     string memeType = LeoAIMemeType.GetMemeType(logicalFilePath); // Use logical path for extension
 
                     // Log API request parameters
-                    Logger.Info($"[API CALL] CreateFile: path={NormalizeFilePathForApi(relativePath)}, checksum={fInfo.CheckSum}, mimeType={memeType}, externalId={externalId}, hasFileContent=true");
+                    Logger.Info($"[API CALL] CreateFile: path={NormalizeFilePathForApi(relativePath)}, identifier={fInfo.CheckSum}, mimeType={memeType}, externalId={externalId}, hasFileContent=true");
                     if (childInfos != null && childInfos.Count > 0)
                     {
                         Logger.Info($"[API CALL] CreateFile dependencies: {JsonConvert.SerializeObject(childInfos)}");
@@ -337,7 +340,7 @@ namespace LeoAICadDataClient
                         content.Add(new StringContent(memeType), "mimeType");
                         content.Add(new StringContent(fInfo.CheckSum), "checkSum");
                         content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
-                        // content.Add(new StringContent(externalId), "externalId");
+                        content.Add(new StringContent(externalId), "externalId");
 
                         var fileBytes = Convert.FromBase64String(fInfo.Base64EncodedFile);
                         content.Add(new ByteArrayContent(fileBytes), "file", Path.GetFileName(logicalFilePath));
@@ -859,7 +862,7 @@ namespace LeoAICadDataClient
                         content.Add(new StringContent(mimeType), "mimeType");
                         content.Add(new StringContent(checksum), "checkSum");
                         content.Add(new StringContent(NormalizeFilePathForApi(relativePath)), "filePathInDirectory");
-                        // content.Add(new StringContent(externalId), "externalId");
+                        content.Add(new StringContent(externalId), "externalId");
 
                         // NOTE: We send checkSum so backend can identify which file to attach the new path to
                         // We do NOT send file content (no ByteArrayContent with Base64EncodedFile)

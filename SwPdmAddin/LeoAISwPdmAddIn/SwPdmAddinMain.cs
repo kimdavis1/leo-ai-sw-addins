@@ -471,37 +471,58 @@ namespace LeoAISwPdmAddIn
                 string oldFolderPath = null;
                 string newFolderPath = currentFolderPath;
 
-                if (operationType == "RenameFolder" || operationType == "MoveFolder")
+                if (operationType == "MoveFolder")
                 {
-                    // For rename: mbsStrData2 is the NEW name, so we can deduce the old name
-                    // Current folder name is in currentFolderPath
-                    // OLD name should be: parent path + old name from (currentName vs newName from mbsStrData2)
+                    // For MoveFolder: mbsStrData1 is typically the full OLD path (before move)
+                    // We can use it directly
+                    if (!string.IsNullOrEmpty(folderPath1) && Path.IsPathRooted(folderPath1))
+                    {
+                        // mbsStrData1 is already a full absolute path
+                        oldFolderPath = folderPath1;
+                        LogFileWriter.LogMessage($"MoveFolder - using mbsStrData1 as full OLD path: '{oldFolderPath}'");
+                    }
+                    else if (!string.IsNullOrEmpty(folderPath1))
+                    {
+                        // mbsStrData1 might be vault-relative, make it absolute
+                        oldFolderPath = Path.Combine(vault.RootFolderPath, folderPath1);
+                        LogFileWriter.LogMessage($"MoveFolder - constructed OLD path from vault root: '{oldFolderPath}'");
+                    }
+                    else
+                    {
+                        LogFileWriter.LogError($"MoveFolder - Could not determine old folder path");
+                        return;
+                    }
+                }
+                else if (operationType == "RenameFolder")
+                {
+                    // For RenameFolder: mbsStrData1 is just the old folder NAME (not full path)
+                    // mbsStrData2 is the new folder NAME
+                    // We need to reconstruct the full old path using the parent directory
 
                     string currentFolderName = Path.GetFileName(currentFolderPath);
                     string parentPath = Path.GetDirectoryName(currentFolderPath);
 
-                    LogFileWriter.LogMessage($"Current folder name: '{currentFolderName}'");
-                    LogFileWriter.LogMessage($"Parent path: '{parentPath}'");
+                    LogFileWriter.LogMessage($"RenameFolder - Current folder name: '{currentFolderName}'");
+                    LogFileWriter.LogMessage($"RenameFolder - Parent path (absolute): '{parentPath}'");
+                    LogFileWriter.LogMessage($"RenameFolder - mbsStrData1 (old name): '{folderPath1}'");
+                    LogFileWriter.LogMessage($"RenameFolder - mbsStrData2 (new name): '{folderPath2}'");
 
-                    // For rename: if mbsStrData2 matches current name, then mbsStrData1 is the old name
-                    if (!string.IsNullOrEmpty(folderPath2) && currentFolderName.Equals(folderPath2, StringComparison.OrdinalIgnoreCase))
+                    // Verify that mbsStrData2 matches the current folder name (sanity check)
+                    if (!string.IsNullOrEmpty(folderPath2) && !currentFolderName.Equals(folderPath2, StringComparison.OrdinalIgnoreCase))
                     {
-                        // mbsStrData1 is the old folder name
+                        LogFileWriter.LogWarning($"RenameFolder - Expected mbsStrData2 '{folderPath2}' to match current name '{currentFolderName}'");
+                    }
+
+                    // Reconstruct old path: parent directory + old folder name
+                    if (!string.IsNullOrEmpty(folderPath1))
+                    {
                         oldFolderPath = Path.Combine(parentPath, folderPath1);
-                        LogFileWriter.LogMessage($"Reconstructed OLD path: '{oldFolderPath}'");
+                        LogFileWriter.LogMessage($"RenameFolder - Reconstructed OLD path: '{oldFolderPath}'");
                     }
                     else
                     {
-                        // Fallback: assume mbsStrData1 is old path, mbsStrData2 is new name
-                        if (!string.IsNullOrEmpty(folderPath1))
-                        {
-                            oldFolderPath = folderPath1;
-                        }
-                        else
-                        {
-                            LogFileWriter.LogWarning($"Could not determine old folder path for {operationType}");
-                            oldFolderPath = currentFolderPath; // Fallback
-                        }
+                        LogFileWriter.LogError($"RenameFolder - mbsStrData1 (old folder name) is empty");
+                        return;
                     }
                 }
                 else
@@ -973,8 +994,12 @@ namespace LeoAISwPdmAddIn
             //   mbsStrData1 = vault path
             //   mbsStrData2 = empty
             // For Move/Rename events:
-            //   mbsStrData1 = old path
-            //   mbsStrData2 = new path
+            //   mbsStrData1 = old path (or old name for RenameFolder)
+            //   mbsStrData2 = new path (or new name for RenameFolder)
+            // For RenameFolder:
+            //   mbsStrData1 = old folder NAME only
+            //   mbsStrData2 = new folder NAME only
+            //   mlObjectID1 = Folder ID
 
             string oldPath, newPath;
 
@@ -986,6 +1011,62 @@ namespace LeoAISwPdmAddIn
                 newPath = cmdData.mbsStrData1;  // vault path
                 oldPath = cmdData.mbsStrData2;  // local/source path (may be empty)
             }
+            else if (operationType == "RenameFolder")
+            {
+                // For RenameFolder: mbsStrData1/2 contain only folder NAMES, not full paths
+                // We need to reconstruct full paths using the folder ID
+                int folderID = cmdData.mlObjectID1;
+                IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
+
+                if (folder != null)
+                {
+                    // Get current path (after rename) from PDM API
+                    string currentFolderPath = folder.LocalPath;
+                    string parentPath = Path.GetDirectoryName(currentFolderPath);
+                    string vaultRoot = vault.RootFolderPath;
+
+                    // Reconstruct old path: parent + old name
+                    string oldFolderPath = Path.Combine(parentPath, cmdData.mbsStrData1);
+
+                    // Convert to vault-relative paths
+                    oldPath = GetVaultRelativePath(vault, oldFolderPath);
+                    newPath = GetVaultRelativePath(vault, currentFolderPath);
+
+                    LogFileWriter.LogDebug($"RenameFolder - Reconstructed paths: old='{oldPath}', new='{newPath}'");
+                }
+                else
+                {
+                    LogFileWriter.LogError($"RenameFolder - Could not get folder object with ID: {folderID}");
+                    // Fallback to raw names (will be wrong, but at least won't crash)
+                    oldPath = cmdData.mbsStrData1;
+                    newPath = cmdData.mbsStrData2;
+                }
+            }
+            else if (operationType == "MoveFolder")
+            {
+                // For MoveFolder: mbsStrData1 is typically the full OLD path
+                // mbsStrData2 might be new path or destination folder
+                int folderID = cmdData.mlObjectID1;
+                IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
+
+                if (folder != null)
+                {
+                    // Get current path (after move) from PDM API
+                    string currentFolderPath = folder.LocalPath;
+
+                    // Convert to vault-relative paths
+                    oldPath = GetVaultRelativePath(vault, cmdData.mbsStrData1);
+                    newPath = GetVaultRelativePath(vault, currentFolderPath);
+
+                    LogFileWriter.LogDebug($"MoveFolder - Paths: old='{oldPath}', new='{newPath}'");
+                }
+                else
+                {
+                    LogFileWriter.LogError($"MoveFolder - Could not get folder object with ID: {folderID}");
+                    oldPath = cmdData.mbsStrData1;
+                    newPath = cmdData.mbsStrData2;
+                }
+            }
             else if (string.IsNullOrEmpty(cmdData.mbsStrData2))
             {
                 // Upload/PostUnlock: only mbsStrData1 is set (vault path)
@@ -994,7 +1075,7 @@ namespace LeoAISwPdmAddIn
             }
             else
             {
-                // Move/Rename: mbsStrData1 = old, mbsStrData2 = new
+                // Move/Rename files: mbsStrData1 = old, mbsStrData2 = new
                 oldPath = cmdData.mbsStrData1;
                 newPath = cmdData.mbsStrData2;
             }
