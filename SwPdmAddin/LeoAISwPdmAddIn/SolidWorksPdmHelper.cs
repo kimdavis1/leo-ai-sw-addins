@@ -137,6 +137,14 @@ namespace LeoAISwPdmAddIn
         {
             try
             {
+                // Skip LeoAI_TaskData folder (contains auth configuration - should never be synced)
+                string folderPath = folder.LocalPath;
+                if (!string.IsNullOrEmpty(folderPath) && folderPath.Contains("\\LeoAI_TaskData"))
+                {
+                    LogFileWriter.LogDebug($"Skipping metadata folder: {folderPath}");
+                    return; // Don't add this folder or recurse into it
+                }
+
                 folderList.Add(folder);
 
                 IEdmPos5 subFolderPos = folder.GetFirstSubFolderPosition();
@@ -161,17 +169,48 @@ namespace LeoAISwPdmAddIn
             {
                 // Step 1: Collect all file references sequentially (COM requirement)
                 List<Tuple<IEdmFile5, string>> filesToProcess = new List<Tuple<IEdmFile5, string>>();
+                int totalFilesInFolder = 0;
+                int nullPathCount = 0;
+                int filteredOutCount = 0;
+
+                // Get folder's vault logical path for constructing file paths
+                string folderPath = folder.LocalPath;
 
                 IEdmPos5 pos = folder.GetFirstFilePosition();
                 while (!pos.IsNull)
                 {
                     IEdmFile5 file = folder.GetNextFile(pos);
-                    string filePath = file.GetLocalPath(folder.ID);
+                    totalFilesInFolder++;
 
-                    if (!string.IsNullOrEmpty(filePath) && IsProcessableFile(filePath))
+                    // CRITICAL FIX: Construct vault logical path instead of using GetLocalPath()
+                    // GetLocalPath() returns null for files not in local view (most files on task host)
+                    // This was causing 95%+ of files to be skipped!
+                    string filePath = null;
+                    if (!string.IsNullOrEmpty(folderPath) && !string.IsNullOrEmpty(file.Name))
                     {
-                        filesToProcess.Add(Tuple.Create(file, filePath));
+                        filePath = System.IO.Path.Combine(folderPath, file.Name);
                     }
+
+                    if (string.IsNullOrEmpty(filePath))
+                    {
+                        nullPathCount++;
+                        LogFileWriter.LogWarning($"Skipping file with null path in folder: {folderPath ?? "unknown"}");
+                        continue;
+                    }
+
+                    if (!IsProcessableFile(filePath))
+                    {
+                        filteredOutCount++;
+                        continue;
+                    }
+
+                    filesToProcess.Add(Tuple.Create(file, filePath));
+                }
+
+                // Log enumeration statistics for this folder
+                if (totalFilesInFolder > 0)
+                {
+                    LogFileWriter.LogDebug($"Folder '{folderPath}': {totalFilesInFolder} total files, {nullPathCount} null paths, {filteredOutCount} filtered out, {filesToProcess.Count} to process");
                 }
 
                 // Step 2: Process all files in parallel

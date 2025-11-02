@@ -247,65 +247,142 @@ namespace LeoAISwPdmAddIn
         private static async Task ProcessRenameOperation(IEdmVault11 vault, OperationMetadata operation, SecureApiClient leoClient, string directoryId, bool tryArchiveFirst)
         {
             LogFileWriter.LogMessage($"ProcessRenameOperation: {operation.OldPath} → {operation.NewPath}");
-            // Rename and Move operations are identical in implementation
-            await ProcessRenameOrMoveOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
-        }
 
-        /// <summary>
-        /// Process a Move operation from metadata
-        /// Upload new path first, then delete old path
-        /// </summary>
-        private static async Task ProcessMoveOperation(IEdmVault11 vault, OperationMetadata operation, SecureApiClient leoClient, string directoryId, bool tryArchiveFirst)
-        {
-            LogFileWriter.LogMessage($"ProcessMoveOperation: {operation.OldPath} → {operation.NewPath}");
-            // Rename and Move operations are identical in implementation
-            await ProcessRenameOrMoveOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
-        }
-
-        /// <summary>
-        /// Common implementation for Rename and Move operations
-        /// Upload new path first, then delete old path
-        /// Uses move context to handle dependencies efficiently
-        /// </summary>
-        private static async Task ProcessRenameOrMoveOperation(IEdmVault11 vault, OperationMetadata operation, SecureApiClient leoClient, string directoryId, bool tryArchiveFirst)
-        {
             if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
             {
-                throw new Exception($"{operation.Operation} operation missing OldPath or NewPath");
+                throw new Exception("Rename operation missing OldPath or NewPath");
             }
 
             // Check if file is processable
             if (!IsProcessableFile(operation.NewPath))
             {
-                LogFileWriter.LogMessage($"Skipping rename/move - file not processable: {operation.NewPath}");
+                LogFileWriter.LogMessage($"Skipping rename - file not processable: {operation.NewPath}");
                 return;
             }
 
-            string oldRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
-            string newRelativePath = GetRelativePath(vault.RootFolderPath, operation.NewPath);
+            // Get full paths using FileID and FolderID from operation metadata
+            // For RENAME, the paths stored are just filenames, so we need to reconstruct full paths
+            // Both old and new files are in the same folder (rename doesn't change folder)
+            string newFullPath = null;
+            string oldFullPath = null;
 
-            LogFileWriter.LogMessage($"Moving file: {operation.OldPath} -> {operation.NewPath}");
+            if (operation.FileID > 0 && operation.FolderID > 0)
+            {
+                try
+                {
+                    IEdmFile5 file = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, operation.FileID);
+                    IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, operation.FolderID);
 
-            // Build mapping for this single file move (new relative path -> old relative path)
+                    if (file != null && folder != null)
+                    {
+                        // Construct full paths using folder.LocalPath + filename
+                        // Don't use GetLocalPath() - it returns null for files not in local view
+                        newFullPath = System.IO.Path.Combine(folder.LocalPath, file.Name);
+                        oldFullPath = System.IO.Path.Combine(folder.LocalPath, operation.OldPath);
+                        LogFileWriter.LogMessage($"Constructed new path from FileID/FolderID: {newFullPath}");
+                        LogFileWriter.LogMessage($"Constructed old path from FileID/FolderID: {oldFullPath}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    LogFileWriter.LogWarning($"Failed to get file/folder from PDM API: {ex.Message}");
+                }
+            }
+
+            // Fallback: If we couldn't get paths from FileID/FolderID, use operation paths
+            if (string.IsNullOrEmpty(newFullPath))
+            {
+                newFullPath = EnsureFullPath(vault, operation.NewPath);
+                LogFileWriter.LogMessage($"Using EnsureFullPath fallback for new path: {newFullPath}");
+            }
+
+            if (string.IsNullOrEmpty(oldFullPath))
+            {
+                oldFullPath = EnsureFullPath(vault, operation.OldPath);
+                LogFileWriter.LogMessage($"Using EnsureFullPath fallback for old path: {oldFullPath}");
+            }
+
+            // Convert both paths to relative paths
+            string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldFullPath);
+            string newRelativePath = GetRelativePath(vault.RootFolderPath, newFullPath);
+
+            // Execute the common rename/move logic
+            await ExecuteRenameOrMoveOperation(vault, oldRelativePath, newRelativePath, newFullPath, leoClient, directoryId, tryArchiveFirst, "Rename");
+        }
+
+        /// <summary>
+        /// Process a Move operation from metadata
+        /// Upload new path first, then delete old path
+        /// For MOVE operations, the paths in metadata are already full vault-relative paths from client
+        /// </summary>
+        private static async Task ProcessMoveOperation(IEdmVault11 vault, OperationMetadata operation, SecureApiClient leoClient, string directoryId, bool tryArchiveFirst)
+        {
+            LogFileWriter.LogMessage($"ProcessMoveOperation: {operation.OldPath} → {operation.NewPath}");
+
+            if (string.IsNullOrEmpty(operation.OldPath) || string.IsNullOrEmpty(operation.NewPath))
+            {
+                throw new Exception("Move operation missing OldPath or NewPath");
+            }
+
+            // Check if file is processable
+            if (!IsProcessableFile(operation.NewPath))
+            {
+                LogFileWriter.LogMessage($"Skipping move - file not processable: {operation.NewPath}");
+                return;
+            }
+
+            // For MOVE operations, the paths stored in metadata are full absolute paths
+            // (client add-in gets full paths from PDM event data for moves)
+            // We need to convert them to relative paths and ensure they're proper full paths
+
+            // Convert paths - they might be absolute or relative
+            string oldFullPath = EnsureFullPath(vault, operation.OldPath);
+            string newFullPath = EnsureFullPath(vault, operation.NewPath);
+
+            // Convert to relative paths for server API
+            string oldRelativePath = GetRelativePath(vault.RootFolderPath, oldFullPath);
+            string newRelativePath = GetRelativePath(vault.RootFolderPath, newFullPath);
+
+            // Execute the common rename/move logic
+            await ExecuteRenameOrMoveOperation(vault, oldRelativePath, newRelativePath, newFullPath, leoClient, directoryId, tryArchiveFirst, "Move");
+        }
+
+        /// <summary>
+        /// Common implementation for executing rename/move operations
+        /// Upload new path first, then delete old path
+        /// </summary>
+        private static async Task ExecuteRenameOrMoveOperation(
+            IEdmVault11 vault,
+            string oldRelativePath,
+            string newRelativePath,
+            string newFullPath,
+            SecureApiClient leoClient,
+            string directoryId,
+            bool tryArchiveFirst,
+            string operationType)
+        {
+            LogFileWriter.LogMessage($"{operationType} file: {oldRelativePath} -> {newRelativePath}");
+
+            // Build mapping for this single file operation (new relative path -> old relative path)
             Dictionary<string, string> moveMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             moveMap[newRelativePath] = oldRelativePath;
 
             // Create processedFiles set for this operation
             HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-            // Step 1: Upload file with new path - check if file exists in vault using PDM API
-            if (FileExistsInVault(vault, operation.NewPath))
+            // Step 1: Upload file with new path
+            if (FileExistsInVault(vault, newFullPath))
             {
                 LogFileWriter.LogMessage($"Uploading file with new path using move context: {newRelativePath}");
 
                 // Use UploadFileWithDependencies with moveMap to handle dependencies
-                await UploadFileWithDependencies(vault, operation.NewPath, vault.RootFolderPath, processedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
+                await UploadFileWithDependencies(vault, newFullPath, vault.RootFolderPath, processedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
 
                 LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
             }
             else
             {
-                LogFileWriter.LogMessage($"Warning: File not found in vault: {operation.NewPath}");
+                LogFileWriter.LogMessage($"Warning: File not found in vault: {newFullPath}");
             }
 
             // Step 2: Delete old path from server
@@ -320,8 +397,9 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"Delete returned false for old path: {oldRelativePath}");
             }
 
-            LogFileWriter.LogMessage($"{operation.Operation} completed: {oldRelativePath} → {newRelativePath}");
+            LogFileWriter.LogMessage($"{operationType} completed: {oldRelativePath} → {newRelativePath}");
         }
+
 
         /// <summary>
         /// Process a Copy operation from metadata
@@ -1051,7 +1129,7 @@ namespace LeoAISwPdmAddIn
 
         #endregion
 
-        #region Sync Operations (Old Format - Legacy)
+        #region Sync Operations
         private static void EnumerateFolderFilesRecursive(IEdmFolder5 folder, string oldBasePath, string newBasePath, List<string> oldFilePaths, List<string> newFilePaths)
         {
             // Get all files in current folder
@@ -1253,6 +1331,8 @@ namespace LeoAISwPdmAddIn
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"TraverseReferences failed at level {level}: {ex.Message}");
+                LogFileWriter.LogDebug($"  Continuing without dependencies from this level");
+                // Don't re-throw - continue with dependencies collected so far
             }
         }
 
@@ -1266,24 +1346,41 @@ namespace LeoAISwPdmAddIn
                 return false;
             }
 
-            // Check if it has a file extension
-            string extension = Path.GetExtension(filePath);
-            if (string.IsNullOrEmpty(extension))
+            try
             {
-                // No extension = likely a cut-list item or broken reference
-                return false;
+                // Check for illegal path characters first (before calling Path methods)
+                char[] invalidPathChars = Path.GetInvalidPathChars();
+                if (filePath.IndexOfAny(invalidPathChars) >= 0)
+                {
+                    LogFileWriter.LogDebug($"Skipping reference with illegal path characters: {filePath}");
+                    return false;
+                }
+
+                // Check if it has a file extension
+                string extension = Path.GetExtension(filePath);
+                if (string.IsNullOrEmpty(extension))
+                {
+                    // No extension = likely a cut-list item or broken reference
+                    return false;
+                }
+
+                // Filter out known invalid references
+                string fileName = Path.GetFileName(filePath);
+
+                // Skip weldment cut-list items (typically named like "Cut-List-Item1", "Cut-List-Item2", etc.)
+                if (fileName.StartsWith("Cut-List-Item", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false;
+                }
+
+                return true;
             }
-
-            // Filter out known invalid references
-            string fileName = Path.GetFileName(filePath);
-
-            // Skip weldment cut-list items (typically named like "Cut-List-Item1", "Cut-List-Item2", etc.)
-            if (fileName.StartsWith("Cut-List-Item", StringComparison.OrdinalIgnoreCase))
+            catch (ArgumentException ex)
             {
-                return false;
+                // Path.GetExtension or Path.GetFileName threw due to invalid characters
+                LogFileWriter.LogWarning($"Path validation failed for reference: {filePath} - {ex.Message}");
+                return false; // Skip this reference
             }
-
-            return true;
         }
 
         /// <summary>
@@ -1656,6 +1753,13 @@ namespace LeoAISwPdmAddIn
                     SentryErrorHandler.AddOperationBreadcrumb("UploadFile", "Getting readable file path");
                     (actualFilePath, needsCleanup) = GetReadableFilePath(vault, filePath, folder.ID, tryArchiveFirst);
 
+                    // Check if file was found (GetReadableFilePath returns null for files not in vault)
+                    if (actualFilePath == null)
+                    {
+                        LogFileWriter.LogMessage($"Skipping file not in vault: {relativePath}");
+                        return false; // Skip this file
+                    }
+
                     // Build externalId: fileID_version (no checksum needed)
                     var idInfo = GetUniqueIdentifier(vault, fullPath);
                     externalId = idInfo.CheckSum;  // Contains "fileID_version"
@@ -1968,12 +2072,16 @@ namespace LeoAISwPdmAddIn
 
                 if (file == null)
                 {
-                    throw new Exception($"Could not find file in vault: {logicalPath}");
+                    LogFileWriter.LogWarning($"File not found in vault (skipping): {logicalPath}");
+                    LogFileWriter.LogDebug($"  This may be a configuration-specific, analysis, or temporary file (e.g., with ^ character)");
+                    // Return null to signal caller to skip this file
+                    return (null, false);
                 }
 
                 if (folder == null)
                 {
-                    throw new Exception($"Could not find folder for file in vault: {logicalPath}");
+                    LogFileWriter.LogWarning($"Could not find folder for file in vault (skipping): {logicalPath}");
+                    return (null, false);
                 }
 
                 // Use the folder ID from the file object, not the parameter
@@ -2023,29 +2131,99 @@ namespace LeoAISwPdmAddIn
 
                 // Fallback: Copy file to temp location using PDM API
                 // This is the most robust method as it works even with corrupted metadata
-                try
-                {
-                    // Create a unique temp subdirectory for this file to avoid naming conflicts
-                    string tempBaseDir = Path.Combine(Path.GetTempPath(), "LeoAI_PDM_Temp");
-                    if (!Directory.Exists(tempBaseDir))
+
+                // Create a unique temp subdirectory for this file to avoid naming conflicts
+                // Try multiple temp directory locations for robustness
+                string uniqueTempDir = null;
+
+                    try
                     {
-                        Directory.CreateDirectory(tempBaseDir);
+                        // Option 1: System drive root (C:\Temp\LeoAI_PDM\{GUID}) - no spaces, short path
+                        string systemDrive = Path.GetPathRoot(Environment.SystemDirectory); // Usually C:\
+                        string tempBase1 = Path.Combine(systemDrive, "Temp", "LeoAI_PDM");
+
+                        if (!Directory.Exists(tempBase1))
+                        {
+                            Directory.CreateDirectory(tempBase1);
+                        }
+
+                        // Use "N" format GUID (no hyphens) for maximum compatibility
+                        uniqueTempDir = Path.Combine(tempBase1, Guid.NewGuid().ToString("N"));
+                        Directory.CreateDirectory(uniqueTempDir);
+
+                        LogFileWriter.LogDebug($"Using system temp directory: {uniqueTempDir}");
+                    }
+                    catch (Exception ex1)
+                    {
+                        LogFileWriter.LogWarning($"Failed to create system temp directory: {ex1.Message}");
+
+                        try
+                        {
+                            // Option 2: User temp directory (current behavior fallback)
+                            string tempBase2 = Path.Combine(Path.GetTempPath(), "LeoAI_PDM");
+                            if (!Directory.Exists(tempBase2))
+                            {
+                                Directory.CreateDirectory(tempBase2);
+                            }
+
+                            uniqueTempDir = Path.Combine(tempBase2, Guid.NewGuid().ToString("N"));
+                            Directory.CreateDirectory(uniqueTempDir);
+
+                            LogFileWriter.LogDebug($"Using user temp directory: {uniqueTempDir}");
+                        }
+                        catch (Exception ex2)
+                        {
+                            LogFileWriter.LogError($"All temp directory creation attempts failed:");
+                            LogFileWriter.LogError($"  System temp error: {ex1.Message}");
+                            LogFileWriter.LogError($"  User temp error: {ex2.Message}");
+
+                            SentryErrorHandler.CaptureException(ex2, new Dictionary<string, string>
+                            {
+                                { "operation", "CreateTempDirectory" },
+                                { "system_temp_error", ex1.Message },
+                                { "user_temp_path", Path.GetTempPath() },
+                                { "file_being_processed", logicalPath },
+                                { "file_id", file.ID.ToString() }
+                            });
+
+                            throw new Exception($"Cannot create temp directory for GetFileCopy: {ex2.Message}", ex2);
+                        }
                     }
 
-                    // Create unique subdirectory for this specific copy operation
-                    string uniqueTempDir = Path.Combine(tempBaseDir, Guid.NewGuid().ToString());
-                    Directory.CreateDirectory(uniqueTempDir);
                     LogFileWriter.LogMessage($"GetFileCopy for '{logicalPath}' - created temp dir: '{uniqueTempDir}'");
 
                     // GetFileCopy signature: GetFileCopy(int hwnd, ref object version, ref object pathOrFolderID, int flags, string newName)
                     // Folder paths must be terminated by a backslash (per PDM API documentation)
                     string folderPathWithBackslash = uniqueTempDir.TrimEnd('\\') + "\\";
                     LogFileWriter.LogMessage($"GetFileCopy for '{logicalPath}' - calling with folder path: '{folderPathWithBackslash}'");
+                    LogFileWriter.LogDebug($"  File.ID: {file.ID}, File.CurrentVersion: {file.CurrentVersion}");
 
                     // Parameters: version (0 for latest), path or folder ID (path with backslash), flags, new name (empty)
                     object version = 0;
                     object folderPath = folderPathWithBackslash;
-                    file.GetFileCopy(0, ref version, ref folderPath, (int)EdmGetCmdFlags.Egcf_Nothing, "");
+
+                    try
+                    {
+                        file.GetFileCopy(0, ref version, ref folderPath, (int)EdmGetCmdFlags.Egcf_Nothing, "");
+                    }
+                    catch (System.Runtime.InteropServices.COMException comEx)
+                    {
+                        LogFileWriter.LogError($"GetFileCopy COM error: HRESULT 0x{comEx.ErrorCode:X8}, Message: {comEx.Message}");
+                        LogFileWriter.LogError($"  File ID: {file.ID}, Version: {file.CurrentVersion}");
+                        LogFileWriter.LogError($"  Temp folder: {folderPathWithBackslash}");
+
+                        SentryErrorHandler.CaptureException(comEx, new Dictionary<string, string>
+                        {
+                            { "operation", "GetFileCopy" },
+                            { "file_path", logicalPath },
+                            { "file_id", file.ID.ToString() },
+                            { "version", file.CurrentVersion.ToString() },
+                            { "temp_folder", folderPathWithBackslash },
+                            { "hresult", $"0x{comEx.ErrorCode:X8}" }
+                        });
+
+                        throw;
+                    }
 
                     // File will be created with its original name in the temp directory
                     string fileName = Path.GetFileName(logicalPath);
@@ -2057,29 +2235,8 @@ namespace LeoAISwPdmAddIn
                         throw new Exception($"GetFileCopy succeeded but temp file not found: {tempFilePath}");
                     }
 
-                    LogFileWriter.LogMessage($"Copied to temp: {tempFilePath}");
-                    return (tempFilePath, true); // Cleanup needed
-                }
-                catch (System.Runtime.InteropServices.COMException comEx)
-                {
-                    // Handle specific PDM COM errors
-                    LogFileWriter.LogError($"PDM COM error for {logicalPath}: HRESULT 0x{comEx.ErrorCode:X8}, Message: {comEx.Message}");
-
-                    // Capture detailed PDM error context to Sentry
-                    var errorContext = new Dictionary<string, string>
-                    {
-                        { "operation", "GetFileCopy" },
-                        { "file_path", logicalPath },
-                        { "folder_id", folderID.ToString() },
-                        { "hresult", $"0x{comEx.ErrorCode:X8}" },
-                        { "error_type", "PDM_COM_Error" },
-                        { "try_archive_first", tryArchiveFirst ? "yes" : "no" }
-                    };
-
-                    SentryErrorHandler.CaptureException(comEx, errorContext);
-
-                    throw new Exception($"PDM error accessing file: {comEx.Message}", comEx);
-                }
+                LogFileWriter.LogMessage($"Copied to temp: {tempFilePath}");
+                return (tempFilePath, true); // Cleanup needed
             }
             catch (Exception ex)
             {
@@ -2213,8 +2370,10 @@ namespace LeoAISwPdmAddIn
 
                 if (file != null && folder != null)
                 {
-                    // Success - get the path using task host's vault root
-                    string taskHostPath = file.GetLocalPath(folder.ID);
+                    // Success - construct path using task host's vault root
+                    // NOTE: Don't use GetLocalPath() here - it returns null for files not in local view
+                    // Instead, use folder.LocalPath + file.Name which works for all files
+                    string taskHostPath = System.IO.Path.Combine(folder.LocalPath, file.Name);
                     LogFileWriter.LogMessage($"EnsureFullPath: Resolved via PDM API to task host path: '{taskHostPath}'");
                     return taskHostPath;
                 }
