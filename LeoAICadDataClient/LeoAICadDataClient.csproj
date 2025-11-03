@@ -1,6 +1,6 @@
 ﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <Import Project="..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.props" Condition="Exists('..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.props')" />
+  <Import Project="$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.props" Condition="Exists('$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.props')" />
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
     <Configuration Condition=" '$(Configuration)' == '' ">Debug</Configuration>
@@ -37,72 +37,74 @@
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="Costura, Version=6.0.0.0, Culture=neutral, PublicKeyToken=9919ef960d84173d, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\lib\netstandard2.0\Costura.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\costura.fody\6.0.0\lib\netstandard2.0\Costura.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.Bcl.AsyncInterfaces, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.Bcl.AsyncInterfaces.9.0.0\lib\net462\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.bcl.asyncinterfaces\9.0.0\lib\net462\Microsoft.Bcl.AsyncInterfaces.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.Bcl.Memory, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.Bcl.Memory.9.0.0\lib\net462\Microsoft.Bcl.Memory.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.bcl.memory\9.0.0\lib\net462\Microsoft.Bcl.Memory.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.Bcl.TimeProvider, Version=8.0.0.1, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.Bcl.TimeProvider.8.0.1\lib\net462\Microsoft.Bcl.TimeProvider.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.bcl.timeprovider\8.0.1\lib\net462\Microsoft.Bcl.TimeProvider.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.Extensions.Logging.Abstractions, Version=2.1.0.0, Culture=neutral, PublicKeyToken=adb9793829ddae60, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.Extensions.Logging.Abstractions.2.1.0\lib\netstandard2.0\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.extensions.logging.abstractions\2.1.0\lib\netstandard2.0\Microsoft.Extensions.Logging.Abstractions.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.IdentityModel.Abstractions, Version=8.9.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.IdentityModel.Abstractions.8.9.0\lib\net472\Microsoft.IdentityModel.Abstractions.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.identitymodel.abstractions\8.9.0\lib\net472\Microsoft.IdentityModel.Abstractions.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.IdentityModel.JsonWebTokens, Version=8.9.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.IdentityModel.JsonWebTokens.8.9.0\lib\net472\Microsoft.IdentityModel.JsonWebTokens.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.identitymodel.jsonwebtokens\8.9.0\lib\net472\Microsoft.IdentityModel.JsonWebTokens.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.IdentityModel.Logging, Version=8.9.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.IdentityModel.Logging.8.9.0\lib\net472\Microsoft.IdentityModel.Logging.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.identitymodel.logging\8.9.0\lib\net472\Microsoft.IdentityModel.Logging.dll</HintPath>
     </Reference>
     <Reference Include="Microsoft.IdentityModel.Tokens, Version=8.9.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Microsoft.IdentityModel.Tokens.8.9.0\lib\net472\Microsoft.IdentityModel.Tokens.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\microsoft.identitymodel.tokens\8.9.0\lib\net472\Microsoft.IdentityModel.Tokens.dll</HintPath>
     </Reference>
     <Reference Include="Newtonsoft.Json, Version=13.0.0.0, Culture=neutral, PublicKeyToken=30ad4fe6b2a6aeed, processorArchitecture=MSIL">
       <SpecificVersion>False</SpecificVersion>
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\Newtonsoft.Json.13.0.3\lib\net45\Newtonsoft.Json.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\newtonsoft.json\13.0.3\lib\net45\Newtonsoft.Json.dll</HintPath>
+    </Reference>
+    <Reference Include="Sentry, Version=5.16.1.0, Culture=neutral, PublicKeyToken=fba2a98e6ccde974, processorArchitecture=MSIL">
+      <HintPath>$(UserProfile)\.nuget\packages\sentry\5.16.1\lib\net48\Sentry.dll</HintPath>
     </Reference>
     <Reference Include="System" />
     <Reference Include="System.Buffers, Version=4.0.3.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Buffers.4.5.1\lib\net461\System.Buffers.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.buffers\4.5.1\lib\net461\System.Buffers.dll</HintPath>
     </Reference>
     <Reference Include="System.Core" />
-
     <Reference Include="System.Diagnostics.DiagnosticSource, Version=6.0.0.2, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Diagnostics.DiagnosticSource.6.0.2\lib\net461\System.Diagnostics.DiagnosticSource.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.diagnostics.diagnosticsource\6.0.2\lib\net461\System.Diagnostics.DiagnosticSource.dll</HintPath>
     </Reference>
     <Reference Include="System.IdentityModel.Tokens.Jwt, Version=8.9.0.0, Culture=neutral, PublicKeyToken=31bf3856ad364e35, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.IdentityModel.Tokens.Jwt.8.9.0\lib\net472\System.IdentityModel.Tokens.Jwt.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.identitymodel.tokens.jwt\8.9.0\lib\net472\System.IdentityModel.Tokens.Jwt.dll</HintPath>
     </Reference>
     <Reference Include="System.IO.Pipelines, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.IO.Pipelines.9.0.0\lib\net462\System.IO.Pipelines.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.io.pipelines\9.0.0\lib\net462\System.IO.Pipelines.dll</HintPath>
     </Reference>
     <Reference Include="System.Memory, Version=4.0.1.2, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Memory.4.5.5\lib\net461\System.Memory.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.memory\4.5.5\lib\net461\System.Memory.dll</HintPath>
     </Reference>
     <Reference Include="System.Numerics" />
     <Reference Include="System.Numerics.Vectors, Version=4.1.4.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Numerics.Vectors.4.5.0\lib\net46\System.Numerics.Vectors.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.numerics.vectors\4.5.0\lib\net46\System.Numerics.Vectors.dll</HintPath>
     </Reference>
     <Reference Include="System.Runtime.CompilerServices.Unsafe, Version=6.0.3.0, Culture=neutral, PublicKeyToken=b03f5f7f11d50a3a, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Runtime.CompilerServices.Unsafe.6.1.2\lib\net462\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.runtime.compilerservices.unsafe\6.1.2\lib\net462\System.Runtime.CompilerServices.Unsafe.dll</HintPath>
     </Reference>
     <Reference Include="System.Text.Encodings.Web, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Text.Encodings.Web.9.0.0\lib\net462\System.Text.Encodings.Web.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.text.encodings.web\9.0.0\lib\net462\System.Text.Encodings.Web.dll</HintPath>
     </Reference>
     <Reference Include="System.Text.Json, Version=9.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Text.Json.9.0.0\lib\net462\System.Text.Json.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.text.json\9.0.0\lib\net462\System.Text.Json.dll</HintPath>
     </Reference>
     <Reference Include="System.Threading.Tasks.Extensions, Version=4.2.0.1, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.Threading.Tasks.Extensions.4.5.4\lib\net461\System.Threading.Tasks.Extensions.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.threading.tasks.extensions\4.5.4\lib\net461\System.Threading.Tasks.Extensions.dll</HintPath>
     </Reference>
     <Reference Include="System.ValueTuple, Version=4.0.3.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
-      <HintPath>..\SwPdmAddin\LeoAISwPdmAddIn\packages\System.ValueTuple.4.5.0\lib\net47\System.ValueTuple.dll</HintPath>
+      <HintPath>$(UserProfile)\.nuget\packages\system.valuetuple\4.5.0\lib\net47\System.ValueTuple.dll</HintPath>
     </Reference>
     <Reference Include="System.Xml.Linq" />
     <Reference Include="System.Data.DataSetExtensions" />
@@ -116,10 +118,12 @@
     <Compile Include="DescopeClient.cs" />
     <Compile Include="JwtAuthHelper.cs" />
     <Compile Include="LeoAIWebClient.cs" />
-    <Compile Include="LeoApiService.cs" />
     <Compile Include="LeoFileInfo.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
     <Compile Include="SecureApiClient.cs" />
+    <Compile Include="SentryErrorHandler.cs" />
+    <Compile Include="Utilities\AuthFileEncryption.cs" />
+    <Compile Include="Utilities\EncryptionKeyGenerated.cs" />
     <Compile Include="Utilities\LeoAIDataUtilities.cs" />
     <Compile Include="Utilities\Logger.cs" />
   </ItemGroup>
@@ -128,18 +132,24 @@
     <None Include="packages.config" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
-  <Import Project="..\SwPdmAddin\LeoAISwPdmAddIn\packages\Fody.6.8.2\build\Fody.targets" Condition="Exists('..\SwPdmAddin\LeoAISwPdmAddIn\packages\Fody.6.8.2\build\Fody.targets')" />
+  <Import Project="$(UserProfile)\.nuget\packages\fody\6.8.2\build\Fody.targets" Condition="Exists('$(UserProfile)\.nuget\packages\fody\6.8.2\build\Fody.targets')" />
+  <Target Name="PreBuild" BeforeTargets="PreBuildEvent">
+    <Exec Command="powershell -ExecutionPolicy Bypass -File &quot;$(ProjectDir)GenerateEncryptionKey.ps1&quot;" />
+  </Target>
   <Target Name="EnsureNuGetPackageBuildImports" BeforeTargets="PrepareForBuild">
     <PropertyGroup>
       <ErrorText>This project references NuGet package(s) that are missing on this computer. Use NuGet Package Restore to download them.  For more information, see http://go.microsoft.com/fwlink/?LinkID=322105. The missing file is {0}.</ErrorText>
     </PropertyGroup>
-    <Error Condition="!Exists('..\SwPdmAddin\LeoAISwPdmAddIn\packages\Fody.6.8.2\build\Fody.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\SwPdmAddin\LeoAISwPdmAddIn\packages\Fody.6.8.2\build\Fody.targets'))" />
-    <Error Condition="!Exists('..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.props')" Text="$([System.String]::Format('$(ErrorText)', '..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.props'))" />
-    <Error Condition="!Exists('..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.targets')" Text="$([System.String]::Format('$(ErrorText)', '..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.targets'))" />
+    <Error Condition="!Exists('$(UserProfile)\.nuget\packages\fody\6.8.2\build\Fody.targets')" Text="$([System.String]::Format('$(ErrorText)', '$(UserProfile)\.nuget\packages\fody\6.8.2\build\Fody.targets'))" />
+    <Error Condition="!Exists('$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.props')" Text="$([System.String]::Format('$(ErrorText)', '$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.props'))" />
+    <Error Condition="!Exists('$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets')" Text="$([System.String]::Format('$(ErrorText)', '$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets'))" />
   </Target>
-  <Import Project="..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.targets" Condition="Exists('..\SwPdmAddin\LeoAISwPdmAddIn\packages\Costura.Fody.6.0.0\build\Costura.Fody.targets')" />
+  <Import Project="$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets" Condition="Exists('$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets')" />
   <ItemGroup>
     <PackageReference Include="Flurl.Http" Version="4.0.2" />
+    <PackageReference Include="Sentry">
+      <Version>5.16.1</Version>
+    </PackageReference>
     <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
   </ItemGroup>
   <ItemGroup>

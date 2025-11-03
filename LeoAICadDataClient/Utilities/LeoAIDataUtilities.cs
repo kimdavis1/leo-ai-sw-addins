@@ -111,5 +111,6 @@ namespace LeoAICadDataClient.Utilities
 		public string FilePathInDirectory { get; set; }
 		public string CheckSum { get; set; }
 		public string mimeType { get; set; }
+		public string ParentStatus { get; set; }
 	}
 }

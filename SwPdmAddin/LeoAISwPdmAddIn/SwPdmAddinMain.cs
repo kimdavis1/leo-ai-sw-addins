@@ -1,363 +1,35 @@
-﻿using EPDM.Interop.epdm;
-using LeoAICadDataClient;
-using LeoAICadDataClient.Utilities;
+using EPDM.Interop.epdm;
 using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Forms;
 using Microsoft.Win32;
+using LeoAISwPdmAddIn.ErrorTracking;
+
 namespace LeoAISwPdmAddIn
 {
-    /// <summary>
-    /// Authentication configuration model for Leo AI
-    /// </summary>
-    public class LeoAuthConfig
-    {
-        public string ApiKey { get; set; }
-        public string ProjectId { get; set; }
-    }
-
-    /// <summary>
-    /// Represents the changes detected during sync analysis
-    /// </summary>
-    public class SyncChanges
-    {
-        public List<FileData> NewFiles { get; set; } = new List<FileData>();
-        public List<FileData> ModifiedFiles { get; set; } = new List<FileData>();
-        public List<FileData> MovedFiles { get; set; } = new List<FileData>();
-        public List<SyncMetadataFile> DeletedFiles { get; set; } = new List<SyncMetadataFile>();
-    }
-
     [ComVisible(true)]
     [Guid("5C9C2B58-C7E9-4052-9321-00433F32A479")]
     public class SwPdmAddinMain : IEdmAddIn5
     {
+        // Command ID for Complete Sync menu item
+        private const int CMD_COMPLETE_SYNC = 1001;
 
-        private Dictionary<string, string> LeoFilesInformation = new Dictionary<string, string>(); // FilePath -> ComponentId
-
-        // Cache for server file state to avoid repeated API calls
-        private readonly object _cacheLock = new object();
-        private Dictionary<string, string> _pathToServerFileCache = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase); // Path -> ComponentId
-        private bool _isCachePopulated = false;
-        private bool _isRefreshingCache = false; // Flag to prevent concurrent cache refreshes
-
-        public SecureApiClient LeoClient { get; set; }
-
-        // Destructor to catch when the add-in is being unloaded
-        ~SwPdmAddinMain()
-        {
-            try
-            {
-                LogFileWriter.LogMessage("SwPdmAddinMain destructor called - add-in is being unloaded");
-                // Note: We can't reliably perform cleanup here because we don't have vault context
-                // But we can at least log that the add-in is being destroyed
-            }
-            catch (Exception)
-            {
-                // Ignore exceptions in destructor
-            }
-        }
-
-        private async Task RefreshCache(string directoryId)
-        {
-            if (string.IsNullOrEmpty(directoryId) || LeoClient == null)
-            {
-                LogFileWriter.LogMessage("Skipping cache refresh because directoryId is missing or LeoClient is not initialized.");
-                return;
-            }
-
-            // Check if another thread is already refreshing the cache
-            lock (_cacheLock)
-            {
-                if (_isRefreshingCache)
-                {
-                    LogFileWriter.LogMessage("Cache refresh already in progress by another thread. Skipping.");
-                    return;
-                }
-                _isRefreshingCache = true;
-            }
-
-            try
-            {
-                LogFileWriter.LogMessage("Refreshing server file state cache...");
-                var dirInfoForCache = await LeoClient.GetSyncMetadataAsync(directoryId);
-
-                lock (_cacheLock)
-                {
-                    _pathToServerFileCache.Clear();
-
-                    if (dirInfoForCache?.Files != null)
-                    {
-                        foreach (var serverFile in dirInfoForCache.Files)
-                        {
-                            var normalizedPath = NormalizePath(serverFile.FilePathInDirectory);
-                            _pathToServerFileCache[normalizedPath] = serverFile.ComponentId;
-                        }
-                    }
-
-                    _isCachePopulated = true;
-                    LogFileWriter.LogMessage($"Cache refreshed with {_pathToServerFileCache.Count} files.");
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error refreshing cache: {ex.Message}");
-            }
-            finally
-            {
-                lock (_cacheLock)
-                {
-                    _isRefreshingCache = false;
-                }
-            }
-        }
-
-        private async Task<string> GetFileIdWithCacheFallback(string normalizedPath, string directoryId)
-        {
-            lock (_cacheLock)
-            {
-                if (_isCachePopulated && _pathToServerFileCache.TryGetValue(normalizedPath, out string cachedId))
-                {
-                    LogFileWriter.LogMessage($"Found cached component ID for '{normalizedPath}': {cachedId}");
-                    return cachedId;
-                }
-            }
-
-            LogFileWriter.LogMessage($"File '{normalizedPath}' not found in cache. Falling back to API lookup.");
-            var fileInfo = await LeoClient.GetFileInfoByPathAsync(directoryId, normalizedPath);
-            if (fileInfo != null)
-            {
-                lock (_cacheLock)
-                {
-                    _pathToServerFileCache[normalizedPath] = fileInfo.ComponentId;
-                }
-                return fileInfo.ComponentId;
-            }
-
-            return null;
-        }
-
-        private async Task EnsureCacheIsPopulated(string directoryId)
-        {
-            lock (_cacheLock)
-            {
-                if (_isCachePopulated)
-                {
-                    return;
-                }
-            }
-
-            await RefreshCache(directoryId);
-        }
-
-        private void AddFileToCache(SyncMetadataFile file)
-        {
-            if (file == null) return;
-
-            lock (_cacheLock)
-            {
-                var normalizedPath = NormalizePath(file.FilePathInDirectory);
-                _pathToServerFileCache[normalizedPath] = file.ComponentId;
-                LogFileWriter.LogMessage($"Added file to cache: '{normalizedPath}' -> {file.ComponentId}");
-            }
-        }
-
-        private void RemoveFileFromCache(string normalizedPath)
-        {
-            lock (_cacheLock)
-            {
-                if (_pathToServerFileCache.Remove(normalizedPath))
-                {
-                    LogFileWriter.LogMessage($"Removed file from cache: '{normalizedPath}'");
-                }
-            }
-        }
-
-        private SyncMetadataFile ConvertToFileMetadata(LeoAICadDataClient.Utilities.FileInfo fileInfo)
-        {
-            if (fileInfo == null) return null;
-
-            return new SyncMetadataFile
-            {
-                ComponentId = fileInfo.ComponentId,
-                FilePathInDirectory = fileInfo.FilePathInDirectory,
-                CheckSum = fileInfo.CheckSum,
-                MimeType = fileInfo.mimeType
-            };
-        }
-
-        /// <summary>
-        /// Shows a message box that appears on top of all other windows and is focused
-        /// </summary>
-        /// <param name="message">The message to display</param>
-        /// <param name="title">The title of the message box</param>
-        /// <param name="icon">The icon to display</param>
-        private void ShowTopMostMessage(string message, string title, System.Windows.Forms.MessageBoxIcon icon)
-        {
-            try
-            {
-                System.Windows.Forms.MessageBox.Show(message, title, System.Windows.Forms.MessageBoxButtons.OK, icon, System.Windows.Forms.MessageBoxDefaultButton.Button1, System.Windows.Forms.MessageBoxOptions.ServiceNotification);
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error showing TopMost message: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Reads the Leo AI authentication configuration from JSON file
-        /// </summary>
-        /// <returns>Authentication configuration or null if not found/invalid</returns>
-        private LeoAuthConfig ReadAuthConfig()
-        {
-            try
-            {
-                string configFilePath = null;
-
-                // First, try to read the path from environment variable
-                string envPath = LeoAIDataUtilities.ReadEnvVariableByName("LEO_AUTH_KEY", false);
-                if (!string.IsNullOrEmpty(envPath) && File.Exists(envPath))
-                {
-                    configFilePath = envPath;
-                    LogFileWriter.LogMessage($"Using auth config from environment variable path: {configFilePath}");
-                }
-                else
-                {
-                    // Fallback to default location
-                    string defaultPath = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
-                    if (File.Exists(defaultPath))
-                    {
-                        configFilePath = defaultPath;
-                        LogFileWriter.LogMessage($"Using auth config from default path: {configFilePath}");
-                    }
-                }
-
-                if (string.IsNullOrEmpty(configFilePath))
-                {
-                    string errorMessage = "Leo AI authentication configuration not found!\n\n" +
-                        "Please place the auth.json file in one of the following locations:\n" +
-                        "1. Default location: C:\\Program Files\\LeoAISwPdmAddIn\\auth.json\n" +
-                        "2. Custom location specified in LEO_AUTH_KEY environment variable\n\n" +
-                        "The auth.json file should contain:\n" +
-                        "{\n" +
-                        "  \"ApiKey\": \"your-api-key\",\n" +
-                        "  \"ProjectId\": \"your-project-id\"\n" +
-                        "}\n\n" +
-                        "You can get the authentication keys from the Leo AI Admin Dashboard\n" +
-                        "(available in Leo Business/Enterprise accounts).";
-
-                    LogFileWriter.LogError("Auth config file not found");
-                    ShowTopMostMessage(errorMessage, "Leo AI Authentication Required", System.Windows.Forms.MessageBoxIcon.Warning);
-                    return null;
-                }
-
-                // Read and parse the JSON file
-                string jsonContent = File.ReadAllText(configFilePath);
-                LeoAuthConfig config = ParseAuthConfig(jsonContent);
-
-                // Validate the configuration
-                if (config == null || string.IsNullOrEmpty(config.ApiKey) || string.IsNullOrEmpty(config.ProjectId))
-                {
-                    string errorMessage = $"Invalid Leo AI authentication configuration in file: {configFilePath}\n\n" +
-                        "The auth.json file should contain:\n" +
-                        "{\n" +
-                        "  \"ApiKey\": \"your-api-key\",\n" +
-                        "  \"ProjectId\": \"your-project-id\"\n" +
-                        "}\n\n" +
-                        "Both ApiKey and ProjectId are required and cannot be empty.\n" +
-                        "You can get the authentication keys from the Leo AI Admin Dashboard\n" +
-                        "(available in Leo Business/Enterprise accounts).";
-
-                    LogFileWriter.LogError($"Invalid auth config in file: {configFilePath}");
-                    ShowTopMostMessage(errorMessage, "Leo AI Authentication Invalid", System.Windows.Forms.MessageBoxIcon.Error);
-                    return null;
-                }
-
-                LogFileWriter.LogMessage("Leo AI authentication configuration loaded successfully");
-                return config;
-            }
-            catch (Exception ex)
-            {
-                string errorMessage = $"Error reading Leo AI authentication configuration:\n{ex.Message}\n\n" +
-                    "Please ensure the auth.json file is properly formatted:\n" +
-                    "{\n" +
-                    "  \"ApiKey\": \"your-api-key\",\n" +
-                    "  \"ProjectId\": \"your-project-id\"\n" +
-                    "}\n\n" +
-                    "You can get the authentication keys from the Leo AI Admin Dashboard\n" +
-                    "(available in Leo Business/Enterprise accounts).";
-
-                LogFileWriter.LogError($"Exception reading auth config: {ex.Message}");
-                ShowTopMostMessage(errorMessage, "Leo AI Authentication Error", System.Windows.Forms.MessageBoxIcon.Error);
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Simple JSON parser for Leo AI authentication configuration
-        /// </summary>
-        /// <param name="jsonContent">JSON content to parse</param>
-        /// <returns>Parsed authentication configuration</returns>
-        private LeoAuthConfig ParseAuthConfig(string jsonContent)
-        {
-            try
-            {
-                var config = new LeoAuthConfig();
-
-                // Remove whitespace and braces
-                jsonContent = jsonContent.Trim().Trim('{', '}');
-
-                // Split by comma to get individual properties
-                string[] properties = jsonContent.Split(',');
-
-                foreach (string property in properties)
-                {
-                    // Split by colon to get key-value pairs
-                    string[] keyValue = property.Split(':');
-                    if (keyValue.Length == 2)
-                    {
-                        string key = keyValue[0].Trim().Trim('"');
-                        string value = keyValue[1].Trim().Trim('"');
-
-                        if (key.Equals("ApiKey", StringComparison.OrdinalIgnoreCase))
-                        {
-                            config.ApiKey = value;
-                        }
-                        else if (key.Equals("ProjectId", StringComparison.OrdinalIgnoreCase))
-                        {
-                            config.ProjectId = value;
-                        }
-                    }
-                }
-
-                return config;
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error parsing JSON config: {ex.Message}");
-                return null;
-            }
-        }
-
-        /// <summary>
-        /// Addin basic information like name and description and version
-        /// </summary>
-        /// <param name="poInfo"></param>
-        /// <param name="poVault"></param>
-        /// <param name="poCmdMgr"></param>
-        /// <exception cref="System.NotImplementedException"></exception>
+        // Client-side Leo AI client (for event-based sync)
+        private LeoAICadDataClient.SecureApiClient _leoClient;
+        private string _directoryId;
+        private bool _isClientInitialized = false;
+        private bool _isSentryInitialized = false;
+        private readonly object _initLock = new object();
         public void GetAddInInfo(ref EdmAddInInfo poInfo, IEdmVault5 poVault, IEdmCmdMgr5 poCmdMgr)
         {
             try
             {
                 LogFileWriter.LogDebug("GetAddInInfo method called");
 
-                // Step 1: Always provide the basic Add-in info. This part can be called multiple times.
+                // Step 1: Always provide the basic Add-in info
                 poInfo.mbsAddInName = "LeoAISolidWorksPDMAdddIn";
                 poInfo.mbsCompany = "LeoAI.";
                 poInfo.mbsDescription = "Your AI engineering design copilot";
@@ -365,8 +37,7 @@ namespace LeoAISwPdmAddIn
                 poInfo.mlRequiredVersionMajor = 17;
                 LogFileWriter.LogDebug("Basic add-in info provided.");
 
-                // Step 2: Perform vault-specific initialization only once.
-                // This part is critical and should not run multiple times for the same vault.
+                // Step 2: Perform vault-specific initialization only once
                 if (poVault == null)
                 {
                     LogFileWriter.LogDebug("GetAddInInfo called without a vault context. Skipping vault-specific initialization.");
@@ -376,34 +47,41 @@ namespace LeoAISwPdmAddIn
                 string vaultName = poVault.Name;
                 LogFileWriter.LogMessage($"GetAddInInfo executing for vault: '{vaultName}'");
 
-                // Step 2a: Register hooks every time to ensure the add-in is responsive in all PDM processes.
-                #region PDM User Events Registration
+                // Register hooks every time to ensure the add-in is responsive
                 LogFileWriter.LogDebug("Registering event hooks...");
 
-                // File events that require processing
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUnlock);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUndoLock);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDelete);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMove);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostCopy);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostAdd);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRename);
+                // File events - each creates immediate task (no tracking)
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostAdd);        // File added to vault
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUnlock);     // File checked in
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostUndoLock);   // Undo checkout
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDelete);     // File deleted
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMove);       // File moved
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRename);     // File renamed
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostCopy);       // File copied
 
-                // Folder events that require processing
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRenameFolder);
-                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMoveFolder);
+                // Folder events - each creates immediate task
+                // NOTE: PostAddFolder and PostDeleteFolder are NOT registered because:
+                // - PostAdd fires for each file when a folder is added
+                // - PostDelete fires for each file when a folder is deleted
+                // poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostAddFolder);    // DISABLED - redundant with PostAdd
+                // poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostDeleteFolder); // DISABLED - redundant with PostDelete
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostMoveFolder);   // Folder moved
+                poCmdMgr.AddHook(EdmCmdType.EdmCmd_PostRenameFolder); // Folder renamed
 
-                // Add a hook for the installation event, which is a better place for one-time setup.
+                // Installation event for one-time setup
                 poCmdMgr.AddHook(EdmCmdType.EdmCmd_InstallAddIn);
+
                 LogFileWriter.LogDebug("All event hooks have been registered.");
-                #endregion
 
-                // Note: Cleanup when add-in is removed from vaults is handled by the standalone uninstaller
-
-                // Step 2c: On subsequent loads, perform a "session startup" sync.
-                // This runs only if the add-in has been successfully installed (i.e., the persistent flag exists).
-                // It uses a Mutex and a static list to ensure it only runs once per session across all processes.
-                // RunStartupSync(poVault);
+                // Add menu command for Complete Sync (only in Administration tool)
+                poCmdMgr.AddCmd(
+                    CMD_COMPLETE_SYNC,
+                    "Initiate complete sync",
+                    (int)EdmMenuFlags.EdmMenu_Administration,
+                    "Synchronize all vault files with Leo AI server",
+                    "Initiate complete sync"
+                );
+                LogFileWriter.LogDebug("Complete Sync menu command added (Administration tool only).");
             }
             catch (System.Runtime.InteropServices.COMException ex)
             {
@@ -414,6 +92,11 @@ namespace LeoAISwPdmAddIn
             {
                 LogFileWriter.LogError($"General Exception in GetAddInInfo: {ex.Message}");
                 LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
+                SentryErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                {
+                    { "operation", "GetAddInInfo" },
+                    { "vault", poVault?.Name ?? "unknown" }
+                }, Sentry.SentryLevel.Fatal);
                 System.Windows.Forms.MessageBox.Show(ex.Message);
             }
             finally
@@ -422,14 +105,6 @@ namespace LeoAISwPdmAddIn
             }
         }
 
-
-
-        /// <summary>
-        /// Events Trigger(Check-in/wrok flow ..etc)
-        /// </summary>
-        /// <param name="poCmd"></param>
-        /// <param name="ppoData"></param>
-        /// <exception cref="System.NotImplementedException"></exception>
         public void OnCmd(ref EdmCmd poCmd, ref EdmCmdData[] ppoData)
         {
             LogFileWriter.LogDebug($"OnCmd method called for command {poCmd.meCmdType}");
@@ -438,8 +113,6 @@ namespace LeoAISwPdmAddIn
             // Copy ref parameters to local variables for use in lambda expressions
             EdmCmd cmd = poCmd;
             EdmCmdData[] data = ppoData;
-
-
 
             // Log file information if available
             if (ppoData != null && ppoData.Length > 0)
@@ -450,56 +123,107 @@ namespace LeoAISwPdmAddIn
                 }
             }
 
+            // Check for custom menu commands
+            if (poCmd.meCmdType == EdmCmdType.EdmCmd_Menu)
+            {
+                LogFileWriter.LogMessage($"Menu command received with ID: {poCmd.mlCmdID}");
+
+                if (poCmd.mlCmdID == CMD_COMPLETE_SYNC)
+                {
+                    LogFileWriter.LogMessage("Complete Sync menu command triggered");
+
+                    IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                    if (vault == null) return;
+
+                    // Trigger complete sync by executing task on auth key file
+                    string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
+                    IEdmFolder5 folder;
+                    IEdmFile5 configFile = vault.GetFileFromPath(configPath, out folder);
+
+                    if (configFile == null)
+                    {
+                        LogFileWriter.LogError("LeoAuthKey.txt not found in vault - cannot trigger complete sync");
+                        System.Windows.Forms.MessageBox.Show(
+                            "LeoAuthKey.txt not found in vault. Please reinstall the add-in.",
+                            "Complete Sync Error",
+                            System.Windows.Forms.MessageBoxButtons.OK,
+                            System.Windows.Forms.MessageBoxIcon.Error);
+                        return;
+                    }
+
+                    // Execute task on config file (task will run complete sync)
+                    LogFileWriter.LogMessage($"Triggering complete sync task on file: {configFile.Name}");
+                    var cmdData = new EdmCmdData
+                    {
+                        mlObjectID1 = configFile.ID,
+                        mlObjectID2 = folder.ID
+                    };
+                    ExecuteSyncTask(poCmd, new EdmCmdData[] { cmdData }, "CompleteSync");
+
+                    return;
+                }
+            }
+
             switch (poCmd.meCmdType)
             {
+                // File operations - process on client side (no metadata files)
+                case EdmCmdType.EdmCmd_PostAdd:
+                    LogFileWriter.LogMessage("PostAdd event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Add");
+                    break;
+
                 case EdmCmdType.EdmCmd_PostUnlock:
-                    LogFileWriter.LogMessage("PostUnlock event detected - after checkin");
-                    Task.Run(async () => await HandleFileCheckIn(cmd, data));
+                    LogFileWriter.LogMessage("PostUnlock event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Upload");
                     break;
 
                 case EdmCmdType.EdmCmd_PostUndoLock:
-                    LogFileWriter.LogMessage("PostUndoLock event detected - after undo checkout or new file added");
-                    Task.Run(async () => await HandleFileUndoCheckOut(cmd, data));
+                    LogFileWriter.LogMessage("PostUndoLock event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Upload");
                     break;
 
                 case EdmCmdType.EdmCmd_PostDelete:
-                    LogFileWriter.LogMessage("PostDelete event detected - after file deletion");
-                    Task.Run(async () => await HandleFileDeleted(cmd, data));
+                    LogFileWriter.LogMessage("PostDelete event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Delete");
                     break;
 
                 case EdmCmdType.EdmCmd_PostMove:
-                    LogFileWriter.LogMessage("PostMove event detected - after file move");
-                    Task.Run(async () => await HandleFileMoved(cmd, data));
-                    break;
-
-                case EdmCmdType.EdmCmd_PostCopy:
-                    LogFileWriter.LogMessage("PostCopy event detected - after file copy");
-                    // Handle copied files (similar to new files)
-                    Task.Run(async () => await HandleFileCopied(cmd, data));
-                    break;
-
-                case EdmCmdType.EdmCmd_PostAdd:
-                    LogFileWriter.LogMessage("PostAdd event detected - after file add");
-                    // Handle newly added files
-                    Task.Run(async () => await PerformLeoAIActions(cmd, data));
+                    LogFileWriter.LogMessage("PostMove event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Move");
                     break;
 
                 case EdmCmdType.EdmCmd_PostRename:
-                    LogFileWriter.LogMessage("PostRename event detected - after file rename");
-                    Task.Run(async () => await HandleFileRename(cmd, data));
+                    LogFileWriter.LogMessage("PostRename event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Rename");
+                    break;
+
+                case EdmCmdType.EdmCmd_PostCopy:
+                    LogFileWriter.LogMessage("PostCopy event - processing on client");
+                    ProcessEventOnClient(cmd, data, "Copy");
+                    break;
+
+                // Folder operations - process on client side (no metadata files)
+                case EdmCmdType.EdmCmd_PostAddFolder:
+                    // COMMENTED OUT: Add events fire for each file in the folder already
+                    // The file-level PostAdd events handle all files, so folder-level is redundant
+                    LogFileWriter.LogMessage("PostAddFolder event - SKIPPED (files already added via PostAdd)");
+                    break;
+
+                case EdmCmdType.EdmCmd_PostDeleteFolder:
+                    // COMMENTED OUT: Delete events fire for both files AND folder, causing duplicates
+                    // The file-level PostDelete events handle all files in the folder already
+                    LogFileWriter.LogMessage("PostDeleteFolder event - SKIPPED (files already deleted via PostDelete)");
                     break;
 
                 case EdmCmdType.EdmCmd_PostMoveFolder:
-                    LogFileWriter.LogMessage("PostMoveFolder event detected - after folder move");
-                    Task.Run(async () => await HandleFolderMove(cmd, data));
+                    LogFileWriter.LogMessage("PostMoveFolder event - processing on client");
+                    ProcessEventOnClient(cmd, data, "MoveFolder");
                     break;
 
                 case EdmCmdType.EdmCmd_PostRenameFolder:
-                    LogFileWriter.LogMessage("PostRenameFolder event detected - after folder rename");
-                    Task.Run(async () => await HandleFolderRename(cmd, data));
+                    LogFileWriter.LogMessage("PostRenameFolder event - processing on client");
+                    ProcessEventOnClient(cmd, data, "RenameFolder");
                     break;
-
-
 
                 case EdmCmdType.EdmCmd_InstallAddIn:
                     LogFileWriter.LogMessage("InstallAddIn event detected. Performing one-time initial data sync and creating persistent flag.");
@@ -513,18 +237,40 @@ namespace LeoAISwPdmAddIn
                         // Register this vault installation in registry for tracking
                         RegisterVaultInstallation(vaultName, vaultRootPath);
 
-                        // Perform initial sync using the safe method - wait for completion to prevent PDM unloading
-                        LogFileWriter.LogMessage("Performing initial vault sync...");
-                        SafeUploadData(vault, waitForCompletion: true);
+                        // Copy LeoAuthKey.txt to vault (NEW - for client-side config access)
+                        CopyAuthConfigToVault(vault);
 
+                        // Trigger complete sync by executing task on auth key file
+                        LogFileWriter.LogMessage("Triggering initial complete sync after installation...");
+
+                        string configPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
+                        IEdmFolder5 folder;
+                        IEdmFile5 configFile = vault.GetFileFromPath(configPath, out folder);
+
+                        if (configFile != null && folder != null)
+                        {
+                            LogFileWriter.LogMessage($"Triggering complete sync task on file: {configFile.Name}");
+
+                            var cmdData = new EdmCmdData
+                            {
+                                mlObjectID1 = configFile.ID,
+                                mlObjectID2 = folder.ID
+                            };
+
+                            ExecuteSyncTask(poCmd, new EdmCmdData[] { cmdData }, "CompleteSync");
+                            LogFileWriter.LogMessage("Complete sync task triggered successfully");
+                        }
+                        else
+                        {
+                            LogFileWriter.LogError("LeoAuthKey.txt not found in vault - cannot trigger initial complete sync");
+                            LogFileWriter.LogError("You may need to manually trigger complete sync from the menu");
+                        }
                     }
                     else
                     {
                         LogFileWriter.LogError("Failed to get vault context during add-in installation.");
                     }
                     break;
-
-
 
                 default:
                     LogFileWriter.LogMessage($"Unhandled command type: {poCmd.meCmdType} (value: {(int)poCmd.meCmdType})");
@@ -533,1415 +279,876 @@ namespace LeoAISwPdmAddIn
             LogFileWriter.LogDebug($"OnCmd method finished for command {poCmd.meCmdType}");
         }
 
+        #region Simplified Direct Task Creation (No Tracking)
 
         /// <summary>
-        /// Perform Leo AI actions on top of check-in files..
+        /// Creates an immediate task for file operations
+        /// Each operation creates its own task file and triggers execution
         /// </summary>
-        /// <param name="poCmd"></param>
-        /// <param name="ppoData"></param>
-        /// <exception cref="NotImplementedException"></exception>
-        private async Task PerformLeoAIActions(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            string asmPath = Assembly.GetExecutingAssembly().Location;
-            try
-            {
-                LogFileWriter.LogMessage("PerformLeoAIActions method called");
-                LeoFilesInformation.Clear();
-                await UploadFileChangesToLeo(poCmd, ppoData);
-                LogFileWriter.LogMessage("PerformLeoAIActions method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in PerformLeoAIActions: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-                System.Windows.Forms.MessageBox.Show($"Error in PerformLeoAIActions: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Uploads specific files that triggered the event to Leo AI
-        /// This is for event-based uploads, not full sync
-        /// </summary>
-        /// <param name="poCmd"></param>
-        /// <param name="ppoData"></param>
-        /// <returns></returns>
-        private async Task UploadFileChangesToLeo(EdmCmd poCmd, EdmCmdData[] ppoData)
+        private void CreateImmediateTask(EdmCmd poCmd, EdmCmdData[] ppoData, string operationType)
         {
             try
             {
-                LogFileWriter.LogMessage("UploadFileChangesToLeo method called for event-based file upload.");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success)
-                {
-                    return;
-                }
-                string directoryId = initResult.directoryId;
-                string vaultDir = initResult.vaultDir;
-                SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
+                IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
 
-                // This method is now a generic uploader for any event that adds/modifies files.
-                // The specific logic for deletes/moves is handled in the dedicated handlers.
-                List<FileData> filesToUpload = new List<FileData>();
-
-                foreach (var cmdData in ppoData)
+                foreach (EdmCmdData cmdData in ppoData)
                 {
                     string filePath = cmdData.mbsStrData1;
-                    LogFileWriter.LogMessage($"Processing event file: {filePath}");
+                    if (string.IsNullOrEmpty(filePath))
+                        continue;
 
-                    // Check if this is a file we should process
-                    if (IsProcessableFile(filePath))
+                    // Skip metadata folder files
+                    if (filePath.Contains("\\LeoAI_TaskData\\"))
                     {
-                        // Check if this file can have dependencies (SOLIDWORKS assemblies/drawings)
-                        if (FileHasDependencies(filePath))
-                        {
-                            // Get file structure for files that may have dependencies
-                            List<FileData> fileStructure = pdmHelper.GetFileStructure(filePath);
+                        LogFileWriter.LogDebug($"Skipping metadata file: {filePath}");
+                        continue;
+                    }
 
-                            if (fileStructure != null && fileStructure.Count > 0)
+                    // For move/rename/copy, get both paths from event data
+                    string newPath = cmdData.mbsStrData2;
+
+                    // Get actual file paths using PDM API for rename/move operations
+                    // This ensures we get vault-relative paths correctly
+                    string actualOldPath = filePath;
+                    string actualNewPath = newPath;
+
+                    if ((operationType == "Rename" || operationType == "Move") && cmdData.mlObjectID1 > 0)
+                    {
+                        try
+                        {
+                            LogFileWriter.LogMessage($"===File Rename/Move RAW data===");
+                            LogFileWriter.LogMessage($"  mbsStrData1: '{filePath}'");
+                            LogFileWriter.LogMessage($"  mbsStrData2: '{newPath}'");
+                            LogFileWriter.LogMessage($"  mlObjectID1 (FileID): {cmdData.mlObjectID1}");
+                            LogFileWriter.LogMessage($"  mlObjectID2 (FolderID): {cmdData.mlObjectID2}");
+
+                            if (operationType == "Move")
                             {
-                                LogFileWriter.LogMessage($"Found {fileStructure.Count} files in structure for {Path.GetFileName(filePath)}");
-                                filesToUpload.AddRange(fileStructure);
+                                // For Move: PDM provides both full paths in the event data
+                                // mbsStrData1 = OLD full path
+                                // mbsStrData2 = NEW full path
+                                actualOldPath = filePath;
+                                actualNewPath = newPath;
+                                LogFileWriter.LogMessage($"Move operation - using event paths directly");
+                                LogFileWriter.LogMessage($"  OLD path: '{actualOldPath}'");
+                                LogFileWriter.LogMessage($"  NEW path: '{actualNewPath}'");
                             }
-                            else
+                            else // Rename
                             {
-                                LogFileWriter.LogMessage($"No structure found for {filePath}, processing as single file");
-                                // Process as single file
-                                var fileData = pdmHelper.GetSingleFileData(filePath);
-                                if (fileData != null)
+                                // For Rename: we need PDM API to get the full path
+                                // Get file object by ID (more reliable than path)
+                                IEdmFile5 file = (IEdmFile5)vault.GetObject(EdmObjectType.EdmObject_File, cmdData.mlObjectID1);
+                                if (file != null)
                                 {
-                                    filesToUpload.Add(fileData);
+                                    // Get parent folder from FolderID
+                                    IEdmFolder5 parentFolder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, cmdData.mlObjectID2);
+                                    if (parentFolder != null)
+                                    {
+                                        // Get current file path (this is the NEW path after rename)
+                                        actualNewPath = file.GetLocalPath(parentFolder.ID);
+                                        LogFileWriter.LogMessage($"Current file path from PDM API: '{actualNewPath}'");
+
+                                        // Reconstruct old path in same folder
+                                        // If newPath (mbsStrData2) matches current filename, then filePath (mbsStrData1) is old name
+                                        string currentFileName = Path.GetFileName(actualNewPath);
+                                        if (!string.IsNullOrEmpty(newPath) && currentFileName.Equals(newPath, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            // mbsStrData1 is the old filename
+                                            string parentPath = Path.GetDirectoryName(actualNewPath);
+                                            actualOldPath = Path.Combine(parentPath, filePath);
+                                            LogFileWriter.LogMessage($"Reconstructed OLD path for rename: '{actualOldPath}'");
+                                        }
+                                        else
+                                        {
+                                            // Fallback: assume filePath is already a full path
+                                            actualOldPath = filePath;
+                                            LogFileWriter.LogMessage($"Using event old path as-is: '{actualOldPath}'");
+                                        }
+                                    }
                                 }
                             }
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            // For files without dependencies (parts, CAD files, documents), process as single file
-                            LogFileWriter.LogMessage($"Processing {filePath} as single file (no dependencies expected)");
-                            var fileData = pdmHelper.GetSingleFileData(filePath);
-                            if (fileData != null)
-                            {
-                                filesToUpload.Add(fileData);
-                            }
+                            LogFileWriter.LogDebug($"Could not get file from PDM API, using event paths: {ex.Message}");
                         }
                     }
-                    else
+
+                    // Convert absolute paths to vault-relative paths for storage in metadata
+                    // This ensures task host can reconstruct paths using its own vault root
+                    string relativeOldPath = GetVaultRelativePath(vault, actualOldPath);
+                    string relativeNewPath = string.IsNullOrEmpty(actualNewPath) ? null : GetVaultRelativePath(vault, actualNewPath);
+
+                    LogFileWriter.LogMessage($"Final file paths - Old: '{relativeOldPath}', New: '{relativeNewPath}'");
+
+                    // Create operation metadata with relative paths
+                    var operation = new OperationMetadata
                     {
-                        LogFileWriter.LogMessage($"Skipping unsupported file: {filePath}");
-                    }
+                        Id = Guid.NewGuid().ToString(),
+                        Operation = operationType,
+                        OldPath = (operationType == "Move" || operationType == "Rename" || operationType == "Copy" || operationType == "Delete") ? relativeOldPath : null,
+                        NewPath = (operationType == "Move" || operationType == "Rename" || operationType == "Copy") ? relativeNewPath : (operationType == "Delete" ? null : relativeOldPath),
+                        FileID = cmdData.mlObjectID1,
+                        FolderID = cmdData.mlObjectID2,
+                        Status = "ready",
+                        Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                    };
+
+                    LogFileWriter.LogMessage($"Creating {operationType} task for: {filePath} (relative: {relativeOldPath})");
+
+                    // Create task file and execute
+                    string taskFilePath = CreateTaskFileAndExecute(vault, operation);
                 }
-
-                if (filesToUpload.Count == 0)
-                {
-                    LogFileWriter.LogMessage("No supported files to upload from this event");
-                    return;
-                }
-
-                // Remove duplicates (in case multiple events reference the same file)
-                var uniqueFiles = filesToUpload
-                    .GroupBy(f => f.file)
-                    .Select(g => g.First())
-                    .ToList();
-
-                LogFileWriter.LogMessage($"Uploading {uniqueFiles.Count} unique files from event");
-
-                // Upload files in correct order: CAD files first, then assemblies, then documents
-                var cadFiles = uniqueFiles.Where(f =>
-                    f.mimeType == "application/x-sldprt" ||
-                    f.mimeType == "model/step").ToList();
-                var assemblies = uniqueFiles.Where(f => f.mimeType == "application/x-sldasm").ToList();
-                var documents = uniqueFiles.Where(f =>
-                    f.mimeType == "text/plain" ||
-                    f.mimeType == "application/pdf" ||
-                    f.mimeType == "application/msword" ||
-                    f.mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document").ToList();
-
-                // Upload in dependency order
-                if (cadFiles.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {cadFiles.Count} CAD files from event");
-                    await UpdateFilesToLeoAI(cadFiles, directoryId, vaultDir);
-                }
-
-                if (assemblies.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {assemblies.Count} assemblies from event");
-                    await UpdateFilesToLeoAI(assemblies, directoryId, vaultDir);
-                }
-
-                if (documents.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {documents.Count} documents from event");
-                    await UpdateFilesToLeoAI(documents, directoryId, vaultDir);
-                }
-
-                LeoFilesInformation.Clear();
-                LogFileWriter.LogMessage("Event-based file upload completed successfully");
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Exception in UploadFileChangesToLeo: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
+                LogFileWriter.LogError($"Error creating immediate task: {ex.Message}");
+                SentryErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                {
+                    { "operation", "create_immediate_task" },
+                    { "operation_type", operationType }
+                });
             }
         }
 
-        SyncMetadataResponse dirInfo = null;
         /// <summary>
-        /// Creates the valut directory in LEO
+        /// Creates an immediate task for folder operations
+        /// For PDM folder events:
+        /// - mbsStrData1 = OLD folder path (before rename/move)
+        /// - mbsStrData2 = NEW folder name only (not full path, just the name)
+        /// - mlObjectID1 = Folder ID
+        ///
+        /// IMPORTANT: Creates ONE task for the entire folder (not per file)
+        /// The task host will iterate over all files in the folder
         /// </summary>
-        /// <param name="valutDir"></param>
-        /// <returns></returns>
-        private async Task<string> CreateDirectory(string valutDir)
+        private void CreateImmediateFolderTask(EdmCmd poCmd, EdmCmdData[] ppoData, string operationType)
         {
-            string directoryId = string.Empty;
             try
             {
-                LogFileWriter.LogMessage($"Checking for existing synced directory for this machine...");
-                //Check if the valut is already registered in Leo
-                List<LeoDirectoryInfo> directoriesInfo = await LeoClient.GetDirectoryInfoAsync(LeoAIDataUtilities.GetFormattedMacAddress());
-                if (directoriesInfo != null && directoriesInfo.Count > 0)
+                IEdmVault5 vault = poCmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
+
+                // For folder operations, ppoData should contain only ONE folder entry
+                // We process only the first item and create ONE task for the entire folder
+                if (ppoData == null || ppoData.Length == 0)
                 {
-                    //Valut already registered
-                    var dir = directoriesInfo.FirstOrDefault(d => d.Uri.Equals(valutDir, StringComparison.OrdinalIgnoreCase));
-                    if (dir != null)
+                    LogFileWriter.LogWarning($"No folder data provided for {operationType}");
+                    return;
+                }
+
+                // Take ONLY the first folder entry
+                EdmCmdData cmdData = ppoData[0];
+
+                // For folders, PDM provides:
+                // mbsStrData1 = folder path (might be relative or absolute)
+                // mbsStrData2 = NEW folder name (for rename) or destination path (for move)
+                // mlObjectID1 = Folder ID
+                string folderPath1 = cmdData.mbsStrData1;
+                string folderPath2 = cmdData.mbsStrData2;
+                int folderID = cmdData.mlObjectID1;
+
+                LogFileWriter.LogMessage($"===Folder event RAW data===");
+                LogFileWriter.LogMessage($"  mbsStrData1: '{folderPath1}'");
+                LogFileWriter.LogMessage($"  mbsStrData2: '{folderPath2}'");
+                LogFileWriter.LogMessage($"  mlObjectID1 (FolderID): {folderID}");
+
+                // Get the folder object from PDM using the folder ID
+                // This is more reliable than using the paths from event data
+                IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
+                if (folder == null)
+                {
+                    LogFileWriter.LogError($"Could not get folder object with ID: {folderID}");
+                    return;
+                }
+
+                // Get the CURRENT folder path from PDM (this is the NEW path after rename/move)
+                string currentFolderPath = folder.LocalPath;
+                LogFileWriter.LogMessage($"Current folder path from PDM API: '{currentFolderPath}'");
+
+                // For Rename/Move: we need to figure out the OLD path
+                // For AddFolder: we just need the current path
+                string oldFolderPath = null;
+                string newFolderPath = currentFolderPath;
+
+                if (operationType == "MoveFolder")
+                {
+                    // For MoveFolder: mbsStrData1 is typically the full OLD path (before move)
+                    // We can use it directly
+                    if (!string.IsNullOrEmpty(folderPath1) && Path.IsPathRooted(folderPath1))
                     {
-                        directoryId = dir.Id;
-                        LogFileWriter.LogMessage($"Found existing synced directory for path: '{valutDir}'. Using ID: {directoryId}");
+                        // mbsStrData1 is already a full absolute path
+                        oldFolderPath = folderPath1;
+                        LogFileWriter.LogMessage($"MoveFolder - using mbsStrData1 as full OLD path: '{oldFolderPath}'");
+                    }
+                    else if (!string.IsNullOrEmpty(folderPath1))
+                    {
+                        // mbsStrData1 might be vault-relative, make it absolute
+                        oldFolderPath = Path.Combine(vault.RootFolderPath, folderPath1);
+                        LogFileWriter.LogMessage($"MoveFolder - constructed OLD path from vault root: '{oldFolderPath}'");
                     }
                     else
                     {
-                        LogFileWriter.LogMessage($"No synced directory found for path: '{valutDir}'. Creating a new one.");
-                        directoryId = await LeoClient.CreateDirectoryAsync(LeoAIDataUtilities.GetFormattedMacAddress(), valutDir);
-                        LogFileWriter.LogMessage($"Created new synced directory with path: '{valutDir}'. New ID: {directoryId}");
+                        LogFileWriter.LogError($"MoveFolder - Could not determine old folder path");
+                        return;
+                    }
+                }
+                else if (operationType == "RenameFolder")
+                {
+                    // For RenameFolder: mbsStrData1 is just the old folder NAME (not full path)
+                    // mbsStrData2 is the new folder NAME
+                    // We need to reconstruct the full old path using the parent directory
+
+                    string currentFolderName = Path.GetFileName(currentFolderPath);
+                    string parentPath = Path.GetDirectoryName(currentFolderPath);
+
+                    LogFileWriter.LogMessage($"RenameFolder - Current folder name: '{currentFolderName}'");
+                    LogFileWriter.LogMessage($"RenameFolder - Parent path (absolute): '{parentPath}'");
+                    LogFileWriter.LogMessage($"RenameFolder - mbsStrData1 (old name): '{folderPath1}'");
+                    LogFileWriter.LogMessage($"RenameFolder - mbsStrData2 (new name): '{folderPath2}'");
+
+                    // Verify that mbsStrData2 matches the current folder name (sanity check)
+                    if (!string.IsNullOrEmpty(folderPath2) && !currentFolderName.Equals(folderPath2, StringComparison.OrdinalIgnoreCase))
+                    {
+                        LogFileWriter.LogWarning($"RenameFolder - Expected mbsStrData2 '{folderPath2}' to match current name '{currentFolderName}'");
+                    }
+
+                    // Reconstruct old path: parent directory + old folder name
+                    if (!string.IsNullOrEmpty(folderPath1))
+                    {
+                        oldFolderPath = Path.Combine(parentPath, folderPath1);
+                        LogFileWriter.LogMessage($"RenameFolder - Reconstructed OLD path: '{oldFolderPath}'");
+                    }
+                    else
+                    {
+                        LogFileWriter.LogError($"RenameFolder - mbsStrData1 (old folder name) is empty");
+                        return;
                     }
                 }
                 else
                 {
-                    //Valut not registered yet
-                    LogFileWriter.LogMessage($"No existing synced directories found for this machine. Creating new one with path: {valutDir}");
-                    directoryId = await LeoClient.CreateDirectoryAsync(LeoAIDataUtilities.GetFormattedMacAddress(), valutDir);
+                    // For AddFolder, we only need the current path
+                    oldFolderPath = null;
                 }
 
-                if (!string.IsNullOrEmpty(directoryId))
+                // Convert to vault-relative paths
+                string relativeOldPath = oldFolderPath != null ? GetVaultRelativePath(vault, oldFolderPath) : null;
+                string relativeNewPath = GetVaultRelativePath(vault, newFolderPath);
+
+                LogFileWriter.LogMessage($"Final paths - Old: '{relativeOldPath}', New: '{relativeNewPath}'");
+
+                // Create operation metadata for folder with relative paths
+                var operation = new OperationMetadata
                 {
-                    dirInfo = await LeoClient.GetSyncMetadataAsync(directoryId);
-                }
+                    Id = Guid.NewGuid().ToString(),
+                    Operation = operationType,
+                    OldPath = (operationType == "MoveFolder" || operationType == "RenameFolder") ? relativeOldPath : null,
+                    NewPath = (operationType == "MoveFolder" || operationType == "RenameFolder") ? relativeNewPath : relativeNewPath,
+                    FileID = cmdData.mlObjectID1,  // Folder ID
+                    FolderID = cmdData.mlObjectID2,
+                    Status = "ready",
+                    Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+                };
+
+                LogFileWriter.LogMessage($"Creating ONE {operationType} task for entire folder: OldPath={operation.OldPath}, NewPath={operation.NewPath}");
+
+                // Create ONE task file for the entire folder and execute
+                // The task host (LeoAiSyncTask) will enumerate all files in the folder
+                string taskFilePath = CreateTaskFileAndExecute(vault, operation);
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError(ex.StackTrace);
+                LogFileWriter.LogError($"Error creating immediate folder task: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
             }
-
-            return directoryId;
         }
 
         /// <summary>
-        /// Update supported files into Leo AI
+        /// Creates a task file with single operation and executes it immediately
         /// </summary>
-        /// <param name="filesInfo">List of file data to upload</param>
-        /// <param name="dirId">Directory ID</param>
-        /// <param name="vaultDir">Vault directory path</param>
-        private async Task<Dictionary<string, string>> UpdateFilesToLeoAI(List<FileData> filesInfo, string dirId, string vaultDir)
+        private string CreateTaskFileAndExecute(IEdmVault5 vault, OperationMetadata operation)
         {
             try
             {
-                // This method is now a simple uploader. It assumes the calling method has already
-                // handled any required deletions for updates/moves.
+                // Create task file with single operation
+                var taskOperations = new List<OperationMetadata> { operation };
+                string taskFilePath = CreateTaskMetadataFile(vault, taskOperations);
 
-                // Sort files by dependency depth to ensure children are created before parents
-                var sortedFiles = filesInfo.OrderBy(f => GetDependencyDepth(f, filesInfo)).ToList();
+                // Execute task immediately
+                LogFileWriter.LogMessage($"Executing task for operation: {operation.Operation}");
+                var poCmd = new EdmCmd { mpoVault = vault };
+                ExecuteSyncTaskWithMetadataFile(poCmd, taskFilePath);
 
-                foreach (var pInfo in sortedFiles)
-                {
-                    // Always treat the file as a new creation.
-                    LogFileWriter.LogMessage($"Uploading file to server: {pInfo.file}");
-                    Dictionary<string, string> childerenInfo = await GetChildInfo(pInfo, dirId, vaultDir);
-                    var result = await LeoClient.CreateFileAsync(dirId, vaultDir, pInfo.file, childerenInfo);
-                    if (result != null)
-                    {
-                        // Add the newly created file to our cache and local dependency info
-                        AddFileToCache(ConvertToFileMetadata(result));
-                        if (!LeoFilesInformation.ContainsKey(pInfo.file))
-                        {
-                            LeoFilesInformation.Add(pInfo.file, result.ComponentId);
-                        }
-                        else
-                        {
-                            LeoFilesInformation[pInfo.file] = result.ComponentId;
-                        }
-                    }
-                }
+                return taskFilePath;
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError(ex.StackTrace);
+                LogFileWriter.LogError($"Error creating and executing task: {ex.Message}");
+                return null;
             }
-            return LeoFilesInformation;
         }
 
-        /// <summary>
-        /// Calculates the dependency depth of a file. Files with no dependencies have depth 0.
-        /// </summary>
-        private int GetDependencyDepth(FileData file, List<FileData> allFiles, Dictionary<string, int> memo = null)
-        {
-            if (memo == null) memo = new Dictionary<string, int>();
-            if (memo.ContainsKey(file.file)) return memo[file.file];
-            if (file.dependencies == null || file.dependencies.Count == 0) return 0;
+        #endregion
 
-            int maxChildDepth = 0;
-            foreach (var dep in file.dependencies)
-            {
-                var childFile = allFiles.FirstOrDefault(f => f.file == dep.filePath);
-                if (childFile != null)
-                {
-                    maxChildDepth = Math.Max(maxChildDepth, GetDependencyDepth(childFile, allFiles, memo));
-                }
-            }
-
-            int depth = 1 + maxChildDepth;
-            memo[file.file] = depth;
-            return depth;
-        }
+        #region Task File Management
 
         /// <summary>
-        /// Gets the required child information of the file
+        /// Creates a task-specific metadata file with only ready operations
         /// </summary>
-        /// <param name="pInfo"></param>
-        /// <param name="dirId"></param>
-        /// <returns></returns>
-        private async Task<Dictionary<string, string>> GetChildInfo(FileData pInfo, string dirId, string vaultDir)
-        {
-            Dictionary<string, string> childerenInfo = new Dictionary<string, string>();
-            if (pInfo.dependencies != null && pInfo.dependencies.Count > 0)
-            {
-                foreach (var child in pInfo.dependencies)
-                {
-                    // The child.filePath from SOLIDWORKS is the full absolute path, 
-                    // so we can use it directly to lookup in LeoFilesInformation
-                    LogFileWriter.LogMessage($"Looking up dependency: '{child.filePath}' in LeoFilesInformation");
-
-                    if (LeoFilesInformation.ContainsKey(child.filePath))
-                    {
-                        var componentId = LeoFilesInformation[child.filePath];
-                        // Calculate the relative path from vault root for this dependency
-                        string relativePath = SecureApiClient.GetRelativePath(vaultDir, child.filePath);
-                        string normalizedPath = SecureApiClient.NormalizeFilePathForApi(relativePath);
-
-                        // Get the actual checksum of the dependency file
-                        string checkSum = GetFileChecksum(child.filePath);
-
-                        // The API expects: checkSum -> relative file path
-                        childerenInfo.Add(checkSum, normalizedPath);
-                        LogFileWriter.LogMessage($"Found dependency '{child.filePath}' with checkSum: {checkSum}, relative path: {normalizedPath}");
-                    }
-                    else
-                    {
-                        // This case should ideally not happen if files are processed in order of dependency.
-                        // It indicates a child part/assembly that wasn't in the original list.
-                        // We create it here as a fallback.
-                        LogFileWriter.LogMessage($"Warning: Child dependency '{child.filePath}' not found in pre-processed list. Creating it on-the-fly.");
-                        var result = await LeoClient.CreateFileAsync(dirId, vaultDir, child.filePath, null);
-                        if (result != null)
-                        {
-                            // Calculate the relative path from vault root for this dependency
-                            string relativePath = SecureApiClient.GetRelativePath(vaultDir, child.filePath);
-                            string normalizedPath = SecureApiClient.NormalizeFilePathForApi(relativePath);
-
-                            // Get the actual checksum of the dependency file
-                            string checkSum = GetFileChecksum(child.filePath);
-
-                            childerenInfo.Add(checkSum, normalizedPath);
-                            // Add to cache and local tracking
-                            AddFileToCache(ConvertToFileMetadata(result));
-                            LeoFilesInformation[child.filePath] = result.ComponentId;
-                            LogFileWriter.LogMessage($"Created dependency '{child.filePath}' with checkSum: {checkSum}, relative path: {normalizedPath}");
-                        }
-                    }
-                }
-            }
-
-            return childerenInfo;
-        }
-
-        /// <summary>
-        /// Gets the checksum of a file using the same algorithm as LeoFileInfo
-        /// </summary>
-        /// <param name="filePath">Full path to the file</param>
-        /// <returns>Checksum string</returns>
-        private string GetFileChecksum(string filePath)
+        private string CreateTaskMetadataFile(IEdmVault5 vault, List<OperationMetadata> readyOperations)
         {
             try
             {
-                if (!File.Exists(filePath))
+                string vaultRoot = vault.RootFolderPath;
+                string metadataFolder = Path.Combine(vaultRoot, "LeoAI_TaskData");
+
+                if (!Directory.Exists(metadataFolder))
                 {
-                    LogFileWriter.LogError($"File not found for checksum calculation: {filePath}");
-                    return string.Empty;
+                    Directory.CreateDirectory(metadataFolder);
                 }
 
-                // Use the same method as LeoFileInfo to ensure consistency
-                LeoFileInfo.LeoFileInformation fileInfo = LeoFileInfo.GetFileInfo(filePath);
-                return fileInfo.CheckSum;
+                // Create unique task file name
+                string taskId = Guid.NewGuid().ToString("N").Substring(0, 8);
+                string timestamp = DateTimeOffset.Now.ToUnixTimeSeconds().ToString();
+                string taskFileName = $"Task_{timestamp}_{taskId}.json";
+                string taskFilePath = Path.Combine(metadataFolder, taskFileName);
+
+                // Create task-specific metadata
+                var taskMetadata = new UserSessionMetadata
+                {
+                    SessionId = $"Task_{taskId}",
+                    Operations = readyOperations,
+                    LastModified = DateTimeOffset.Now.ToUnixTimeSeconds()
+                };
+
+                // Write task metadata file
+                string json = Newtonsoft.Json.JsonConvert.SerializeObject(taskMetadata, Newtonsoft.Json.Formatting.Indented);
+                using (FileStream fs = new FileStream(taskFilePath, FileMode.Create, FileAccess.Write, FileShare.None))
+                using (StreamWriter writer = new StreamWriter(fs))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                }
+
+                LogFileWriter.LogMessage($"Created task metadata file: {taskFileName}");
+
+                // Add to vault and check in
+                AddFileToVault(vault, taskFilePath);
+
+                return taskFilePath;
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Error calculating checksum for file '{filePath}': {ex.Message}");
-                return string.Empty;
-            }
-        }
-
-        /// <summary>
-        /// Analyzes the differences between local files and server sync metadata to determine what changes need to be made
-        /// </summary>
-        /// <param name="localFiles">List of local files</param>
-        /// <param name="serverSyncData">Server sync metadata</param>
-        /// <param name="vaultDir">Vault directory path</param>
-        /// <returns>Categorized sync changes</returns>
-        private SyncChanges AnalyzeSyncChanges(List<FileData> localFiles, SyncMetadataResponse serverSyncData, string vaultDir)
-        {
-            var syncChanges = new SyncChanges();
-
-            try
-            {
-                // Create a set of server file paths for quick lookup
-                var serverFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-                var serverFileMap = new Dictionary<string, SyncMetadataFile>(StringComparer.OrdinalIgnoreCase);
-
-                if (serverSyncData?.Files != null)
-                {
-                    foreach (var serverFile in serverSyncData.Files)
-                    {
-                        var normalizedPath = NormalizePath(serverFile.FilePathInDirectory);
-                        serverFiles.Add(normalizedPath);
-                        serverFileMap[normalizedPath] = serverFile;
-
-                        // Log first few server files for debugging
-                        if (serverFiles.Count <= 5)
-                        {
-                            LogFileWriter.LogMessage($"Server file: '{normalizedPath}' (Original: '{serverFile.FilePathInDirectory}')");
-                        }
-                    }
-                }
-
-                LogFileWriter.LogMessage($"Server has {serverFiles.Count} files");
-
-                // Deduplicate local files by relative path to prevent duplicate processing
-                var uniqueLocalFiles = new Dictionary<string, FileData>(StringComparer.OrdinalIgnoreCase);
-                foreach (var localFile in localFiles)
-                {
-                    var relativePath = SecureApiClient.GetRelativePath(vaultDir, localFile.file);
-                    var normalizedPath = NormalizePath(relativePath);
-
-                    // Only keep the first occurrence of each unique path
-                    if (!uniqueLocalFiles.ContainsKey(normalizedPath))
-                    {
-                        uniqueLocalFiles[normalizedPath] = localFile;
-
-                        // Log first few local files for debugging
-                        if (uniqueLocalFiles.Count <= 10)
-                        {
-                            LogFileWriter.LogMessage($"Local file: '{normalizedPath}' (Original: '{localFile.file}')");
-                        }
-                    }
-                    else
-                    {
-                        LogFileWriter.LogMessage($"Duplicate local file skipped: '{normalizedPath}' (Original: '{localFile.file}')");
-                    }
-                }
-
-                LogFileWriter.LogMessage($"Local vault has {uniqueLocalFiles.Count} unique files (deduplicated from {localFiles.Count} total)");
-
-                // Debug path comparison for first few files
-                LogFileWriter.LogMessage("=== PATH COMPARISON DEBUG ===");
-                int debugCount = 0;
-                foreach (var kvp in uniqueLocalFiles)
-                {
-                    if (debugCount >= 5) break;
-                    var normalizedPath = kvp.Key;
-                    var hasMatch = serverFiles.Contains(normalizedPath);
-                    LogFileWriter.LogMessage($"Local: '{normalizedPath}' -> Server match: {hasMatch}");
-                    debugCount++;
-                }
-                LogFileWriter.LogMessage("=== END PATH COMPARISON DEBUG ===");
-
-                // Analyze each unique local file
-                foreach (var kvp in uniqueLocalFiles)
-                {
-                    var normalizedPath = kvp.Key;
-                    var localFile = kvp.Value;
-
-                    if (serverFiles.Contains(normalizedPath))
-                    {
-                        // File exists on server - check if it's modified
-                        var serverFile = serverFileMap[normalizedPath];
-
-                        // For now, assume files are unchanged if they exist on both sides
-                        // In the future, we could compare checksums or modification dates
-                        LogFileWriter.LogMessage($"File unchanged: {normalizedPath}");
-                        // Don't add to any sync changes list - unchanged files don't need processing
-                    }
-                    else
-                    {
-                        // File doesn't exist on server - it's new
-                        LogFileWriter.LogMessage($"New file detected: {normalizedPath}");
-                        syncChanges.NewFiles.Add(localFile);
-                    }
-                }
-
-                // Check for files that exist on server but not locally (deleted files)
-                foreach (var serverFile in serverFileMap.Values)
-                {
-                    var normalizedPath = NormalizePath(serverFile.FilePathInDirectory);
-                    if (!uniqueLocalFiles.ContainsKey(normalizedPath))
-                    {
-                        LogFileWriter.LogMessage($"Deleted file detected: {normalizedPath}");
-                        syncChanges.DeletedFiles.Add(serverFile);
-                    }
-                }
-
-                LogFileWriter.LogMessage("Sync analysis completed successfully");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogMessage($"Error during sync analysis: {ex.Message}");
+                LogFileWriter.LogError($"Error creating task metadata file: {ex.Message}");
                 throw;
             }
-
-            return syncChanges;
         }
 
         /// <summary>
-        /// Decodes a URL-encoded path segment from the API.
+        /// Executes sync task by passing metadata file to the task
         /// </summary>
-        private string DecodePathFromApi(string encodedPath)
+        private void ExecuteSyncTaskWithMetadataFile(EdmCmd poCmd, string metadataFilePath)
         {
-            if (string.IsNullOrEmpty(encodedPath)) return encodedPath;
-            return Uri.UnescapeDataString(encodedPath);
-        }
-
-        /// <summary>
-        /// Handles file deletion by removing the file from Leo AI
-        /// </summary>
-        /// <param name="poCmd"></param>
-        /// <param name="ppoData"></param>
-        private async Task HandleFileDeleted(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            LogFileWriter.LogMessage("File delete hook called.");
-
-            var initResult = await InitializeClientAndCache(poCmd);
-            if (!initResult.success)
+            try
             {
-                LogFileWriter.LogError("Could not initialize Leo client or cache. Aborting delete operation.");
-                return;
+                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
+                IEdmFolder5 folder;
+                IEdmFile5 metadataFile = vault.GetFileFromPath(metadataFilePath, out folder);
+
+                if (metadataFile == null)
+                {
+                    LogFileWriter.LogError($"Metadata file not found in vault: {metadataFilePath}");
+                    return;
+                }
+
+                // Create EdmCmdData for the metadata file
+                EdmCmdData metadataData = new EdmCmdData();
+                metadataData.mlObjectID1 = metadataFile.ID;
+                metadataData.mlObjectID2 = folder.ID;
+
+                // Execute task with metadata file
+                ExecuteSyncTask(poCmd, new EdmCmdData[] { metadataData }, "ProcessMetadata");
             }
-            string directoryId = initResult.directoryId;
-            string vaultDir = initResult.vaultDir;
-            SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-            foreach (var data in ppoData)
+            catch (Exception ex)
             {
+                LogFileWriter.LogError($"Error executing sync task with metadata file: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Adds file to vault if not already present
+        /// </summary>
+        private void AddFileToVault(IEdmVault5 vault, string filePath)
+        {
+            try
+            {
+                string folderPath = Path.GetDirectoryName(filePath);
+                string fileName = Path.GetFileName(filePath);
+
+                IEdmFolder5 folder = vault.GetFolderFromPath(folderPath);
+                if (folder == null)
+                {
+                    // Create the folder if it doesn't exist
+                    string parentPath = Path.GetDirectoryName(folderPath);
+                    string folderName = Path.GetFileName(folderPath);
+
+                    IEdmFolder5 parentFolder = vault.GetFolderFromPath(parentPath);
+                    if (parentFolder != null)
+                    {
+                        parentFolder.AddFolder(0, folderName);
+                        LogFileWriter.LogMessage($"Added folder to vault: {folderName}");
+                        folder = vault.GetFolderFromPath(folderPath);
+                    }
+                }
+
+                if (folder == null)
+                {
+                    LogFileWriter.LogError($"Failed to get/create folder: {folderPath}");
+                    return;
+                }
+
+                // Check if file already in vault
+                IEdmFile5 file = null;
+                IEdmFolder5 fileFolder = null;
+
                 try
                 {
-                    string filePath = data.mbsStrData1; // For PostDelete, the path is in mbsStrData1
-                    if (string.IsNullOrEmpty(filePath)) continue;
+                    file = vault.GetFileFromPath(filePath, out fileFolder);
+                }
+                catch
+                {
+                    // File not in vault yet
+                }
 
-                    LogFileWriter.LogMessage($"Processing deletion for file: {filePath}");
+                if (file == null)
+                {
+                    LogFileWriter.LogMessage($"Starting add file to vault process in path: {filePath}");
+                    folder.AddFile(0, filePath);
+                    LogFileWriter.LogMessage($"File added to vault");
 
-                    string relativePath = SecureApiClient.GetRelativePath(vaultDir, filePath);
-                    string normalizedPath = NormalizePath(relativePath);
-
-                    // Use the new method to get the file ID, with fallback to refresh the cache
-                    string componentId = await GetFileIdWithCacheFallback(normalizedPath, directoryId);
-
-                    if (string.IsNullOrEmpty(componentId))
+                    // Get file and check it in
+                    file = vault.GetFileFromPath(filePath, out fileFolder);
+                    if (file != null)
                     {
-                        LogFileWriter.LogMessage($"Could not find ComponentId for deleted file '{normalizedPath}' even after cache refresh. It might have been out of sync or already deleted.");
-                        continue; // Skip if not found on server
+                        LogFileWriter.LogMessage($"Checking in file: {fileName}");
+                        file.UnlockFile(0, "Added by Leo AI PDM Add-in", (int)EdmUnlockFlag.EdmUnlock_IgnoreReferences);
+                        LogFileWriter.LogMessage($"File checked in successfully: {fileName}");
                     }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error adding file to vault: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+            }
+        }
 
-                    bool success = await LeoClient.DeleteFileAsync(directoryId, componentId, normalizedPath);
+        #endregion
 
-                    if (success)
+        #region Task Execution Methods (Client-Side)
+
+        /// <summary>
+        /// Executes a sync task on the task host (server) by calling IEdmTaskMgr.RunTask()
+        /// This is a simplified method that just triggers the task - no metadata creation here
+        /// </summary>
+        private void ExecuteSyncTask(EdmCmd poCmd, EdmCmdData[] ppoData, string operation, Dictionary<string, string> additionalData = null)
+        {
+            LogFileWriter.LogMessage($"=== ExecuteSyncTask called - Operation: {operation}, Files: {ppoData?.Length ?? 0} ===");
+
+            try
+            {
+                IEdmVault11 vault = (IEdmVault11)poCmd.mpoVault;
+                LogFileWriter.LogMessage($"Getting IEdmTaskMgr from vault...");
+
+                IEdmTaskMgr taskMgr = (IEdmTaskMgr)vault.CreateUtility(EdmUtility.EdmUtil_TaskMgr);
+                if (taskMgr == null)
+                {
+                    LogFileWriter.LogError("Failed to create IEdmTaskMgr - CreateUtility returned null");
+                    return;
+                }
+
+                LogFileWriter.LogMessage("IEdmTaskMgr created successfully");
+
+                // Get all configured tasks
+                EdmTaskInfo[] tasks = taskMgr.GetTasks();
+                LogFileWriter.LogMessage($"Retrieved {tasks?.Length ?? 0} tasks from vault");
+
+                if (tasks == null || tasks.Length == 0)
+                {
+                    LogFileWriter.LogError("No tasks found in vault. Please configure 'Leo AI Sync Task' in PDM Administration.");
+                    return;
+                }
+
+                // Find the Leo AI Sync Task by name
+                EdmTaskInfo syncTask = new EdmTaskInfo();
+                bool foundTask = false;
+
+                foreach (EdmTaskInfo task in tasks)
+                {
+                    LogFileWriter.LogMessage($"Found task: {task.mbsTaskName} (ID: {task.mlTaskID})");
+                    if (task.mbsTaskName == "Leo AI Sync Task")
                     {
-                        LogFileWriter.LogMessage($"Successfully notified Leo AI of file deletion: {filePath}");
-                        RemoveFileFromCache(normalizedPath); // Keep cache in sync
+                        syncTask = task;
+                        foundTask = true;
+                        break;
+                    }
+                }
+
+                if (!foundTask || syncTask.mlTaskID == 0)
+                {
+                    LogFileWriter.LogError("Leo AI Sync Task not found. Please configure the task in PDM Administration.");
+                    LogFileWriter.LogMessage($"Available tasks: {string.Join(", ", tasks.Select(t => t.mbsTaskName))}");
+                    return;
+                }
+
+                LogFileWriter.LogMessage($"Found sync task: {syncTask.mbsTaskName} (ID: {syncTask.mlTaskID})");
+
+                // Convert ppoData to EdmSelItem2[] for task file list
+                LogFileWriter.LogMessage("Building file selection list...");
+                List<EdmSelItem2> fileList = new List<EdmSelItem2>();
+
+                foreach (EdmCmdData data in ppoData)
+                {
+                    EdmSelItem2 item = new EdmSelItem2();
+                    item.mlID = data.mlObjectID1;        // File/Document ID
+                    item.mlParentID = data.mlObjectID2;  // Parent Folder ID
+                    item.meType = EdmObjectType.EdmObject_File;
+                    item.mlVersion = 0;                  // Use latest version
+                    fileList.Add(item);
+
+                    LogFileWriter.LogMessage($"Added file to selection: ID={item.mlID}, ParentID={item.mlParentID}");
+                }
+
+                LogFileWriter.LogMessage($"File selection built: {fileList.Count} items");
+                LogFileWriter.LogMessage($"Calling RunTask() with {fileList.Count} items...");
+                taskMgr.RunTask(syncTask, fileList.ToArray(), 0);
+
+                LogFileWriter.LogMessage($"=== ExecuteSyncTask: Task execution initiated successfully ===");
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"ExecuteSyncTask failed: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+            }
+        }
+
+        #endregion
+
+        #region Client Initialization
+
+        /// <summary>
+        /// Ensures Leo AI client is initialized for client-side event processing
+        /// </summary>
+        private void EnsureClientInitialized(IEdmVault5 vault)
+        {
+            if (_isClientInitialized) return;
+
+            lock (_initLock)
+            {
+                if (_isClientInitialized) return;
+
+                try
+                {
+                    LogFileWriter.LogMessage("Initializing Leo AI client on client side...");
+
+                    string vaultConfigPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
+
+                    // Use PDM API to get local copy if file exists in vault
+                    IEdmFolder5 configFolder;
+                    IEdmFile5 configFile = vault.GetFileFromPath(vaultConfigPath, out configFolder);
+
+                    if (configFile != null && configFolder != null)
+                    {
+                        LogFileWriter.LogMessage($"Auth key file found in vault - getting local copy: {vaultConfigPath}");
+
+                        // Get local copy to ensure file is synced to this machine
+                        try
+                        {
+                            // GetFileCopy signature: GetFileCopy(int hwnd, ref object version, ref object pathOrFolderID, int flags, string newName)
+                            // Folder paths must be terminated by a backslash (per PDM API documentation)
+                            string destFolder = Path.GetDirectoryName(vaultConfigPath);
+                            LogFileWriter.LogMessage($"Auth key GetFileCopy - vaultConfigPath: '{vaultConfigPath}'");
+                            LogFileWriter.LogMessage($"Auth key GetFileCopy - destFolder: '{destFolder}'");
+
+                            string folderPathWithBackslash = destFolder.TrimEnd('\\') + "\\";
+                            LogFileWriter.LogMessage($"Auth key GetFileCopy - calling with folder path: '{folderPathWithBackslash}'");
+
+                            // Parameters: version (0 for latest), path or folder ID (path with backslash), flags, new name (empty)
+                            object version = 0;
+                            object folderPath = folderPathWithBackslash;
+                            configFile.GetFileCopy(0, ref version, ref folderPath, (int)EdmGetFlag.EdmGet_Simple, "");
+                            LogFileWriter.LogMessage("Auth key file retrieved successfully");
+                        }
+                        catch (Exception getEx)
+                        {
+                            LogFileWriter.LogWarning($"Failed to get local copy of auth key (might already be local): {getEx.Message}");
+                        }
                     }
                     else
                     {
-                        LogFileWriter.LogError($"Failed to notify Leo AI of file deletion: {filePath}");
+                        LogFileWriter.LogWarning("Auth key file not found in vault - will try fallback locations");
+                    }
+
+                    // Create client from vault config (will fall back to installation folder if not in vault)
+                    _leoClient = LeoAICadDataClient.SecureApiClient.CreateFromStandardLocations(vaultConfigPath);
+
+                    // Get/create directory
+                    string directoryPath = $"swpdm/{vault.Name}";
+                    _directoryId = SharedSyncOperations.GetOrCreateDirectoryId(_leoClient, directoryPath).Result;
+
+                    _isClientInitialized = true;
+                    LogFileWriter.LogMessage($"Client initialized successfully - DirectoryId: {_directoryId}");
+
+                    // Initialize Sentry error tracking
+                    if (!_isSentryInitialized)
+                    {
+                        SentryErrorHandler.Initialize(vault.Name, "Production");
+                        SentryErrorHandler.SetUser(System.Environment.UserName, vault.Name);
+                        _isSentryInitialized = true;
                     }
                 }
                 catch (Exception ex)
                 {
-                    LogFileWriter.LogError($"Error processing file deletion: {ex.Message}");
+                    LogFileWriter.LogError($"Failed to initialize Leo AI client: {ex.Message}");
+                    // Capture to Sentry if available
+                    SentryErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    {
+                        { "operation", "client_initialization" },
+                        { "vault", vault.Name }
+                    });
+                    // Don't throw - allow PDM to continue, just log the error
                 }
             }
         }
 
         /// <summary>
-        /// Gets the directory ID for the vault
+        /// Processes file operation events directly on client side (no metadata files)
         /// </summary>
-        /// <param name="vaultDir"></param>
-        /// <returns></returns>
-        private async Task<string> GetDirectoryId(string vaultDir)
+        private void ProcessEventOnClient(EdmCmd cmd, EdmCmdData[] data, string operationType)
         {
+            IEdmVault5 vault = null;
             try
             {
-                List<LeoDirectoryInfo> directoriesInfo = await LeoClient.GetDirectoryInfoAsync(LeoAIDataUtilities.GetFormattedMacAddress());
-                if (directoriesInfo != null && directoriesInfo.Count > 0)
-                {
-                    return directoriesInfo.FirstOrDefault()?.Id;
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in GetDirectoryId: {ex.Message}");
-            }
-            return string.Empty;
-        }
+                vault = cmd.mpoVault as IEdmVault5;
+                if (vault == null) return;
 
-        /// <summary>
-        /// Handles file move by updating the file location in Leo AI and removing the old location
-        /// </summary>
-        /// <param name="poCmd"></param>
-        /// <param name="ppoData"></param>
-        private async Task HandleFileMoved(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            try
-            {
-                LogFileWriter.LogMessage("HandleFileMoved method called");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success)
+                foreach (EdmCmdData cmdData in data)
                 {
-                    return;
-                }
-                string directoryId = initResult.directoryId;
-                string vaultDir = initResult.vaultDir;
-                SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
+                    string filePath = cmdData.mbsStrData1;
+                    if (string.IsNullOrEmpty(filePath))
+                        continue;
 
-                // Process each moved file
-                foreach (var cmdData in ppoData)
-                {
-                    string oldFilePath = cmdData.mbsStrData1;
-                    string newFilePath = cmdData.mbsStrData2;
-                    LogFileWriter.LogMessage($"Processing move: Old='{oldFilePath}' -> New='{newFilePath}'");
-
-                    // 1. Upload the new file.
-                    List<FileData> fileStructure = pdmHelper.GetFileStructure(newFilePath);
-                    if (fileStructure != null && fileStructure.Count > 0)
+                    // Skip metadata folder files
+                    if (filePath.Contains("\\LeoAI_TaskData\\"))
                     {
-                        LogFileWriter.LogMessage($"Uploading moved file structure to new location: {newFilePath}");
-                        await UpdateFilesToLeoAI(fileStructure, directoryId, vaultDir);
-                    }
-
-                    // 2. Delete the old file from the server
-                    string oldRelativePath = NormalizePath(SecureApiClient.GetRelativePath(vaultDir, oldFilePath));
-                    if (_pathToServerFileCache.TryGetValue(oldRelativePath, out var componentId))
-                    {
-                        LogFileWriter.LogMessage($"Deleting old record for moved file: '{oldRelativePath}'");
-                        if (await LeoClient.DeleteFileAsync(directoryId, componentId, oldRelativePath))
-                        {
-                            RemoveFileFromCache(oldRelativePath);
-                        }
-                    }
-                }
-
-                LogFileWriter.LogMessage("HandleFileMoved method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in HandleFileMoved: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-            }
-        }
-
-        /// <summary>
-        /// Handles file copy by uploading the new file to Leo AI
-        /// </summary>
-        /// <param name="poCmd"></param>
-        /// <param name="ppoData"></param>
-        private async Task HandleFileCopied(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            LogFileWriter.LogMessage("File copy hook called.");
-
-            var initResult = await InitializeClientAndCache(poCmd);
-            if (!initResult.success)
-            {
-                LogFileWriter.LogError("Could not initialize Leo client or cache. Aborting copy operation.");
-                return;
-            }
-            string directoryId = initResult.directoryId;
-            string vaultDir = initResult.vaultDir;
-            SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-            foreach (var data in ppoData)
-            {
-                // For PostCopy, mbsStrData1 is the source file path and mbsStrData2 is the destination.
-                string sourceFilePath = data.mbsStrData1;
-                string destFilePath = data.mbsStrData2;
-
-                LogFileWriter.LogMessage($"Processing copy from '{sourceFilePath}' to '{destFilePath}'");
-
-                try
-                {
-                    // We only care about uploading the new destination file
-                    var fileInfo = await LeoClient.CreateFileAsync(directoryId, vaultDir, destFilePath);
-                    if (fileInfo != null)
-                    {
-                        LogFileWriter.LogMessage($"Successfully created copied file in Leo: {destFilePath}");
-                        AddFileToCache(ConvertToFileMetadata(fileInfo));
-                    }
-                    else
-                    {
-                        LogFileWriter.LogError($"Failed to create copied file in Leo: {destFilePath}");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    LogFileWriter.LogError($"Error processing file copy for '{destFilePath}': {ex.Message}");
-                }
-            }
-        }
-
-        /// <summary>
-        /// Handles a file check-in event. Assumes the file content has changed and replaces it on the server.
-        /// </summary>
-        private async Task HandleFileCheckIn(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            LogFileWriter.LogMessage("File check-in hook called.");
-
-            var initResult = await InitializeClientAndCache(poCmd);
-            if (!initResult.success)
-            {
-                return;
-            }
-            string directoryId = initResult.directoryId;
-            string vaultDir = initResult.vaultDir;
-            SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-            foreach (var cmdData in ppoData)
-            {
-                string filePath = cmdData.mbsStrData1;
-                string relativePath = NormalizePath(SecureApiClient.GetRelativePath(vaultDir, filePath));
-
-                // Get the component ID for the old file version (for deletion later)
-                string oldComponentId = null;
-                if (_pathToServerFileCache.TryGetValue(relativePath, out oldComponentId))
-                {
-                    LogFileWriter.LogMessage($"File check-in: Found existing version of '{relativePath}' with component ID: {oldComponentId}");
-                }
-
-                // 1. Upload the new file version FIRST
-                List<FileData> fileStructure = pdmHelper.GetFileStructure(filePath);
-                if (fileStructure != null && fileStructure.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading new version for checked-in file: {filePath}");
-                    await UpdateFilesToLeoAI(fileStructure, directoryId, vaultDir);
-
-                    // 2. Only after successful upload, delete the old file version if it existed
-                    if (!string.IsNullOrEmpty(oldComponentId))
-                    {
-                        LogFileWriter.LogMessage($"File check-in: Deleting old version of '{relativePath}' after successful upload of new version.");
-                        if (await LeoClient.DeleteFileAsync(directoryId, oldComponentId, relativePath))
-                        {
-                            LogFileWriter.LogMessage($"Successfully deleted old version of '{relativePath}'");
-                            // Note: Cache is already updated by UpdateFilesToLeoAI with the new file info
-                        }
-                        else
-                        {
-                            LogFileWriter.LogError($"Failed to delete old version of '{relativePath}'. New version uploaded but old version remains.");
-                            // Note: The new version is still available, so the check-in succeeded
-                        }
-                    }
-                }
-                else
-                {
-                    LogFileWriter.LogError($"Failed to get file structure for check-in: {filePath}. Check-in operation aborted - old version remains intact.");
-                }
-            }
-            LogFileWriter.LogMessage("HandleFileCheckIn method finished");
-        }
-
-        /// <summary>
-        /// Handles an "undo check-out" event, which can include a file rename.
-        /// </summary>
-        private async Task HandleFileUndoCheckOut(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            try
-            {
-                LogFileWriter.LogMessage("HandleFileUndoCheckOut method called");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success)
-                {
-                    return;
-                }
-                string directoryId = initResult.directoryId;
-                string vaultDir = initResult.vaultDir;
-                SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-                foreach (var cmdData in ppoData)
-                {
-                    string oldFilePath = cmdData.mbsStrData1;
-                    string newFilePath = cmdData.mbsStrData2;
-
-                    // If newFilePath is empty or same as old, it's not a rename, so do nothing.
-                    if (string.IsNullOrEmpty(newFilePath) || oldFilePath.Equals(newFilePath, StringComparison.OrdinalIgnoreCase))
-                    {
-                        LogFileWriter.LogMessage($"Undo checkout for '{oldFilePath}' with no name change. No action needed.");
+                        LogFileWriter.LogDebug($"Skipping metadata file: {filePath}");
                         continue;
                     }
 
-                    // This is a rename. Treat it like a move.
-                    LogFileWriter.LogMessage($"Undo checkout with rename detected. Old: '{oldFilePath}', New: '{newFilePath}'");
-
-                    // 1. Upload the new file location
-                    List<FileData> fileStructure = pdmHelper.GetFileStructure(newFilePath);
-                    if (fileStructure != null && fileStructure.Count > 0)
-                    {
-                        LogFileWriter.LogMessage($"Uploading renamed file structure for: {newFilePath}");
-                        await UpdateFilesToLeoAI(fileStructure, directoryId, vaultDir);
-                    }
-
-                    // 2. Delete the old file record from the server
-                    string oldRelativePath = NormalizePath(SecureApiClient.GetRelativePath(vaultDir, oldFilePath));
-                    if (_pathToServerFileCache.TryGetValue(oldRelativePath, out var componentId))
-                    {
-                        LogFileWriter.LogMessage($"Deleting old record for renamed file: '{oldRelativePath}'");
-                        if (await LeoClient.DeleteFileAsync(directoryId, componentId, oldRelativePath))
-                        {
-                            RemoveFileFromCache(oldRelativePath);
-                        }
-                    }
-                }
-                LogFileWriter.LogMessage("HandleFileUndoCheckOut method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in HandleFileUndoCheckOut: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-            }
-        }
-
-        private async Task HandleFileRename(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            try
-            {
-                LogFileWriter.LogMessage("HandleFileRename method called");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success)
-                {
-                    return;
-                }
-                string directoryId = initResult.directoryId;
-                string vaultDir = initResult.vaultDir;
-                SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-                foreach (var cmdData in ppoData)
-                {
-                    var vault = poCmd.mpoVault as IEdmVault5;
-                    IEdmFolder5 parentFolder = vault.GetObject(EdmObjectType.EdmObject_Folder, cmdData.mlObjectID2) as IEdmFolder5;
-                    if (parentFolder == null)
-                    {
-                        LogFileWriter.LogError($"Could not retrieve parent folder (ID: {cmdData.mlObjectID2}) for rename operation.");
-                        continue;
-                    }
-
-                    string oldFilePath = Path.Combine(parentFolder.LocalPath, cmdData.mbsStrData1);
-                    string newFilePath = Path.Combine(parentFolder.LocalPath, cmdData.mbsStrData2);
-                    LogFileWriter.LogMessage($"Processing rename: Old='{oldFilePath}' -> New='{newFilePath}'");
-
-                    // This is a rename. Treat it like a move.
-                    await MoveFileOnServer(directoryId, vaultDir, pdmHelper, oldFilePath, newFilePath);
-                }
-                LogFileWriter.LogMessage("HandleFileRename method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in HandleFileRename: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-            }
-        }
-
-        private async Task HandleFolderRename(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            try
-            {
-                LogFileWriter.LogMessage("HandleFolderRename method called");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success) return;
-
-                foreach (var cmdData in ppoData)
-                {
-                    var vault = poCmd.mpoVault as IEdmVault5;
-                    IEdmFolder5 parentFolder = vault.GetObject(EdmObjectType.EdmObject_Folder, cmdData.mlObjectID2) as IEdmFolder5;
-                    if (parentFolder == null)
-                    {
-                        LogFileWriter.LogError($"Could not retrieve parent folder (ID: {cmdData.mlObjectID2}) for folder rename.");
-                        continue;
-                    }
-
-                    string oldFolderPath = Path.Combine(parentFolder.LocalPath, cmdData.mbsStrData1);
-                    string newFolderPath = Path.Combine(parentFolder.LocalPath, cmdData.mbsStrData2);
-
-                    await HandleRecursiveMove(oldFolderPath, newFolderPath, poCmd);
-                }
-                LogFileWriter.LogMessage("HandleFolderRename method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in HandleFolderRename: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-            }
-        }
-
-        // Generic method to handle directory operations with different file operation functions
-        private async Task HandleDirectoryOperation(EdmCmd poCmd, EdmCmdData[] ppoData, string operationName,
-            Func<string, string, string, string, SolidWorksPdmHelper, string[]> getFilesFunc,
-            Func<string, string, string, SolidWorksPdmHelper, string, Task> fileOperationFunc)
-        {
-            try
-            {
-                LogFileWriter.LogMessage($"{operationName} method called");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success)
-                {
-                    LogFileWriter.LogError($"Could not initialize Leo client or cache. Aborting {operationName.ToLower()} operation.");
-                    return;
-                }
-                string directoryId = initResult.directoryId;
-                string vaultDir = initResult.vaultDir;
-                SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-                foreach (var cmdData in ppoData)
-                {
-                    try
-                    {
-                        // Get the files to process using the provided function
-                        var filesToProcess = getFilesFunc(cmdData.mbsStrData1, cmdData.mbsStrData2, directoryId, vaultDir, pdmHelper);
-
-                        foreach (var filePath in filesToProcess)
-                        {
-                            LogFileWriter.LogMessage($"Processing {operationName.ToLower()} file: {filePath}");
-
-                            // Execute the file operation using the provided function
-                            await fileOperationFunc(directoryId, vaultDir, filePath, pdmHelper, cmdData.mbsStrData1);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        LogFileWriter.LogError($"Error processing {operationName.ToLower()} for folder '{cmdData.mbsStrData1}': {ex.Message}");
-                    }
-                }
-                LogFileWriter.LogMessage($"{operationName} method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in {operationName}: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-            }
-        }
-
-        private async Task HandleFolderMove(EdmCmd poCmd, EdmCmdData[] ppoData)
-        {
-            try
-            {
-                LogFileWriter.LogMessage("HandleFolderMove method called");
-                var initResult = await InitializeClientAndCache(poCmd);
-                if (!initResult.success) return;
-
-                foreach (var cmdData in ppoData)
-                {
-                    await HandleRecursiveMove(cmdData.mbsStrData1, cmdData.mbsStrData2, poCmd);
-                }
-                LogFileWriter.LogMessage("HandleFolderMove method finished");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Exception in HandleFolderMove: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-            }
-        }
-
-
-
-
-
-        private async Task HandleRecursiveMove(string oldFolderPath, string newFolderPath, EdmCmd poCmd)
-        {
-            var initResult = await InitializeClientAndCache(poCmd);
-            if (!initResult.success)
-            {
-                LogFileWriter.LogError("Could not initialize Leo client or cache. Aborting recursive move.");
-                return;
-            }
-            string directoryId = initResult.directoryId;
-            string vaultDir = initResult.vaultDir;
-            SolidWorksPdmHelper pdmHelper = initResult.pdmHelper;
-
-            LogFileWriter.LogMessage($"Starting recursive move from '{oldFolderPath}' to '{newFolderPath}'");
-
-            try
-            {
-                // For PostMoveFolder, the folder has already been moved, so we need to get files from the NEW location
-                // and calculate what their old paths would have been
-                var filesToMove = Directory.GetFiles(newFolderPath, "*.*", SearchOption.AllDirectories);
-
-                foreach (var newFilePath in filesToMove)
-                {
-                    // Calculate what the old path would have been
-                    string oldFilePath = newFilePath.Replace(newFolderPath, oldFolderPath);
-                    LogFileWriter.LogMessage($"Processing moved file: '{oldFilePath}' -> '{newFilePath}'");
-                    await MoveFileOnServer(directoryId, vaultDir, pdmHelper, oldFilePath, newFilePath);
-                }
-
-                LogFileWriter.LogMessage("Finished recursive move.");
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error during recursive move: {ex.Message}");
-            }
-        }
-
-        private async Task MoveFileOnServer(string directoryId, string vaultDir, SolidWorksPdmHelper pdmHelper, string oldFilePath, string newFilePath)
-        {
-            string oldRelativePath = SecureApiClient.GetRelativePath(vaultDir, oldFilePath);
-            string newRelativePath = SecureApiClient.GetRelativePath(vaultDir, newFilePath);
-            string normalizedOldPath = NormalizePath(oldRelativePath);
-            string normalizedNewPath = NormalizePath(newRelativePath);
-
-            LogFileWriter.LogMessage($"Attempting to move file on server from '{normalizedOldPath}' to '{normalizedNewPath}'");
-
-            // 1. Get the component ID for the old file (for deletion later)
-            string componentId = await GetFileIdWithCacheFallback(normalizedOldPath, directoryId);
-            if (string.IsNullOrEmpty(componentId))
-            {
-                LogFileWriter.LogMessage($"Cannot move file: component ID for '{normalizedOldPath}' not found.");
-                return;
-            }
-
-            // 2. Create the new file record FIRST
-            var fileInfo = await LeoClient.CreateFileAsync(directoryId, vaultDir, newFilePath, null);
-            if (fileInfo != null)
-            {
-                LogFileWriter.LogMessage($"Successfully created new file record: '{normalizedNewPath}'");
-
-                // 3. Only after successful creation, delete the old file record
-                if (await LeoClient.DeleteFileAsync(directoryId, componentId, normalizedOldPath))
-                {
-                    LogFileWriter.LogMessage($"Successfully deleted old file record: '{normalizedOldPath}'");
-
-                    // 4. Update cache: remove old entry and add new one
-                    RemoveFileFromCache(normalizedOldPath);
-                    AddFileToCache(ConvertToFileMetadata(fileInfo));
-                }
-                else
-                {
-                    LogFileWriter.LogError($"Failed to delete old file record during move: '{normalizedOldPath}'. New file created but old record remains.");
-                    // Note: We still have the new file created, so the move partially succeeded
-                    // The old file record will remain, but the new file is available
-                    AddFileToCache(ConvertToFileMetadata(fileInfo));
-                }
-            }
-            else
-            {
-                LogFileWriter.LogError($"Failed to create new file record for move: '{normalizedNewPath}'. Move operation aborted - old file remains intact.");
-                // The old file remains untouched, so no data loss occurred
-            }
-        }
-
-        private static string NormalizePath(string path)
-        {
-            return path?.Replace('\\', '/');
-        }
-
-
-        /// <summary>
-        /// Helper method to reduce boilerplate in event handlers. Initializes the API client and ensures the cache is populated.
-        /// </summary>
-        private async Task<(bool success, string directoryId, string vaultDir, SolidWorksPdmHelper pdmHelper)> InitializeClientAndCache(EdmCmd poCmd)
-        {
-            string directoryId = null;
-            string vaultDir = null;
-            SolidWorksPdmHelper pdmHelper = null;
-
-            try
-            {
-                var vault = poCmd.mpoVault as IEdmVault5;
-                if (vault == null)
-                {
-                    LogFileWriter.LogError("Failed to get vault object.");
-                    return (false, null, null, null);
-                }
-                vaultDir = vault.RootFolderPath;
-                pdmHelper = new SolidWorksPdmHelper(vault);
-
-                LeoAuthConfig authConfig = ReadAuthConfig();
-                if (authConfig == null)
-                {
-                    LogFileWriter.LogError("Failed to read auth config.");
-                    return (false, null, null, null);
-                }
-
-                LeoClient = new SecureApiClient(authConfig.ApiKey, authConfig.ProjectId);
-                if (LeoClient == null)
-                {
-                    LogFileWriter.LogError("Failed to initialize Leo API client.");
-                    return (false, null, null, null);
-                }
-
-                string macAddress = LeoAIDataUtilities.GetMacAddress();
-                var directories = await LeoClient.GetDirectoryInfoAsync(macAddress);
-                string localVaultDir = vaultDir; // Copy out parameter to local variable for lambda
-                directoryId = directories?.FirstOrDefault(d => d.Uri.Equals(localVaultDir, StringComparison.OrdinalIgnoreCase))?.Id;
-
-                if (string.IsNullOrEmpty(directoryId))
-                {
-                    LogFileWriter.LogError("Failed to create a new directory in Leo. Aborting.");
-                    return (false, null, null, null);
-                }
-
-                await EnsureCacheIsPopulated(directoryId);
-                return (true, directoryId, vaultDir, pdmHelper);
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error during client initialization: {ex.Message}");
-                return (false, null, null, null);
-            }
-        }
-
-        private LeoAICadDataClient.Utilities.FileInfo ConvertToFileInfo(SyncMetadataFile file)
-        {
-            if (file == null) return null;
-            return new LeoAICadDataClient.Utilities.FileInfo
-            {
-                ComponentId = file.ComponentId,
-                FilePathInDirectory = file.FilePathInDirectory,
-                CheckSum = file.CheckSum,
-                mimeType = file.MimeType
-            };
-        }
-
-        /// <summary>
-        /// Safely uploads vault data by extracting COM data on main thread first
-        /// </summary>
-        /// <param name="edmVault">The vault to upload data from</param>
-        /// <param name="waitForCompletion">If true, blocks until upload completes (needed for install events)</param>
-        private void SafeUploadData(IEdmVault5 edmVault, bool waitForCompletion = false)
-        {
-            try
-            {
-                // Extract all needed data from COM object on main thread
-                string vaultDir = edmVault.RootFolderPath;
-                string vaultName = edmVault.Name;
-
-                LogFileWriter.LogMessage($"SafeUploadData method called for vault: {vaultName}");
-                LogFileWriter.LogMessage($"Vault directory: {vaultDir}");
-
-                // This is a full, one-time sync. The cache should be cleared before starting.
-                Task.Run(async () => await ClearCacheSafely()).Wait();
-
-                // Create SolidWorksPdmHelper on main thread
-                SolidWorksPdmHelper pdmHelper = new SolidWorksPdmHelper(edmVault);
-                pdmHelper.ProcessFolders(edmVault);
-
-                // Get the file structure on main thread
-                List<FileData> topFileStructure = pdmHelper.FilesInfo;
-                LogFileWriter.LogMessage($"Found {topFileStructure.Count} files in vault");
-
-                // Handle async operations based on whether we need to wait for completion
-                if (waitForCompletion)
-                {
-                    // For install operations, block until completion to prevent PDM from unloading the add-in
-                    try
-                    {
-                        Task.Run(async () =>
-                        {
-                            await UploadVaultDataAsync(vaultDir, vaultName, topFileStructure);
-                            LogFileWriter.LogMessage("SafeUploadData method finished successfully");
-                        }).Wait();
-                    }
-                    catch (Exception ex)
-                    {
-                        LogFileWriter.LogError($"Exception in SafeUploadData sync operation: {ex.Message}");
-                        LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
-                    }
-                }
-                else
-                {
-                    // For regular operations, run in background
+                    // Run async operation without blocking PDM
+                    // IMPORTANT: Initialize client INSIDE Task.Run to avoid STA thread deadlock with Descope auth
                     Task.Run(async () =>
                     {
                         try
                         {
-                            await UploadVaultDataAsync(vaultDir, vaultName, topFileStructure);
-                            LogFileWriter.LogMessage("SafeUploadData method finished successfully");
+                            // Ensure client is initialized on thread pool thread (not PDM STA thread)
+                            EnsureClientInitialized(vault);
+
+                            if (!_isClientInitialized)
+                            {
+                                LogFileWriter.LogWarning($"Client not initialized - cannot process {operationType} event");
+                                return;
+                            }
+
+                            var operation = CreateOperationMetadata(operationType, cmdData, vault);
+                            await ProcessOperationAsync(vault, operation);
                         }
                         catch (Exception ex)
                         {
-                            LogFileWriter.LogError($"Exception in SafeUploadData async operation: {ex.Message}");
-                            LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
+                            LogFileWriter.LogError($"Failed to process {operationType} on {filePath}: {ex.Message}");
                         }
                     });
                 }
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Exception in SafeUploadData: {ex.Message}");
-                LogFileWriter.LogError($"StackTrace: {ex.StackTrace}");
+                LogFileWriter.LogError($"Error in ProcessEventOnClient: {ex.Message}");
+                SentryErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                {
+                    { "operation", "ProcessEventOnClient" },
+                    { "operation_type", operationType },
+                    { "vault", vault?.Name ?? "unknown" }
+                });
             }
         }
 
         /// <summary>
-        /// Async method that uploads vault data without using COM objects
-        /// Uses intelligent sync comparison to only upload what has changed
+        /// Creates operation metadata from PDM event data
         /// </summary>
-        /// <param name="vaultDir">Vault root directory path</param>
-        /// <param name="vaultName">Vault name</param>
-        /// <param name="filesInfo">List of files to upload</param>
-        private async Task UploadVaultDataAsync(string vaultDir, string vaultName, List<FileData> filesInfo)
+        private OperationMetadata CreateOperationMetadata(string operationType, EdmCmdData cmdData, IEdmVault5 vault)
         {
-            LogFileWriter.LogMessage("UploadVaultDataAsync method called for initial sync.");
+            // For PostAdd events:
+            //   mbsStrData1 = vault path (where file was added TO)
+            //   mbsStrData2 = local/source path (where it came FROM) or empty
+            // For Upload/PostUnlock events:
+            //   mbsStrData1 = vault path
+            //   mbsStrData2 = empty
+            // For Move/Rename events:
+            //   mbsStrData1 = old path (or old name for RenameFolder)
+            //   mbsStrData2 = new path (or new name for RenameFolder)
+            // For RenameFolder:
+            //   mbsStrData1 = old folder NAME only
+            //   mbsStrData2 = new folder NAME only
+            //   mlObjectID1 = Folder ID
 
-            // 1. Initialize Descope Auth
-            LeoAuthConfig authConfig = ReadAuthConfig();
-            if (authConfig == null)
+            string oldPath, newPath;
+
+            if (operationType == "Add")
             {
-                LogFileWriter.LogError("Failed to load authentication configuration. Aborting file upload.");
-                return;
+                // For Add: file is being added TO vault
+                // NewPath = where it's going (vault path in mbsStrData1)
+                // OldPath = where it came from (local path in mbsStrData2, or empty)
+                newPath = cmdData.mbsStrData1;  // vault path
+                oldPath = cmdData.mbsStrData2;  // local/source path (may be empty)
             }
-
-            var descopeApiKey = authConfig.ApiKey;
-            var descopeProjectId = authConfig.ProjectId;
-
-            LogFileWriter.LogMessage("Descope Auth initialized");
-
-            // Initialize LeoApiClient
-            LeoClient = new SecureApiClient(descopeApiKey, descopeProjectId);
-            LogFileWriter.LogMessage("LeoApiClient initialized");
-
-            // CreateDirectory
-            string directoryId = await CreateDirectory(vaultDir);
-            if (string.IsNullOrEmpty(directoryId))
+            else if (operationType == "RenameFolder")
             {
-                LogFileWriter.LogError("Failed to create directory");
-                return;
-            }
+                // For RenameFolder: mbsStrData1/2 contain only folder NAMES, not full paths
+                // We need to reconstruct full paths using the folder ID
+                int folderID = cmdData.mlObjectID1;
+                IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
 
-            LogFileWriter.LogMessage($"Directory created with ID: {directoryId}");
-
-            // Get current sync metadata from server
-            LogFileWriter.LogMessage("Getting current sync metadata from server...");
-            SyncMetadataResponse serverSyncData = await LeoClient.GetSyncMetadataAsync(directoryId);
-
-            // Compare local files with server state and categorize changes
-            var syncChanges = AnalyzeSyncChanges(filesInfo, serverSyncData, vaultDir);
-
-            LogFileWriter.LogMessage($"Sync analysis complete:");
-            LogFileWriter.LogMessage($"  New files: {syncChanges.NewFiles.Count}");
-            LogFileWriter.LogMessage($"  Modified files: {syncChanges.ModifiedFiles.Count}");
-            LogFileWriter.LogMessage($"  Moved files: {syncChanges.MovedFiles.Count}");
-            LogFileWriter.LogMessage($"  Deleted files: {syncChanges.DeletedFiles.Count}");
-
-            // Process changes in the correct order:
-            // 1. Upload new files (CAD files first, then assemblies, then documents)
-            if (syncChanges.NewFiles.Count > 0)
-            {
-                LogFileWriter.LogMessage("Processing new files...");
-
-                // CAD files with dependencies (SOLIDWORKS assemblies)
-                var newAssemblies = syncChanges.NewFiles.Where(f => f.mimeType == "application/x-sldasm").ToList();
-
-                // CAD files without dependencies (parts, STEP)
-                var newCadFiles = syncChanges.NewFiles.Where(f =>
-                    f.mimeType == "application/x-sldprt" ||
-                    f.mimeType == "model/step").ToList();
-
-                // Document files
-                var newDocuments = syncChanges.NewFiles.Where(f =>
-                    f.mimeType == "text/plain" ||
-                    f.mimeType == "application/pdf" ||
-                    f.mimeType == "application/msword" ||
-                    f.mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document").ToList();
-
-                // Upload in dependency order: CAD files first, then assemblies, then documents
-                if (newCadFiles.Count > 0)
+                if (folder != null)
                 {
-                    LogFileWriter.LogMessage($"Uploading {newCadFiles.Count} new CAD files (parts, STEP)...");
-                    await UpdateFilesToLeoAI(newCadFiles, directoryId, vaultDir);
+                    // Get current path (after rename) from PDM API
+                    string currentFolderPath = folder.LocalPath;
+                    string parentPath = Path.GetDirectoryName(currentFolderPath);
+                    string vaultRoot = vault.RootFolderPath;
+
+                    // Reconstruct old path: parent + old name
+                    string oldFolderPath = Path.Combine(parentPath, cmdData.mbsStrData1);
+
+                    // Convert to vault-relative paths
+                    oldPath = GetVaultRelativePath(vault, oldFolderPath);
+                    newPath = GetVaultRelativePath(vault, currentFolderPath);
+
+                    LogFileWriter.LogDebug($"RenameFolder - Reconstructed paths: old='{oldPath}', new='{newPath}'");
                 }
-
-                if (newAssemblies.Count > 0)
+                else
                 {
-                    LogFileWriter.LogMessage($"Uploading {newAssemblies.Count} new assemblies...");
-                    await UpdateFilesToLeoAI(newAssemblies, directoryId, vaultDir);
-                }
-
-                if (newDocuments.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {newDocuments.Count} new documents...");
-                    await UpdateFilesToLeoAI(newDocuments, directoryId, vaultDir);
+                    LogFileWriter.LogError($"RenameFolder - Could not get folder object with ID: {folderID}");
+                    // Fallback to raw names (will be wrong, but at least won't crash)
+                    oldPath = cmdData.mbsStrData1;
+                    newPath = cmdData.mbsStrData2;
                 }
             }
-
-            // 2. Upload moved files (same order as new files)
-            if (syncChanges.MovedFiles.Count > 0)
+            else if (operationType == "MoveFolder")
             {
-                LogFileWriter.LogMessage("Processing moved files...");
+                // For MoveFolder: mbsStrData1 is typically the full OLD path
+                // mbsStrData2 might be new path or destination folder
+                int folderID = cmdData.mlObjectID1;
+                IEdmFolder5 folder = (IEdmFolder5)vault.GetObject(EdmObjectType.EdmObject_Folder, folderID);
 
-                var movedAssemblies = syncChanges.MovedFiles.Where(f => f.mimeType == "application/x-sldasm").ToList();
-                var movedCadFiles = syncChanges.MovedFiles.Where(f =>
-                    f.mimeType == "application/x-sldprt" ||
-                    f.mimeType == "model/step").ToList();
-                var movedDocuments = syncChanges.MovedFiles.Where(f =>
-                    f.mimeType == "text/plain" ||
-                    f.mimeType == "application/pdf" ||
-                    f.mimeType == "application/msword" ||
-                    f.mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document").ToList();
-
-                if (movedCadFiles.Count > 0)
+                if (folder != null)
                 {
-                    LogFileWriter.LogMessage($"Uploading {movedCadFiles.Count} moved CAD files...");
-                    await UpdateFilesToLeoAI(movedCadFiles, directoryId, vaultDir);
+                    // Get current path (after move) from PDM API
+                    string currentFolderPath = folder.LocalPath;
+
+                    // Convert to vault-relative paths
+                    oldPath = GetVaultRelativePath(vault, cmdData.mbsStrData1);
+                    newPath = GetVaultRelativePath(vault, currentFolderPath);
+
+                    LogFileWriter.LogDebug($"MoveFolder - Paths: old='{oldPath}', new='{newPath}'");
                 }
-
-                if (movedAssemblies.Count > 0)
+                else
                 {
-                    LogFileWriter.LogMessage($"Uploading {movedAssemblies.Count} moved assemblies...");
-                    await UpdateFilesToLeoAI(movedAssemblies, directoryId, vaultDir);
-                }
-
-                if (movedDocuments.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {movedDocuments.Count} moved documents...");
-                    await UpdateFilesToLeoAI(movedDocuments, directoryId, vaultDir);
+                    LogFileWriter.LogError($"MoveFolder - Could not get folder object with ID: {folderID}");
+                    oldPath = cmdData.mbsStrData1;
+                    newPath = cmdData.mbsStrData2;
                 }
             }
-
-            // 3. Upload modified files (same order as new files)
-            if (syncChanges.ModifiedFiles.Count > 0)
+            else if (string.IsNullOrEmpty(cmdData.mbsStrData2))
             {
-                LogFileWriter.LogMessage("Processing modified files...");
-
-                var modifiedAssemblies = syncChanges.ModifiedFiles.Where(f => f.mimeType == "application/x-sldasm").ToList();
-                var modifiedCadFiles = syncChanges.ModifiedFiles.Where(f =>
-                    f.mimeType == "application/x-sldprt" ||
-                    f.mimeType == "model/step").ToList();
-                var modifiedDocuments = syncChanges.ModifiedFiles.Where(f =>
-                    f.mimeType == "text/plain" ||
-                    f.mimeType == "application/pdf" ||
-                    f.mimeType == "application/msword" ||
-                    f.mimeType == "application/vnd.openxmlformats-officedocument.wordprocessingml.document").ToList();
-
-                if (modifiedCadFiles.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {modifiedCadFiles.Count} modified CAD files...");
-                    await UpdateFilesToLeoAI(modifiedCadFiles, directoryId, vaultDir);
-                }
-
-                if (modifiedAssemblies.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {modifiedAssemblies.Count} modified assemblies...");
-                    await UpdateFilesToLeoAI(modifiedAssemblies, directoryId, vaultDir);
-                }
-
-                if (modifiedDocuments.Count > 0)
-                {
-                    LogFileWriter.LogMessage($"Uploading {modifiedDocuments.Count} modified documents...");
-                    await UpdateFilesToLeoAI(modifiedDocuments, directoryId, vaultDir);
-                }
+                // Upload/PostUnlock: only mbsStrData1 is set (vault path)
+                newPath = cmdData.mbsStrData1;
+                oldPath = cmdData.mbsStrData1;
+            }
+            else
+            {
+                // Move/Rename files: mbsStrData1 = old, mbsStrData2 = new
+                oldPath = cmdData.mbsStrData1;
+                newPath = cmdData.mbsStrData2;
             }
 
-            // 4. Delete files that no longer exist locally
-            if (syncChanges.DeletedFiles.Count > 0)
+            return new OperationMetadata
             {
-                LogFileWriter.LogMessage($"Deleting {syncChanges.DeletedFiles.Count} files from server...");
-
-                foreach (var deletedFile in syncChanges.DeletedFiles)
-                {
-                    // Use the original sync metadata for deletion - don't get fresh data as it may include newly created files
-                    string pathForDelete = NormalizePath(deletedFile.FilePathInDirectory);
-                    LogFileWriter.LogMessage($"Attempting to delete file using path from original sync metadata: {pathForDelete}");
-                    bool deleteSuccess = await LeoClient.DeleteFileAsync(directoryId, deletedFile.ComponentId, pathForDelete);
-                    if (deleteSuccess)
-                    {
-                        LogFileWriter.LogMessage($"Successfully deleted: {pathForDelete}");
-                        // Remove from cache to keep it in sync
-                        RemoveFileFromCache(pathForDelete);
-                    }
-                    else
-                    {
-                        LogFileWriter.LogError($"Failed to delete: {pathForDelete}");
-                    }
-                }
-            }
-
-            LeoFilesInformation.Clear();
-            LogFileWriter.LogMessage("Sync process completed successfully");
+                Id = Guid.NewGuid().ToString(),
+                Operation = operationType,
+                OldPath = oldPath,
+                NewPath = newPath,
+                FileID = cmdData.mlObjectID1,
+                FolderID = cmdData.mlObjectID2,
+                Status = "ready",
+                Timestamp = DateTimeOffset.Now.ToUnixTimeSeconds()
+            };
         }
 
         /// <summary>
-        /// Determines if a file should be processed based on its extension
+        /// Processes a single operation asynchronously on client side
+        /// TODO: Currently just logs - will implement actual sync when OperationExecution class is complete
         /// </summary>
-        /// <param name="filePath">Path to the file</param>
-        /// <returns>True if the file should be processed</returns>
-        private bool IsProcessableFile(string filePath)
+        private async Task ProcessOperationAsync(IEdmVault5 vault, OperationMetadata operation)
         {
-            string extension = Path.GetExtension(filePath).ToLower();
+            LogFileWriter.LogMessage($"[CLIENT] Processing operation: {operation.Operation} for file: {operation.OldPath ?? operation.NewPath}");
 
-            // SOLIDWORKS files (excluding drawings)
-            if (extension == ".sldprt" || extension == ".sldasm")
-                return true;
-
-            // Generic CAD formats
-            if (extension == ".step" || extension == ".stp")
-                return true;
-
-            // Parasolid files - temporarily disabled until API MIME type is confirmed
-            // if (extension == ".x_t" || extension == ".xt")
-            //     return true;
-
-            // Document formats
-            if (extension == ".txt" || extension == ".pdf")
-                return true;
-
-            // Microsoft Word formats
-            if (extension == ".doc" || extension == ".docx")
-                return true;
-
-            return false;
-        }
-
-        /// <summary>
-        /// Determines if a file has dependencies (i.e., is a SOLIDWORKS assembly)
-        /// </summary>
-        /// <param name="filePath">Path to the file</param>
-        /// <returns>True if the file may have dependencies</returns>
-        private bool FileHasDependencies(string filePath)
-        {
-            string extension = Path.GetExtension(filePath).ToLower();
-            // Only SOLIDWORKS assemblies have dependencies (drawings no longer supported)
-            return extension == ".sldasm";
-        }
-
-        private async Task ClearCacheSafely()
-        {
-            // Wait for any ongoing cache refresh to complete before clearing
-            while (true)
+            try
             {
-                lock (_cacheLock)
+                IEdmVault11 vault11 = (IEdmVault11)vault;
+                string operationJson = Newtonsoft.Json.JsonConvert.SerializeObject(operation);
+
+                SharedSyncOperations.OnOperationRun(vault11, operationJson, _leoClient, _directoryId);
+
+                LogFileWriter.LogMessage($"[CLIENT] Operation completed: {operation.Operation}");
+            }
+            catch (Exception ex)
+            {
+                // Unwrap AggregateException to get the real error
+                Exception realException = ex;
+                if (ex is AggregateException aggEx && aggEx.InnerExceptions.Count > 0)
                 {
-                    if (!_isRefreshingCache)
-                    {
-                        _pathToServerFileCache.Clear();
-                        _isCachePopulated = false;
-                        LogFileWriter.LogMessage("Cache cleared safely.");
-                        return;
-                    }
+                    realException = aggEx.InnerException ?? aggEx.InnerExceptions[0];
+                    LogFileWriter.LogError($"[CLIENT] Operation failed (AggregateException unwrapped): {realException.Message}");
+                }
+                else
+                {
+                    LogFileWriter.LogError($"[CLIENT] Operation failed: {ex.Message}");
                 }
 
-                LogFileWriter.LogMessage("Waiting for cache refresh to complete before clearing...");
-                await Task.Delay(50); // Short delay before checking again
+                LogFileWriter.LogError($"[CLIENT] Stack trace: {realException.StackTrace}");
+
+                // Log inner exceptions if present
+                if (realException.InnerException != null)
+                {
+                    LogFileWriter.LogError($"[CLIENT] Inner exception: {realException.InnerException.Message}");
+                    LogFileWriter.LogError($"[CLIENT] Inner exception stack trace: {realException.InnerException.StackTrace}");
+                }
+
+                // Capture exception to Sentry
+                SentryErrorHandler.CaptureException(realException, new Dictionary<string, string>
+                {
+                    { "operation", "ProcessOperationAsync" },
+                    { "operation_type", operation?.Operation ?? "unknown" },
+                    { "file_path", operation?.NewPath ?? operation?.OldPath ?? "unknown" },
+                    { "vault", vault?.Name ?? "unknown" }
+                });
             }
+
+            await Task.CompletedTask;
         }
+
+        #endregion
+
+        #region Registry Helpers
 
         /// <summary>
         /// Registers vault installation in the registry for tracking
@@ -1950,45 +1157,191 @@ namespace LeoAISwPdmAddIn
         {
             try
             {
-                string registryPath = @"SOFTWARE\LeoAI\PDM-AddIn\InstalledVaults";
+                string registryPath = @"SOFTWARE\LeoAI\SwPdmAddIn\Vaults";
+
                 using (RegistryKey key = Registry.CurrentUser.CreateSubKey(registryPath))
                 {
                     if (key != null)
                     {
                         key.SetValue(vaultName, vaultPath);
-                        LogFileWriter.LogMessage($"Registered vault installation in registry: {vaultName} -> {vaultPath}");
+                        LogFileWriter.LogMessage($"Registered vault installation: {vaultName} -> {vaultPath}");
                     }
                 }
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Failed to register vault installation in registry: {ex.Message}");
+                LogFileWriter.LogError($"Failed to register vault installation: {ex.Message}");
             }
         }
 
         /// <summary>
-        /// Removes vault installation from the registry after successful cleanup
+        /// Copies LeoAuthKey.txt (encrypted) from installation folder to vault for client-side access
+        /// Supports both .txt (new encrypted format) and .json (legacy) files
         /// </summary>
-        private void UnregisterVaultInstallation(string vaultName)
+        private void CopyAuthConfigToVault(IEdmVault5 vault)
         {
             try
             {
-                string registryPath = @"SOFTWARE\LeoAI\PDM-AddIn\InstalledVaults";
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(registryPath, true))
+                // Try .txt (encrypted) first, fallback to .json (legacy)
+                string sourceConfigPathTxt = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.txt");
+                string sourceConfigPathJson = Path.Combine(@"C:\Program Files\LeoAISwPdmAddIn", "LeoAuthKey.json");
+
+                string sourceConfigPath;
+                string targetFileName;
+
+                if (File.Exists(sourceConfigPathTxt))
                 {
-                    if (key != null)
+                    sourceConfigPath = sourceConfigPathTxt;
+                    targetFileName = "LeoAuthKey.txt";
+                    LogFileWriter.LogMessage($"Found encrypted auth file: {sourceConfigPath}");
+                }
+                else if (File.Exists(sourceConfigPathJson))
+                {
+                    sourceConfigPath = sourceConfigPathJson;
+                    targetFileName = "LeoAuthKey.json";
+                    LogFileWriter.LogMessage($"Found legacy auth file: {sourceConfigPath}");
+                }
+                else
+                {
+                    LogFileWriter.LogWarning($"LeoAuthKey.txt (or .json) not found in installation folder");
+                    LogFileWriter.LogWarning("Skipping config copy to vault. Client-side events will use installation folder.");
+                    return;
+                }
+
+                string vaultLeoFolder = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData");
+                string vaultConfigPath = Path.Combine(vaultLeoFolder, targetFileName);
+
+                // Ensure folder exists
+                if (!Directory.Exists(vaultLeoFolder))
+                {
+                    Directory.CreateDirectory(vaultLeoFolder);
+                    LogFileWriter.LogMessage($"Created vault Leo folder: {vaultLeoFolder}");
+                }
+
+                // Check if file already exists in vault
+                IEdmFolder5 existingFolder;
+                IEdmFile5 existingFile = vault.GetFileFromPath(vaultConfigPath, out existingFolder);
+
+                // Read source file content (encrypted or plaintext - just copy as-is)
+                string configContent = File.ReadAllText(sourceConfigPath);
+                LogFileWriter.LogMessage($"Read source config from: {sourceConfigPath}");
+
+                if (existingFile != null)
+                {
+                    // File exists - need to replace it because encryption key changed
+                    // Each build has a different encryption key, so old encrypted file is useless
+                    LogFileWriter.LogMessage($"{targetFileName} already exists in vault - replacing with new version (encryption key changed)");
+
+                    // Check out the file so we can modify it
+                    try
                     {
-                        key.DeleteValue(vaultName, false);
-                        LogFileWriter.LogMessage($"Removed vault installation from registry: {vaultName}");
+                        existingFile.LockFile(existingFolder.ID, 0, (int)EdmLockFlag.EdmLock_Simple);
+                        LogFileWriter.LogMessage($"Checked out {targetFileName} for modification");
                     }
+                    catch (Exception lockEx)
+                    {
+                        LogFileWriter.LogWarning($"Could not check out file (may already be checked out): {lockEx.Message}");
+                        // Continue anyway - file might already be unlocked
+                    }
+
+                    // Write new content to the local copy
+                    using (FileStream fs = new FileStream(vaultConfigPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (StreamWriter writer = new StreamWriter(fs))
+                    {
+                        writer.Write(configContent);
+                        writer.Flush();
+                    }
+                    LogFileWriter.LogMessage($"Updated local copy of {targetFileName}");
+
+                    // Check in the modified file
+                    try
+                    {
+                        existingFile.UnlockFile(0, "Updated encryption key - Leo AI PDM Add-in", (int)EdmUnlockFlag.EdmUnlock_IgnoreReferences);
+                        LogFileWriter.LogMessage($"Checked in updated {targetFileName}");
+                    }
+                    catch (Exception unlockEx)
+                    {
+                        LogFileWriter.LogError($"Could not check in file: {unlockEx.Message}");
+                        throw;
+                    }
+                }
+                else
+                {
+                    // File doesn't exist - create new one
+                    LogFileWriter.LogMessage($"{targetFileName} doesn't exist in vault - creating new file");
+
+                    // Write to vault folder using FileStream
+                    using (FileStream fs = new FileStream(vaultConfigPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                    using (StreamWriter writer = new StreamWriter(fs))
+                    {
+                        writer.Write(configContent);
+                        writer.Flush();
+                    }
+                    LogFileWriter.LogMessage($"Wrote config to vault folder: {vaultConfigPath}");
+
+                    // Add to vault and check in
+                    AddFileToVault(vault, vaultConfigPath);
+                    LogFileWriter.LogMessage($"{targetFileName} added to vault successfully");
                 }
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Failed to remove vault installation from registry: {ex.Message}");
+                LogFileWriter.LogError($"Failed to copy auth config to vault: {ex.Message}");
+                LogFileWriter.LogError($"Stack trace: {ex.StackTrace}");
+                LogFileWriter.LogWarning("Installation will continue. Client will use config from installation folder.");
+                // Don't throw - installation can proceed with config in install folder
             }
         }
 
+        #endregion
 
+        #region Path Utilities
+
+        /// <summary>
+        /// Converts an absolute file path to a vault-relative path
+        /// This allows the task host to reconstruct the full path using its own vault root
+        /// </summary>
+        private string GetVaultRelativePath(IEdmVault5 vault, string absolutePath)
+        {
+            if (string.IsNullOrEmpty(absolutePath))
+                return absolutePath;
+
+            string vaultRoot = vault.RootFolderPath;
+
+            // If path starts with vault root, extract the relative portion
+            if (absolutePath.StartsWith(vaultRoot, StringComparison.OrdinalIgnoreCase))
+            {
+                string relativePath = absolutePath.Substring(vaultRoot.Length).TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                return relativePath;
+            }
+
+            // Path doesn't start with vault root - might be from different local view
+            // Try to extract vault-relative path by finding vault name
+            string vaultName = vault.Name;
+            int vaultNameIndex = absolutePath.IndexOf(vaultName, StringComparison.OrdinalIgnoreCase);
+
+            if (vaultNameIndex >= 0)
+            {
+                // Extract everything after "vaultName\"
+                int relativeStartIndex = vaultNameIndex + vaultName.Length;
+                if (relativeStartIndex < absolutePath.Length && (absolutePath[relativeStartIndex] == '\\' || absolutePath[relativeStartIndex] == '/'))
+                {
+                    relativeStartIndex++; // Skip the separator
+                }
+
+                if (relativeStartIndex < absolutePath.Length)
+                {
+                    string relativePath = absolutePath.Substring(relativeStartIndex);
+                    LogFileWriter.LogMessage($"GetVaultRelativePath: Extracted '{relativePath}' from '{absolutePath}' using vault name");
+                    return relativePath;
+                }
+            }
+
+            // If we can't extract relative path, return as-is (shouldn't happen in normal operation)
+            LogFileWriter.LogMessage($"GetVaultRelativePath: Could not extract relative path from '{absolutePath}' - returning as-is");
+            return absolutePath;
+        }
+
+        #endregion
     }
 }

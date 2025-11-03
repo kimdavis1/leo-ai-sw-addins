@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <!-- Sentry Configuration Registry Component -->
+  <!-- This component creates the registry entry for Sentry DSN during installation -->
+
+  <Fragment>
+    <DirectoryRef Id="TARGETDIR">
+      <Component Id="SentryConfigComponent" Guid="A1B2C3D4-E5F6-7890-ABCD-1234567890AB">
+
+        <!-- System-wide Sentry DSN stored in HKEY_CURRENT_USER -->
+        <!-- This is accessible without admin privileges -->
+        <RegistryKey Root="HKCU" Key="Software\LeoAI\PDM">
+          <RegistryValue
+            Type="string"
+            Name="SentryDsn"
+            Value="[SENTRY_DSN]"
+            KeyPath="yes" />
+        </RegistryKey>
+
+        <!-- Optional: Also store in HKLM for system-wide access (requires admin) -->
+        <!-- Uncomment if you want to store in HKLM as well -->
+        <!--
+        <RegistryKey Root="HKLM" Key="Software\LeoAI\PDM">
+          <RegistryValue
+            Type="string"
+            Name="SentryDsn"
+            Value="[SENTRY_DSN]" />
+        </RegistryKey>
+        -->
+
+      </Component>
+    </DirectoryRef>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="SentryConfigComponents">
+      <ComponentRef Id="SentryConfigComponent" />
+    </ComponentGroup>
+  </Fragment>
+
+</Wix>

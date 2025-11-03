@@ -25,6 +25,11 @@ namespace LeoAISwPdmAddIn
 		private static LogLevel _currentLogLevel = LogLevel.Error; // Default to Error level
 		private static bool _logLevelInitialized = false;
 
+		/// <summary>
+		/// Gets the path to the log file
+		/// </summary>
+		public static string LogFilePath => logFilePath;
+
 		static LogFileWriter()
 		{
 			string tempPath = System.IO.Path.GetTempPath();

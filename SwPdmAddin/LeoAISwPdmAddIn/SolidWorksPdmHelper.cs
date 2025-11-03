@@ -1,9 +1,11 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
+using System.Threading.Tasks;
 using EPDM.Interop.epdm;
 using LeoAICadDataClient;
-using LeoAICadDataClient.Utilities;
 
 namespace LeoAISwPdmAddIn
 {
@@ -11,133 +13,12 @@ namespace LeoAISwPdmAddIn
     {
         private IEdmVault5 swPdmVault;
 
+        // Use ConcurrentBag for thread-safe parallel operations
         public List<FileData> FilesInfo { get; set; }
 
         public SolidWorksPdmHelper(IEdmVault5 edmVault)
         {
             swPdmVault = edmVault;
-        }
-
-        public List<FileData> GetFileStructure(string swFilePath)
-        {
-            FilesInfo = new List<FileData>();
-            try
-            {
-                string currDocType = GetDocType(swFilePath);
-                switch (currDocType.ToUpper())
-                {
-                    case "ASSEMBLY":
-                        GetAssemblyInfo(swFilePath);
-                        break;
-                    case "PART":
-                        GetPartInfo(swFilePath);
-                        break;
-                    case "DRAWING":
-                        break;
-                    default:
-                        break;
-                }
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error getting file structure for {swFilePath}: {ex.Message}");
-            }
-            return FilesInfo;
-        }
-
-        public FileData GetSingleFileData(string swFilePath)
-        {
-            try
-            {
-                if (!IsProcessableFile(swFilePath))
-                {
-                    return null;
-                }
-
-                IEdmFolder5 parentFolder;
-                IEdmFile5 file = swPdmVault.GetFileFromPath(swFilePath, out parentFolder);
-                if (file == null)
-                {
-                    LogFileWriter.LogError($"Failed to get file from PDM: {swFilePath}");
-                    return null;
-                }
-
-                var fileData = new FileData
-                {
-                    file = swFilePath,
-                    mimeType = LeoAIMemeType.GetMemeType(swFilePath),
-                    children = new List<ChildData>()
-                };
-
-                return fileData;
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error getting single file data for {swFilePath}: {ex.Message}");
-                return null;
-            }
-        }
-
-        private void GetPartInfo(string swFilePath)
-        {
-            try
-            {
-                if (!IsProcessableFile(swFilePath))
-                {
-                    return;
-                }
-
-                var partFileData = new FileData
-                {
-                    file = swFilePath,
-                    mimeType = LeoAIMemeType.GetMemeType(swFilePath),
-                    children = new List<ChildData>()
-                };
-
-                FilesInfo.Add(partFileData);
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error processing part file {swFilePath}: {ex.Message}");
-            }
-        }
-
-        private void GetAssemblyInfo(string swFilePath)
-        {
-            try
-            {
-                if (!IsProcessableFile(swFilePath))
-                {
-                    return;
-                }
-
-                IEdmFolder5 parentFolder;
-                IEdmFile5 file = swPdmVault.GetFileFromPath(swFilePath, out parentFolder);
-                if (file == null)
-                {
-                    LogFileWriter.LogError($"Failed to get assembly file from PDM: {swFilePath}");
-                    return;
-                }
-
-                var assemblyFileData = new FileData
-                {
-                    file = swFilePath,
-                    mimeType = LeoAIMemeType.GetMemeType(swFilePath),
-                    children = new List<ChildData>()
-                };
-
-                IEdmReference10 reference = (IEdmReference10)file;
-                if (reference != null)
-                {
-                    assemblyFileData.children = GetReferencedFiles(reference);
-                }
-
-                FilesInfo.Add(assemblyFileData);
-            }
-            catch (Exception ex)
-            {
-                LogFileWriter.LogError($"Error processing assembly file {swFilePath}: {ex.Message}");
-            }
         }
 
         public List<ChildData> GetReferencedFiles(IEdmReference10 Reference, string ProjectName = "")
@@ -163,14 +44,19 @@ namespace LeoAISwPdmAddIn
                 return false;
 
             string extension = Path.GetExtension(filePath).ToLower();
-            return extension == ".sldprt" || 
-                   extension == ".sldasm" || 
-                   extension == ".slddrw" || 
-                   extension == ".step" || 
-                   extension == ".stp" || 
-                   extension == ".txt" || 
-                   extension == ".pdf" || 
-                   extension == ".doc" || 
+            return extension == ".sldprt" ||
+                   extension == ".sldasm" ||
+                   extension == ".step" ||
+                   extension == ".stp" ||
+                   extension == ".prt" ||
+                   extension == ".asm" ||
+                   extension == ".ipt" ||
+                   extension == ".iam" ||
+                   extension == ".x_t" ||
+                   extension == ".xt" ||
+                   extension == ".txt" ||
+                   extension == ".pdf" ||
+                   extension == ".doc" ||
                    extension == ".docx";
         }
 
@@ -208,11 +94,35 @@ namespace LeoAISwPdmAddIn
         {
             try
             {
-            FilesInfo = new List<FileData>();
-            IEdmFolder5 rootFolder = edmVault.RootFolder;
-                ListFoldersAndFiles(rootFolder, edmVault);
-            return true;
-        }
+                FilesInfo = new List<FileData>();
+                IEdmFolder5 rootFolder = edmVault.RootFolder;
+
+                // Step 1: Collect all folders (must be sequential due to COM threading)
+                List<IEdmFolder5> allFolders = new List<IEdmFolder5>();
+                CollectAllFolders(rootFolder, allFolders);
+                LogFileWriter.LogMessage($"Found {allFolders.Count} folders to process");
+
+                // Step 2: Process folders in parallel
+                ConcurrentBag<FileData> concurrentResults = new ConcurrentBag<FileData>();
+
+                Parallel.ForEach(allFolders, folder =>
+                {
+                    try
+                    {
+                        ProcessSingleFolder(folder, edmVault, concurrentResults);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Error processing folder in parallel: {ex.Message}");
+                    }
+                });
+
+                // Convert ConcurrentBag to List
+                FilesInfo = concurrentResults.ToList();
+                LogFileWriter.LogMessage($"Processed {FilesInfo.Count} files from {allFolders.Count} folders");
+
+                return true;
+            }
             catch (Exception ex)
             {
                 LogFileWriter.LogError($"Error processing folders: {ex.Message}");
@@ -220,48 +130,132 @@ namespace LeoAISwPdmAddIn
             }
         }
 
-        private void ListFoldersAndFiles(IEdmFolder5 folder, IEdmVault5 vault)
+        /// <summary>
+        /// Recursively collect all folders (must run on main thread due to COM)
+        /// </summary>
+        private void CollectAllFolders(IEdmFolder5 folder, List<IEdmFolder5> folderList)
         {
             try
             {
-                IEdmPos5 pos = folder.GetFirstFilePosition();
-                while (!pos.IsNull)
+                // Skip LeoAI_TaskData folder (contains auth configuration - should never be synced)
+                string folderPath = folder.LocalPath;
+                if (!string.IsNullOrEmpty(folderPath) && folderPath.Contains("\\LeoAI_TaskData"))
                 {
-                    IEdmFile5 file = folder.GetNextFile(pos);
-                        string filePath = file.GetLocalPath(folder.ID);
+                    LogFileWriter.LogDebug($"Skipping metadata folder: {folderPath}");
+                    return; // Don't add this folder or recurse into it
+                }
 
-                    if (!string.IsNullOrEmpty(filePath) && IsProcessableFile(filePath))
-                    {
-                        var fileData = new FileData
-                        {
-                            file = filePath,
-                            mimeType = LeoAIMemeType.GetMemeType(filePath),
-                            children = new List<ChildData>()
-                        };
-
-                        if (GetDocType(filePath).ToUpper() == "ASSEMBLY")
-                        {
-                            IEdmReference10 reference = (IEdmReference10)file;
-                            if (reference != null)
-                            {
-                                fileData.children = GetReferencedFiles(reference);
-                            }
-                        }
-
-                        FilesInfo.Add(fileData);
-                    }
-                        }
+                folderList.Add(folder);
 
                 IEdmPos5 subFolderPos = folder.GetFirstSubFolderPosition();
                 while (!subFolderPos.IsNull)
                 {
                     IEdmFolder5 subFolder = folder.GetNextSubFolder(subFolderPos);
-                    ListFoldersAndFiles(subFolder, vault);
+                    CollectAllFolders(subFolder, folderList);
                 }
             }
             catch (Exception ex)
             {
-                LogFileWriter.LogError($"Error listing folder contents: {ex.Message}");
+                LogFileWriter.LogError($"Error collecting folders: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Process files in a single folder (thread-safe, can run in parallel)
+        /// </summary>
+        private void ProcessSingleFolder(IEdmFolder5 folder, IEdmVault5 vault, ConcurrentBag<FileData> results)
+        {
+            try
+            {
+                // Step 1: Collect all file references sequentially (COM requirement)
+                List<Tuple<IEdmFile5, string>> filesToProcess = new List<Tuple<IEdmFile5, string>>();
+                int totalFilesInFolder = 0;
+                int nullPathCount = 0;
+                int filteredOutCount = 0;
+
+                // Get folder's vault logical path for constructing file paths
+                string folderPath = folder.LocalPath;
+
+                IEdmPos5 pos = folder.GetFirstFilePosition();
+                while (!pos.IsNull)
+                {
+                    IEdmFile5 file = folder.GetNextFile(pos);
+                    totalFilesInFolder++;
+
+                    // CRITICAL FIX: Construct vault logical path instead of using GetLocalPath()
+                    // GetLocalPath() returns null for files not in local view (most files on task host)
+                    // This was causing 95%+ of files to be skipped!
+                    string filePath = null;
+                    if (!string.IsNullOrEmpty(folderPath) && !string.IsNullOrEmpty(file.Name))
+                    {
+                        filePath = System.IO.Path.Combine(folderPath, file.Name);
+                    }
+
+                    if (string.IsNullOrEmpty(filePath))
+                    {
+                        nullPathCount++;
+                        LogFileWriter.LogWarning($"Skipping file with null path in folder: {folderPath ?? "unknown"}");
+                        continue;
+                    }
+
+                    if (!IsProcessableFile(filePath))
+                    {
+                        filteredOutCount++;
+                        continue;
+                    }
+
+                    filesToProcess.Add(Tuple.Create(file, filePath));
+                }
+
+                // Log enumeration statistics for this folder
+                if (totalFilesInFolder > 0)
+                {
+                    LogFileWriter.LogDebug($"Folder '{folderPath}': {totalFilesInFolder} total files, {nullPathCount} null paths, {filteredOutCount} filtered out, {filesToProcess.Count} to process");
+                }
+
+                // Step 2: Process all files in parallel
+                Parallel.ForEach(filesToProcess, fileInfo =>
+                {
+                    try
+                    {
+                        IEdmFile5 file = fileInfo.Item1;
+                        string filePath = fileInfo.Item2;
+
+                        var fileData = new FileData
+                        {
+                            file = filePath,
+                            mimeType = LeoAIMemeType.GetMemeType(filePath),
+                            checkSum = null,
+                            children = new List<ChildData>()
+                        };
+
+                        if (GetDocType(filePath).ToUpper() == "ASSEMBLY")
+                        {
+                            try
+                            {
+                                IEdmReference10 reference = file as IEdmReference10;
+                                if (reference != null)
+                                {
+                                    fileData.children = GetReferencedFiles(reference);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                LogFileWriter.LogError($"Error getting references for {file.Name}: {ex.Message}");
+                            }
+                        }
+
+                        results.Add(fileData);
+                    }
+                    catch (Exception ex)
+                    {
+                        LogFileWriter.LogError($"Error processing individual file: {ex.Message}");
+                    }
+                });
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Error processing folder files: {ex.Message}");
             }
         }
     }

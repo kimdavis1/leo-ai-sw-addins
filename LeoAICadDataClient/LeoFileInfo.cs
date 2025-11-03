@@ -1,52 +1,50 @@
 ﻿using System;
 using System.IO;
 using System.IO.Hashing;
-using LeoAICadDataClient.Utilities;
 
 namespace LeoAICadDataClient
 {
 	public class LeoFileInfo
 	{
-		// This should match the UNIVERSAL_FILE_HASHING_SEED from your Electron app
-		private const long UNIVERSAL_FILE_HASHING_SEED = 0; // Replace with your actual seed value
-		
-		public static LeoFileInformation GetFileInfo(string filePath)
+		/// <summary>
+		/// Reads file and encodes it to Base64 for upload
+		/// Takes fileID_version as parameter instead of calculating checksum
+		/// </summary>
+		public static LeoFileInformation GetFileForUpload(string filePath, string fileIdVersion)
 		{
-			// Read file as byte array
-			byte[] fileBytes = File.ReadAllBytes(filePath);
+			byte[] fileBytes;
 
-			// Compute xxHash64 checksum with hex output (to match Electron app)
-			string checkSum = ComputeXXHash64Hex(fileBytes);
+			// Read file with FileShare.ReadWrite to allow access even if file is open in SOLIDWORKS
+			using (System.IO.FileStream fs = new System.IO.FileStream(filePath, System.IO.FileMode.Open, System.IO.FileAccess.Read, System.IO.FileShare.ReadWrite))
+			{
+				fileBytes = new byte[fs.Length];
+				int totalRead = 0;
+				while (totalRead < fileBytes.Length)
+				{
+					int bytesRead = fs.Read(fileBytes, totalRead, fileBytes.Length - totalRead);
+					if (bytesRead == 0)
+						throw new System.IO.EndOfStreamException($"Could not read entire file: {filePath}");
+					totalRead += bytesRead;
+				}
+			}
 
 			// Encode file to Base64
 			string base64EncodedFile = Convert.ToBase64String(fileBytes);
 
-			LeoFileInformation info = new LeoFileInformation()
+			return new LeoFileInformation
 			{
-				CheckSum = checkSum,
+				CheckSum = fileIdVersion,  // Use provided FileID_Version identifier
 				Base64EncodedFile = base64EncodedFile
 			};
-		
-			return info;
 		}
 
-		static string ComputeXXHash64Hex(byte[] data)
-		{
-			// Use Microsoft's System.IO.Hashing with xxHash64 and custom seed
-			var xxHash = new XxHash64(UNIVERSAL_FILE_HASHING_SEED);
-			xxHash.Append(data);
-			byte[] hash = xxHash.GetHashAndReset();
-			
-			// Convert 8-byte array to 64-bit number, then to hex (like JavaScript .toString(16))
-			ulong hashValue = BitConverter.ToUInt64(hash, 0);
-			string result = hashValue.ToString("x"); // "x" for lowercase hex, equivalent to .toString(16)
-			
-			return result;
-		}
-
+		/// <summary>
+		/// Data class for file information
+		/// CheckSum field now stores FileID_Version identifier instead of actual checksum
+		/// </summary>
 		public class LeoFileInformation
 		{
-			public string CheckSum { get; set; }
+			public string CheckSum { get; set; }  // Now stores "fileID_version" format
 			public string Base64EncodedFile { get; set; }
 		}
 	}
@@ -75,13 +73,37 @@ namespace LeoAICadDataClient
 						memeType = "model/step";
 						break;
 					}
+				// Creo part files
+				case ".prt":
+					{
+						memeType = "application/x-creo-part";
+						break;
+					}
+				// Creo assembly files
+				case ".asm":
+					{
+						memeType = "application/x-creo-assembly";
+						break;
+					}
+				// Inventor part files
+				case ".ipt":
+					{
+						memeType = "application/vnd.autodesk.inventor.part";
+						break;
+					}
+				// Inventor assembly files
+				case ".iam":
+					{
+						memeType = "application/vnd.autodesk.inventor.assembly";
+						break;
+					}
 				// Parasolid files - MIME type not confirmed by API yet
-				// case ".x_t":
-				// case ".xt":
-				// 	{
-				// 		memeType = "application/x-parasolid";
-				// 		break;
-				// 	}
+				case ".x_t":
+				case ".xt":
+					{
+						memeType = "application/x-parasolid";
+						break;
+					}
 				case ".txt":
 					{
 						memeType = "text/plain";
