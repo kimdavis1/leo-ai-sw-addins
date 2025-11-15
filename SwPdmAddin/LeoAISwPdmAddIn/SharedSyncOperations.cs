@@ -1275,10 +1275,14 @@ namespace LeoAISwPdmAddIn
                                     dependenciesByLevel[level].Add(relativePath);
 
                                     LogFileWriter.LogMessage($"  Dependency (level {level}): {relativePath}");
-                                }
 
-                                // Recursively traverse this child's dependencies
-                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependenciesByLevel, seenFiles);
+                                    // Recursively traverse this child's dependencies (ONLY if not seen before)
+                                    TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependenciesByLevel, seenFiles);
+                                }
+                                else
+                                {
+                                    LogFileWriter.LogDebug($"  Skipping already seen file (circular reference) at level {level}: {relativePath}");
+                                }
                             }
                             else
                             {
@@ -1315,10 +1319,14 @@ namespace LeoAISwPdmAddIn
                                     dependenciesByLevel[level].Add(relativePath);
 
                                     LogFileWriter.LogMessage($"  Dependency (level {level}): {relativePath}");
-                                }
 
-                                // Recursively traverse this child's dependencies
-                                TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependenciesByLevel, seenFiles);
+                                    // Recursively traverse this child's dependencies (ONLY if not seen before)
+                                    TraverseReferences(vault, childRef, projectName, level + 1, false, vaultRootPath, dependenciesByLevel, seenFiles);
+                                }
+                                else
+                                {
+                                    LogFileWriter.LogDebug($"  Skipping already seen file (circular reference) at level {level}: {relativePath}");
+                                }
                             }
                             else
                             {
