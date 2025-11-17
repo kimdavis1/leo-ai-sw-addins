@@ -67,10 +67,13 @@
       <SpecificVersion>False</SpecificVersion>
       <HintPath>$(UserProfile)\.nuget\packages\newtonsoft.json\13.0.3\lib\net45\Newtonsoft.Json.dll</HintPath>
     </Reference>
-    <Reference Include="Sentry, Version=5.16.1.0, Culture=neutral, PublicKeyToken=fba2a98e6ccde974, processorArchitecture=MSIL">
-      <HintPath>$(UserProfile)\.nuget\packages\sentry\5.16.1\lib\net48\Sentry.dll</HintPath>
+    <Reference Include="Sentry, Version=5.16.1.0, Culture=neutral, PublicKeyToken=fba2ec45388e2af0, processorArchitecture=MSIL">
+      <HintPath>$(UserProfile)\.nuget\packages\sentry\5.16.1\lib\net462\Sentry.dll</HintPath>
     </Reference>
     <Reference Include="System" />
+    <Reference Include="System.IO.Hashing, Version=8.0.0.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
+      <HintPath>$(UserProfile)\.nuget\packages\system.io.hashing\8.0.0\lib\net462\System.IO.Hashing.dll</HintPath>
+    </Reference>
     <Reference Include="System.Buffers, Version=4.0.3.0, Culture=neutral, PublicKeyToken=cc7b13ffcd2ddd51, processorArchitecture=MSIL">
       <HintPath>$(UserProfile)\.nuget\packages\system.buffers\4.5.1\lib\net461\System.Buffers.dll</HintPath>
     </Reference>
@@ -145,13 +148,6 @@
     <Error Condition="!Exists('$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets')" Text="$([System.String]::Format('$(ErrorText)', '$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets'))" />
   </Target>
   <Import Project="$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets" Condition="Exists('$(UserProfile)\.nuget\packages\costura.fody\6.0.0\build\Costura.Fody.targets')" />
-  <ItemGroup>
-    <PackageReference Include="Flurl.Http" Version="4.0.2" />
-    <PackageReference Include="Sentry">
-      <Version>5.16.1</Version>
-    </PackageReference>
-    <PackageReference Include="System.IO.Hashing" Version="8.0.0" />
-  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\PdmToLeo.Data\PdmToLeo.Data.csproj">
       <Project>{09E2393B-11F8-41E8-9E28-1B1C8A8C35A6}</Project>

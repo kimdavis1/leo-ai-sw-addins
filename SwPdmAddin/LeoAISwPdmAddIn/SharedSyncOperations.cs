@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -367,8 +368,12 @@ namespace LeoAISwPdmAddIn
             Dictionary<string, string> moveMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             moveMap[newRelativePath] = oldRelativePath;
 
-            // Create processedFiles set for this operation
-            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Create processedFiles set for this operation (thread-safe)
+            ConcurrentDictionary<string, byte> processedFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            // Create processing set for circular dependency detection (thread-safe)
+            ConcurrentDictionary<string, byte> processingFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            // Create dependency cache to avoid redundant PDM API calls (thread-safe)
+            ConcurrentDictionary<string, Dictionary<int, List<string>>> dependencyCache = new ConcurrentDictionary<string, Dictionary<int, List<string>>>(StringComparer.OrdinalIgnoreCase);
 
             // Step 1: Upload file with new path
             if (FileExistsInVault(vault, newFullPath))
@@ -376,7 +381,7 @@ namespace LeoAISwPdmAddIn
                 LogFileWriter.LogMessage($"Uploading file with new path using move context: {newRelativePath}");
 
                 // Use UploadFileWithDependencies with moveMap to handle dependencies
-                await UploadFileWithDependencies(vault, newFullPath, vault.RootFolderPath, processedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
+                await UploadFileWithDependencies(vault, newFullPath, vault.RootFolderPath, processedFiles, processingFiles, dependencyCache, moveMap, leoClient, directoryId, tryArchiveFirst);
 
                 LogFileWriter.LogMessage($"Upload completed: {newRelativePath}");
             }
@@ -577,7 +582,11 @@ namespace LeoAISwPdmAddIn
 
             // IMPORTANT: Share processedFiles across all files in this folder move
             // This prevents re-processing dependencies that were already handled
-            HashSet<string> processedFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            ConcurrentDictionary<string, byte> processedFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            // Create processing set for circular dependency detection (thread-safe)
+            ConcurrentDictionary<string, byte> processingFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            // Create dependency cache to avoid redundant PDM API calls (thread-safe)
+            ConcurrentDictionary<string, Dictionary<int, List<string>>> dependencyCache = new ConcurrentDictionary<string, Dictionary<int, List<string>>>(StringComparer.OrdinalIgnoreCase);
 
             // Process each file: upload new path, delete old path
             int processed = 0;
@@ -595,7 +604,7 @@ namespace LeoAISwPdmAddIn
 
                     // Upload file with new path using move context
                     // Pass move map and shared processedFiles so dependencies can be identified and tracked
-                    await UploadFileWithDependencies(vault, newFilePath, vault.RootFolderPath, processedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
+                    await UploadFileWithDependencies(vault, newFilePath, vault.RootFolderPath, processedFiles, processingFiles, dependencyCache, moveMap, leoClient, directoryId, tryArchiveFirst);
                     LogFileWriter.LogMessage($"Uploaded file to new location: {newRelativePath}");
 
                     // Delete old path
@@ -1165,7 +1174,15 @@ namespace LeoAISwPdmAddIn
             if (string.IsNullOrEmpty(filePath))
                 return false;
 
+            string fileName = Path.GetFileName(filePath);
             string ext = Path.GetExtension(filePath).ToUpper();
+
+            // Skip SolidWorks lock files (temporary files that start with ~$)
+            if (fileName.StartsWith("~$") && (ext == ".SLDPRT" || ext == ".SLDASM"))
+            {
+                return false;
+            }
+
             return ext == ".SLDPRT" ||
                    ext == ".SLDASM" ||
                    ext == ".STEP" ||
@@ -1421,16 +1438,27 @@ namespace LeoAISwPdmAddIn
 
             // Track uploaded files to avoid re-uploading dependencies multiple times
             // Start with files that are already on server (from initial sync comparison)
-            HashSet<string> uploadedFiles = alreadyOnServer != null
-                ? new HashSet<string>(alreadyOnServer, StringComparer.OrdinalIgnoreCase)
-                : new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Use thread-safe ConcurrentDictionary for parallel uploads
+            ConcurrentDictionary<string, byte> uploadedFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            if (alreadyOnServer != null)
+            {
+                foreach (var path in alreadyOnServer)
+                {
+                    uploadedFiles.TryAdd(path, 0);
+                }
+            }
+
+            // Create processing set for circular dependency detection (thread-safe)
+            ConcurrentDictionary<string, byte> processingFiles = new ConcurrentDictionary<string, byte>(StringComparer.OrdinalIgnoreCase);
+            // Create dependency cache to avoid redundant PDM API calls (thread-safe)
+            ConcurrentDictionary<string, Dictionary<int, List<string>>> dependencyCache = new ConcurrentDictionary<string, Dictionary<int, List<string>>>(StringComparer.OrdinalIgnoreCase);
 
             // Upload each file with its dependencies (dependencies uploaded first, recursively)
             foreach (string filePath in filePaths)
             {
                 try
                 {
-                    await UploadFileWithDependencies(vault, filePath, vaultRootPath, uploadedFiles, null, leoClient, directoryId, tryArchiveFirst);
+                    await UploadFileWithDependencies(vault, filePath, vaultRootPath, uploadedFiles, processingFiles, dependencyCache, null, leoClient, directoryId, tryArchiveFirst);
                 }
                 catch (Exception ex)
                 {
@@ -1453,26 +1481,48 @@ namespace LeoAISwPdmAddIn
         /// Recursively uploads a file and all its dependencies
         /// Dependencies are uploaded first before the file that depends on them
         /// Uses uploadedFiles set to track what's been uploaded and avoid duplicates
+        /// Uses processingFiles set to prevent circular dependency loops
+        /// Uses dependencyCache to avoid redundant PDM API calls
         /// moveMap (optional): new relative path -> old relative path for files being moved/renamed
         /// </summary>
-        private static async Task UploadFileWithDependencies(IEdmVault11 vault, string filePath, string vaultRootPath, HashSet<string> uploadedFiles, Dictionary<string, string> moveMap, SecureApiClient leoClient, string directoryId, bool tryArchiveFirst)
+        private static async Task UploadFileWithDependencies(IEdmVault11 vault, string filePath, string vaultRootPath, ConcurrentDictionary<string, byte> uploadedFiles, ConcurrentDictionary<string, byte> processingFiles, ConcurrentDictionary<string, Dictionary<int, List<string>>> dependencyCache, Dictionary<string, string> moveMap, SecureApiClient leoClient, string directoryId, bool tryArchiveFirst)
         {
             string relativePath = GetRelativePath(vaultRootPath, filePath);
 
             // Check if already uploaded - if so, skip everything (no need to process dependencies or upload)
-            if (uploadedFiles.Contains(relativePath))
+            if (uploadedFiles.ContainsKey(relativePath))
             {
                 LogFileWriter.LogMessage($"File already uploaded, skipping: {relativePath}");
                 return;
             }
 
-            LogFileWriter.LogMessage($"=== Processing file: {relativePath} ===");
+            // Check if this file is currently being processed (circular dependency prevention)
+            // TryAdd returns false if key already exists - this is an atomic check-and-add operation
+            if (!processingFiles.TryAdd(relativePath, 0))
+            {
+                LogFileWriter.LogWarning($"Circular dependency detected, skipping: {relativePath}");
+                return;
+            }
 
-            // Get dependencies for this file organized by level (depth in dependency tree)
-            Dictionary<int, List<string>> dependenciesByLevel = GetFileDependencies(vault, filePath, vaultRootPath);
+            try
+            {
+                LogFileWriter.LogMessage($"=== Processing file: {relativePath} ===");
 
-            // If file has dependencies, upload them first (level by level, deepest first)
-            int totalDependencies = dependenciesByLevel.Values.Sum(list => list.Count);
+                // Get dependencies for this file organized by level (depth in dependency tree)
+                // Use cache if available to avoid redundant PDM API calls
+                // GetOrAdd is atomic - only one thread will call GetFileDependencies for a given key
+                Dictionary<int, List<string>> dependenciesByLevel = dependencyCache.GetOrAdd(
+                    relativePath,
+                    key => GetFileDependencies(vault, filePath, vaultRootPath)
+                );
+
+                if (dependencyCache.ContainsKey(relativePath))
+                {
+                    LogFileWriter.LogMessage($"Using cached/computed dependencies for: {relativePath}");
+                }
+
+                // If file has dependencies, upload them first (level by level, deepest first)
+                int totalDependencies = dependenciesByLevel.Values.Sum(list => list.Count);
             if (totalDependencies > 0)
             {
                 LogFileWriter.LogMessage($"File has {totalDependencies} dependencies across {dependenciesByLevel.Count} levels - uploading dependencies level-by-level (deepest first)");
@@ -1491,8 +1541,15 @@ namespace LeoAISwPdmAddIn
 
                     foreach (var depRelativePath in filesAtLevel)
                     {
+                        // Skip self-reference (file depends on itself - corrupted PDM data)
+                        if (depRelativePath.Equals(relativePath, StringComparison.OrdinalIgnoreCase))
+                        {
+                            LogFileWriter.LogWarning($"  [Level {level}] Skipping self-referencing dependency: {depRelativePath}");
+                            continue;
+                        }
+
                         // Skip if already uploaded
-                        if (uploadedFiles.Contains(depRelativePath))
+                        if (uploadedFiles.ContainsKey(depRelativePath))
                         {
                             LogFileWriter.LogMessage($"  [Level {level}] Dependency already uploaded, skipping: {depRelativePath}");
                             continue;
@@ -1516,7 +1573,7 @@ namespace LeoAISwPdmAddIn
                             try
                             {
                                 // Recursively process this dependency (will check checksum and choose upload method)
-                                await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, moveMap, leoClient, directoryId, tryArchiveFirst);
+                                await UploadFileWithDependencies(vault, depFullPath, vaultRootPath, uploadedFiles, processingFiles, dependencyCache, moveMap, leoClient, directoryId, tryArchiveFirst);
                             }
                             catch (Exception ex)
                             {
@@ -1547,7 +1604,7 @@ namespace LeoAISwPdmAddIn
             foreach (var depRelativePath in allDependencyPaths)
             {
                 // Only include dependencies that were successfully uploaded
-                if (uploadedFiles.Contains(depRelativePath))
+                if (uploadedFiles.ContainsKey(depRelativePath))
                 {
                     try
                     {
@@ -1607,7 +1664,7 @@ namespace LeoAISwPdmAddIn
                 if (updateResult != null)
                 {
                     // Success - file location updated
-                    uploadedFiles.Add(relativePath);
+                    uploadedFiles.TryAdd(relativePath, 0);
                     LogFileWriter.LogMessage($"File location updated successfully: {relativePath}");
                 }
                 else
@@ -1660,7 +1717,7 @@ namespace LeoAISwPdmAddIn
 
                             if (uploadSuccess)
                             {
-                                uploadedFiles.Add(relativePath);
+                                uploadedFiles.TryAdd(relativePath, 0);
                                 LogFileWriter.LogMessage($"File uploaded to NEW path: {relativePath}");
                             }
                             else
@@ -1676,7 +1733,7 @@ namespace LeoAISwPdmAddIn
 
                             if (uploadSuccess)
                             {
-                                uploadedFiles.Add(relativePath);
+                                uploadedFiles.TryAdd(relativePath, 0);
                                 LogFileWriter.LogMessage($"File uploaded to NEW path: {relativePath}");
                             }
                             else
@@ -1711,13 +1768,20 @@ namespace LeoAISwPdmAddIn
                 // Mark as uploaded (even if skipped, because it exists on server)
                 if (uploadSuccess)
                 {
-                    uploadedFiles.Add(relativePath);
+                    uploadedFiles.TryAdd(relativePath, 0);
                     LogFileWriter.LogMessage($"File upload completed (or skipped if unchanged): {relativePath}");
                 }
                 else
                 {
                     LogFileWriter.LogError($"File upload failed: {relativePath}");
                 }
+            }
+            }
+            finally
+            {
+                // Remove from processing set when done (successful or not)
+                byte removedValue;
+                processingFiles.TryRemove(relativePath, out removedValue);
             }
         }
 
