@@ -19,11 +19,23 @@ namespace LeoAICadDataClient
 
         /// <summary>
         /// Initialize Sentry for API client. Called from SecureApiClient constructor.
+        /// Can be disabled by setting environment variable: DISABLE_SENTRY=true
         /// </summary>
         public static void Initialize(string environment = "Production")
         {
             if (_isInitialized)
             {
+                return;
+            }
+
+            // Check if Sentry is disabled (for testing)
+            string disableSentry = Environment.GetEnvironmentVariable("DISABLE_SENTRY");
+            if (!string.IsNullOrEmpty(disableSentry) &&
+                (disableSentry.Equals("true", StringComparison.OrdinalIgnoreCase) ||
+                 disableSentry.Equals("1", StringComparison.OrdinalIgnoreCase)))
+            {
+                _isInitialized = true; // Mark as initialized so we don't try again
+                Logger.Info("Sentry disabled via DISABLE_SENTRY environment variable");
                 return;
             }
 
@@ -72,7 +84,18 @@ namespace LeoAICadDataClient
                 SentrySdk.CaptureException(exception);
 
                 // Flush immediately to ensure event is sent (API calls are often short-lived)
-                SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait();
+                // Add timeout protection to prevent infinite hangs
+                try
+                {
+                    if (!SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        Logger.Warning("Sentry flush timed out after 5 seconds");
+                    }
+                }
+                catch (Exception flushEx)
+                {
+                    Logger.Error($"Sentry flush failed: {flushEx.Message}");
+                }
 
                 string contextInfo = context != null && context.Count > 0
                     ? $" (Context: {string.Join(", ", context.Keys)})"
@@ -124,7 +147,18 @@ namespace LeoAICadDataClient
                 SentrySdk.CaptureMessage(message, SentryLevel.Error);
 
                 // Flush immediately to ensure event is sent (API calls are often short-lived)
-                SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait();
+                // Add timeout protection to prevent infinite hangs
+                try
+                {
+                    if (!SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        Logger.Warning("Sentry flush timed out after 5 seconds");
+                    }
+                }
+                catch (Exception flushEx)
+                {
+                    Logger.Error($"Sentry flush failed: {flushEx.Message}");
+                }
 
                 Logger.Info($"API error captured by Sentry: {message}");
             }

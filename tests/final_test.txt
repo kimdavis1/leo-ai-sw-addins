@@ -1,0 +1,54 @@
+WARNING: The names of some imported commands from the module 'TestHelpers' include unapproved verbs that might make 
+them less discoverable. To find the commands with unapproved verbs, run the Import-Module command again with the 
+Verbose parameter. For a list of approved verbs, type Get-Verb.
+[2025-11-18 18:35:24] [INFO] === Leo AI PDM Add-in E2E Test Suite ===
+[2025-11-18 18:35:24] [INFO] Configuration: C:\Code\leo-ai-sw-addins\tests\config.json
+[2025-11-18 18:35:24] [INFO] Log file: C:\Code\leo-ai-sw-addins\tests\results\TestRun_20251118_183524.log
+[2025-11-18 18:35:24] [INFO] 
+[2025-11-18 18:35:24] [INFO] Loaded PDM interop
+[2025-11-18 18:35:24] [SUCCESS] Connected to vault: moti-test-pro
+[2025-11-18 18:35:24] [INFO] Cleaning test environment...
+[2025-11-18 18:35:24] [SUCCESS] Cleaned local test files
+[2025-11-18 18:35:24] [INFO] Creating folder: \E2E_Tests
+[2025-11-18 18:35:25] [SUCCESS] Test folder created: \E2E_Tests
+[2025-11-18 18:35:25] [INFO] 
+[2025-11-18 18:35:25] [INFO] 
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [INFO] TEST 1: Add SLDPRT file to subfolder
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [INFO] Creating folder: \E2E_Tests\Parts
+[2025-11-18 18:35:25] [INFO] Adding file: Part4.SLDPRT
+[2025-11-18 18:35:25] [ERROR] Failed to add file: An attempt was made to create a new file or folder with the same name as an existing one.
+[2025-11-18 18:35:25] [TESTFAIL] TEST FAILED: Add SLDPRT file to subfolder
+[2025-11-18 18:35:25] [INFO] Duration: 0.37 seconds
+[2025-11-18 18:35:25] [INFO] 
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [INFO] TEST 2: Add folder with multiple files
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [INFO] Creating folder: \E2E_Tests\BulkTest
+[2025-11-18 18:35:25] [INFO] Adding file: bulk_test_1.pdf
+[2025-11-18 18:35:25] [ERROR] Failed to add file: An attempt was made to create a new file or folder with the same name as an existing one.
+[2025-11-18 18:35:25] [INFO] Adding file: bulk_test_2.pdf
+[2025-11-18 18:35:25] [ERROR] Failed to add file: An attempt was made to create a new file or folder with the same name as an existing one.
+[2025-11-18 18:35:25] [INFO] Adding file: bulk_test_3.pdf
+[2025-11-18 18:35:25] [ERROR] Failed to add file: An attempt was made to create a new file or folder with the same name as an existing one.
+[2025-11-18 18:35:25] [TESTFAIL] TEST FAILED: Add folder with multiple files
+[2025-11-18 18:35:25] [INFO] Duration: 0.27 seconds
+[2025-11-18 18:35:25] [INFO] 
+[2025-11-18 18:35:25] [INFO] Cleaning up test folder...
+[2025-11-18 18:35:25] [SUCCESS] Local test files cleaned
+[2025-11-18 18:35:25] [INFO] 
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [INFO] TEST SUMMARY
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [INFO] Total Tests: 2
+[2025-11-18 18:35:25] [SUCCESS] Passed: 0
+[2025-11-18 18:35:25] [ERROR] Failed: 2
+[2025-11-18 18:35:25] [WARN] Skipped: 0
+[2025-11-18 18:35:25] [INFO] 
+[2025-11-18 18:35:25] [INFO] Log file: C:\Code\leo-ai-sw-addins\tests\results\TestRun_20251118_183524.log
+[2025-11-18 18:35:25] [INFO] ========================================
+[2025-11-18 18:35:25] [TESTFAIL] FAILED: Add SLDPRT file to subfolder (0.37s)
+[2025-11-18 18:35:25] [ERROR]   Test returned false
+[2025-11-18 18:35:25] [TESTFAIL] FAILED: Add folder with multiple files (0.27s)
+[2025-11-18 18:35:25] [ERROR]   Test returned false

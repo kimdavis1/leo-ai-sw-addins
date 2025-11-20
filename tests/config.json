@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy this file to config.json and fill in your actual values",
+  "vaultName": "moti-test-pro",
+  "vaultRootPath": "C:\\moti-test-pro",
+  "testRootFolder": "\\E2E_Tests",
+  "apiKeyJsonPath": "C:\\Users\\Moti\\Downloads\\Leo AI-8-key.json",
+  "timeoutMinutes": 5,
+  "pollIntervalSeconds": 10,
+  "cleanupAfterTests": true,
+  "testFileTypes": {
+    "sldprt": true,
+    "sldasm": true,
+    "pdf": true
+  },
+  "testOperations": {
+    "fileAdd": true,
+    "fileModify": false,
+    "fileRename": false,
+    "fileMove": false,
+    "fileDelete": false,
+    "folderAdd": true,
+    "folderRename": false,
+    "folderMove": false,
+    "folderDelete": false
+  }
+}

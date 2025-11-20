@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32;
 using LeoAISwPdmAddIn.ErrorTracking;
@@ -22,7 +23,7 @@ namespace LeoAISwPdmAddIn
         private string _directoryId;
         private bool _isClientInitialized = false;
         private bool _isSentryInitialized = false;
-        private readonly object _initLock = new object();
+        private readonly SemaphoreSlim _initSemaphore = new SemaphoreSlim(1, 1);
         public void GetAddInInfo(ref EdmAddInInfo poInfo, IEdmVault5 poVault, IEdmCmdMgr5 poCmdMgr)
         {
             try
@@ -839,85 +840,98 @@ namespace LeoAISwPdmAddIn
         /// <summary>
         /// Ensures Leo AI client is initialized for client-side event processing
         /// </summary>
-        private void EnsureClientInitialized(IEdmVault5 vault)
+        private async Task EnsureClientInitializedAsync(IEdmVault5 vault)
         {
             if (_isClientInitialized) return;
 
-            lock (_initLock)
+            // Use SemaphoreSlim with timeout for async-compatible synchronization
+            if (!await _initSemaphore.WaitAsync(TimeSpan.FromSeconds(10)))
             {
+                throw new TimeoutException("Could not acquire initialization lock within 10 seconds");
+            }
+
+            try
+            {
+                // Double-check after acquiring semaphore
                 if (_isClientInitialized) return;
 
-                try
+                LogFileWriter.LogMessage("Initializing Leo AI client on client side...");
+
+                string vaultConfigPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
+
+                // Use PDM API to get local copy if file exists in vault
+                IEdmFolder5 configFolder;
+                IEdmFile5 configFile = vault.GetFileFromPath(vaultConfigPath, out configFolder);
+
+                if (configFile != null && configFolder != null)
                 {
-                    LogFileWriter.LogMessage("Initializing Leo AI client on client side...");
+                    LogFileWriter.LogMessage($"Auth key file found in vault - getting local copy: {vaultConfigPath}");
 
-                    string vaultConfigPath = Path.Combine(vault.RootFolderPath, "LeoAI_TaskData", "LeoAuthKey.txt");
-
-                    // Use PDM API to get local copy if file exists in vault
-                    IEdmFolder5 configFolder;
-                    IEdmFile5 configFile = vault.GetFileFromPath(vaultConfigPath, out configFolder);
-
-                    if (configFile != null && configFolder != null)
+                    // Get local copy to ensure file is synced to this machine
+                    try
                     {
-                        LogFileWriter.LogMessage($"Auth key file found in vault - getting local copy: {vaultConfigPath}");
+                        // GetFileCopy signature: GetFileCopy(int hwnd, ref object version, ref object pathOrFolderID, int flags, string newName)
+                        // Folder paths must be terminated by a backslash (per PDM API documentation)
+                        string destFolder = Path.GetDirectoryName(vaultConfigPath);
+                        LogFileWriter.LogMessage($"Auth key GetFileCopy - vaultConfigPath: '{vaultConfigPath}'");
+                        LogFileWriter.LogMessage($"Auth key GetFileCopy - destFolder: '{destFolder}'");
 
-                        // Get local copy to ensure file is synced to this machine
-                        try
-                        {
-                            // GetFileCopy signature: GetFileCopy(int hwnd, ref object version, ref object pathOrFolderID, int flags, string newName)
-                            // Folder paths must be terminated by a backslash (per PDM API documentation)
-                            string destFolder = Path.GetDirectoryName(vaultConfigPath);
-                            LogFileWriter.LogMessage($"Auth key GetFileCopy - vaultConfigPath: '{vaultConfigPath}'");
-                            LogFileWriter.LogMessage($"Auth key GetFileCopy - destFolder: '{destFolder}'");
+                        string folderPathWithBackslash = destFolder.TrimEnd('\\') + "\\";
+                        LogFileWriter.LogMessage($"Auth key GetFileCopy - calling with folder path: '{folderPathWithBackslash}'");
 
-                            string folderPathWithBackslash = destFolder.TrimEnd('\\') + "\\";
-                            LogFileWriter.LogMessage($"Auth key GetFileCopy - calling with folder path: '{folderPathWithBackslash}'");
-
-                            // Parameters: version (0 for latest), path or folder ID (path with backslash), flags, new name (empty)
-                            object version = 0;
-                            object folderPath = folderPathWithBackslash;
-                            configFile.GetFileCopy(0, ref version, ref folderPath, (int)EdmGetFlag.EdmGet_Simple, "");
-                            LogFileWriter.LogMessage("Auth key file retrieved successfully");
-                        }
-                        catch (Exception getEx)
-                        {
-                            LogFileWriter.LogWarning($"Failed to get local copy of auth key (might already be local): {getEx.Message}");
-                        }
+                        // Parameters: version (0 for latest), path or folder ID (path with backslash), flags, new name (empty)
+                        object version = 0;
+                        object folderPath = folderPathWithBackslash;
+                        configFile.GetFileCopy(0, ref version, ref folderPath, (int)EdmGetFlag.EdmGet_Simple, "");
+                        LogFileWriter.LogMessage("Auth key file retrieved successfully");
                     }
-                    else
+                    catch (Exception getEx)
                     {
-                        LogFileWriter.LogWarning("Auth key file not found in vault - will try fallback locations");
-                    }
-
-                    // Create client from vault config (will fall back to installation folder if not in vault)
-                    _leoClient = LeoAICadDataClient.SecureApiClient.CreateFromStandardLocations(vaultConfigPath);
-
-                    // Get/create directory
-                    string directoryPath = $"swpdm/{vault.Name}";
-                    _directoryId = SharedSyncOperations.GetOrCreateDirectoryId(_leoClient, directoryPath).Result;
-
-                    _isClientInitialized = true;
-                    LogFileWriter.LogMessage($"Client initialized successfully - DirectoryId: {_directoryId}");
-
-                    // Initialize Sentry error tracking
-                    if (!_isSentryInitialized)
-                    {
-                        SentryErrorHandler.Initialize(vault.Name, "Production");
-                        SentryErrorHandler.SetUser(System.Environment.UserName, vault.Name);
-                        _isSentryInitialized = true;
+                        LogFileWriter.LogWarning($"Failed to get local copy of auth key (might already be local): {getEx.Message}");
                     }
                 }
-                catch (Exception ex)
+                else
                 {
-                    LogFileWriter.LogError($"Failed to initialize Leo AI client: {ex.Message}");
-                    // Capture to Sentry if available
-                    SentryErrorHandler.CaptureException(ex, new Dictionary<string, string>
-                    {
-                        { "operation", "client_initialization" },
-                        { "vault", vault.Name }
-                    });
-                    // Don't throw - allow PDM to continue, just log the error
+                    LogFileWriter.LogWarning("Auth key file not found in vault - will try fallback locations");
                 }
+
+                // Create client from vault config (will fall back to installation folder if not in vault)
+                _leoClient = LeoAICadDataClient.SecureApiClient.CreateFromStandardLocations(vaultConfigPath);
+
+                // Get/create directory with 2-minute timeout
+                string directoryPath = $"swpdm/{vault.Name}";
+                var directoryTask = SharedSyncOperations.GetOrCreateDirectoryId(_leoClient, directoryPath);
+                if (!directoryTask.Wait(TimeSpan.FromMinutes(2)))
+                {
+                    throw new TimeoutException("Get/create directory operation timed out after 2 minutes");
+                }
+                _directoryId = directoryTask.Result;
+
+                _isClientInitialized = true;
+                LogFileWriter.LogMessage($"Client initialized successfully - DirectoryId: {_directoryId}");
+
+                // Initialize Sentry error tracking
+                if (!_isSentryInitialized)
+                {
+                    SentryErrorHandler.Initialize(vault.Name, "Production");
+                    SentryErrorHandler.SetUser(System.Environment.UserName, vault.Name);
+                    _isSentryInitialized = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                LogFileWriter.LogError($"Failed to initialize Leo AI client: {ex.Message}");
+                // Capture to Sentry if available
+                SentryErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                {
+                    { "operation", "client_initialization" },
+                    { "vault", vault.Name }
+                });
+                // Don't throw - allow PDM to continue, just log the error
+            }
+            finally
+            {
+                _initSemaphore.Release();
             }
         }
 
@@ -952,7 +966,7 @@ namespace LeoAISwPdmAddIn
                         try
                         {
                             // Ensure client is initialized on thread pool thread (not PDM STA thread)
-                            EnsureClientInitialized(vault);
+                            await EnsureClientInitializedAsync(vault);
 
                             if (!_isClientInitialized)
                             {
@@ -1106,7 +1120,7 @@ namespace LeoAISwPdmAddIn
                 IEdmVault11 vault11 = (IEdmVault11)vault;
                 string operationJson = Newtonsoft.Json.JsonConvert.SerializeObject(operation);
 
-                SharedSyncOperations.OnOperationRun(vault11, operationJson, _leoClient, _directoryId);
+                await SharedSyncOperations.OnOperationRunAsync(vault11, operationJson, _leoClient, _directoryId);
 
                 LogFileWriter.LogMessage($"[CLIENT] Operation completed: {operation.Operation}");
             }

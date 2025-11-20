@@ -100,7 +100,18 @@ namespace LeoAISwPdmAddIn.ErrorTracking
                 SentrySdk.CaptureException(exception);
 
                 // Flush immediately to ensure event is sent (PDM events are short-lived)
-                SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait();
+                // Add timeout protection to prevent infinite hangs
+                try
+                {
+                    if (!SentrySdk.FlushAsync(TimeSpan.FromSeconds(2)).Wait(TimeSpan.FromSeconds(5)))
+                    {
+                        LogFileWriter.LogWarning("Sentry flush timed out after 5 seconds");
+                    }
+                }
+                catch (Exception flushEx)
+                {
+                    LogFileWriter.LogError($"Sentry flush failed: {flushEx.Message}");
+                }
 
                 // Also log locally for redundancy
                 string contextInfo = context != null && context.Count > 0

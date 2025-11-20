@@ -1,0 +1,26 @@
+{
+  "_comment": "Copy this file to config.json and fill in your actual values",
+  "vaultName": "your_vault_name",
+  "vaultRootPath": "C:\\path\\to\\vault\\root",
+  "testRootFolder": "\\E2E_Tests",
+  "apiKeyJsonPath": "C:\\path\\to\\your\\api-key.json",
+  "timeoutMinutes": 5,
+  "pollIntervalSeconds": 10,
+  "cleanupAfterTests": true,
+  "testFileTypes": {
+    "sldprt": true,
+    "sldasm": true,
+    "pdf": true
+  },
+  "testOperations": {
+    "fileAdd": true,
+    "fileModify": true,
+    "fileRename": true,
+    "fileMove": true,
+    "fileDelete": true,
+    "folderAdd": true,
+    "folderRename": true,
+    "folderMove": true,
+    "folderDelete": true
+  }
+}

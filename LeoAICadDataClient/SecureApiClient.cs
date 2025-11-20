@@ -8,6 +8,7 @@ namespace LeoAICadDataClient
     using System.Net.Http;
     using System.Net.Http.Headers;
     using System.Text;
+    using System.Threading;
     using System.Threading.Tasks;
     using LeoAICadDataClient.Utilities;
     using Newtonsoft.Json;
@@ -19,6 +20,7 @@ namespace LeoAICadDataClient
         private readonly string _apiKey;
         private readonly string _projectId;
         private string _jwtToken;
+        private readonly SemaphoreSlim _tokenRefreshLock = new SemaphoreSlim(1, 1);
         private const int MaxRetries = 5;
         private const int InitialRetryDelayMs = 1000;
 
@@ -233,8 +235,11 @@ namespace LeoAICadDataClient
 
         private async Task RefreshTokenIfRequiredAsync()
         {
+            // Prevent concurrent token refreshes - only one thread should refresh at a time
+            await _tokenRefreshLock.WaitAsync().ConfigureAwait(false);
             try
             {
+                // Double-check token validity after acquiring lock (another thread may have already refreshed)
                 bool isTokenValid = JwtAuthHelper.ValidateJwtToken(_jwtToken, _apiKey, _projectId);
                 if (!isTokenValid)
                 {
@@ -265,6 +270,10 @@ namespace LeoAICadDataClient
             catch (Exception ex)
             {
                 Logger.Error($"Error refreshing token: {ex.Message}");
+            }
+            finally
+            {
+                _tokenRefreshLock.Release();
             }
         }
 
@@ -405,7 +414,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"CreateFile({Path.GetFileName(logicalFilePath)})");
+            }, $"CreateFile({Path.GetFileName(logicalFilePath)})").ConfigureAwait(false);
         }
 
         public static string GetRelativePath(string rootPath, string targetPath)
@@ -495,7 +504,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"CreateDirectory({machineId})");
+            }, $"CreateDirectory({machineId})").ConfigureAwait(false);
         }
 
         public async Task<List<LeoDirectoryInfo>> GetDirectoryInfoAsync(string machineId)
@@ -545,7 +554,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"GetDirectoryInfo({machineId})");
+            }, $"GetDirectoryInfo({machineId})").ConfigureAwait(false);
         }
 
         public async Task<LeoAICadDataClient.Utilities.FileInfo> GetFileInfoByPathAsync(string directoryId, string relativePath)
@@ -658,7 +667,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"GetSyncMetadataPaged({directoryId}, page={page}, limit={limit})");
+            }, $"GetSyncMetadataPaged({directoryId}, page={page}, limit={limit})").ConfigureAwait(false);
         }
 
         /// <summary>
@@ -765,7 +774,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"GetSyncMetadata({directoryId}, {filepathInDirectory ?? "all"})");
+            }, $"GetSyncMetadata({directoryId}, {filepathInDirectory ?? "all"})").ConfigureAwait(false);
         }
 
         public async Task<bool> DeleteFileAsync(string directoryId, string filePathInDirectory)
@@ -826,7 +835,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"DeleteFile({filePathInDirectory})");
+            }, $"DeleteFile({filePathInDirectory})").ConfigureAwait(false);
         }
 
         /// <summary>
@@ -932,7 +941,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"UpdateFileLocation({Path.GetFileName(filePath)})");
+            }, $"UpdateFileLocation({Path.GetFileName(filePath)})").ConfigureAwait(false);
         }
 
         public async Task<bool> DeleteDirectoryAsync(string directoryId)
@@ -984,7 +993,7 @@ namespace LeoAICadDataClient
 
                     throw;
                 }
-            }, $"DeleteDirectory({directoryId})");
+            }, $"DeleteDirectory({directoryId})").ConfigureAwait(false);
         }
     }
 

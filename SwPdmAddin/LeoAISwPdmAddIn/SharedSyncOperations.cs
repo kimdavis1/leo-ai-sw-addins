@@ -43,7 +43,7 @@ namespace LeoAISwPdmAddIn
     /// </summary>
     public static class SharedSyncOperations
     {
-        public static void OnOperationRun(IEdmVault11 vault, string operationJson, SecureApiClient leoClient, string directoryId)
+        public static async Task OnOperationRunAsync(IEdmVault11 vault, string operationJson, SecureApiClient leoClient, string directoryId)
         {
             LogFileWriter.LogMessage("=== OnOperationRun: Starting sync operation (EVENT MODE - local-first) ===");
 
@@ -93,39 +93,39 @@ namespace LeoAISwPdmAddIn
                     case "Add":
                     case "Upload":
                         SentryErrorHandler.AddOperationBreadcrumb("Upload", "Starting upload operation");
-                        ProcessUploadOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessUploadOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "Delete":
-                        ProcessDeleteOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessDeleteOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "Move":
-                        ProcessMoveOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessMoveOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "Rename":
-                        ProcessRenameOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessRenameOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "Copy":
-                        ProcessCopyOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessCopyOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "AddFolder":
-                        ProcessAddFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessAddFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "DeleteFolder":
-                        ProcessDeleteFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessDeleteFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "MoveFolder":
-                        ProcessMoveFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessMoveFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     case "RenameFolder":
-                        ProcessRenameFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst).Wait();
+                        await ProcessRenameFolderOperation(vault, operation, leoClient, directoryId, tryArchiveFirst);
                         break;
 
                     default:
