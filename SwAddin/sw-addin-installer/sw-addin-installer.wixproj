@@ -1,12 +1,21 @@
-﻿<Project Sdk="WixToolset.Sdk/6.0.0">
+<Project Sdk="WixToolset.Sdk/6.0.0">
   <PropertyGroup>
     <OutputType>Package</OutputType>
     <TargetFramework>net8.0</TargetFramework>
     <OutputName>sw_addin_installer</OutputName>
-    <WixToolsetOutputType>Bundle</WixToolsetOutputType>
+    <!-- Match 64-bit Program Files and SolidWorks x64 add-in -->
+    <InstallerPlatform>x64</InstallerPlatform>
+    <!-- Only compile Product.wxs; do not pick up LeoAISetUp\*.wxs in this folder -->
+    <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
   </PropertyGroup>
   <ItemGroup>
-    <WixSource Include="Product.wxs" />
+    <None Include="License.rtf" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="WixToolset.UI.wixext" Version="6.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="Product.wxs" />
     <Content Include="sw-addin-installer.wax" />
   </ItemGroup>
   <ItemGroup>

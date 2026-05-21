@@ -5,6 +5,15 @@ using System;
 
 namespace SwLeoAIAddin
 {
+	/// <summary>
+	/// Mode for Property Manager Page - determines what type of selection is needed
+	/// </summary>
+	public enum PMPMode
+	{
+		FindComponent,  // For finding components - requires face selection
+		PartReplacer    // For part replacement - requires component/part selection
+	}
+
 	public class UserPMPage
 	{
 		//Local Objects
@@ -37,6 +46,9 @@ namespace SwLeoAIAddin
 		public IPropertyManagerPageTextbox textbox2;
 		public IPropertyManagerPageTextbox textbox3;
 
+		// Mode to determine behavior
+		public PMPMode Mode { get; private set; }
+
 		//Control IDs
 		public const int group1ID = 0;
 		public const int group2ID = 1;
@@ -59,9 +71,10 @@ namespace SwLeoAIAddin
 		//public const int textbox3ID = 16;
 		#endregion
 
-		public UserPMPage(SwAddin addin)
+		public UserPMPage(SwAddin addin, PMPMode mode = PMPMode.FindComponent)
 		{
 			userAddin = addin;
+			Mode = mode;
 			if (userAddin != null)
 			{
 				iSwApp = (ISldWorks)userAddin.SwApp;
@@ -80,7 +93,7 @@ namespace SwLeoAIAddin
 			int options = (int)swPropertyManagerPageOptions_e.swPropertyManagerOptions_OkayButton |
 					(int)swPropertyManagerPageOptions_e.swPropertyManagerOptions_CancelButton;
 
-			handler = new PMPHandler(userAddin, this);
+			handler = new PMPHandler(userAddin, this, Mode);
 			swPropertyPage = (IPropertyManagerPage2)iSwApp.CreatePropertyManagerPage("Leo AI Copilot", options, handler, ref errors);
 			if (swPropertyPage != null && errors == (int)swPropertyManagerPageStatus_e.swPropertyManagerPage_Okay)
 			{
@@ -105,35 +118,67 @@ namespace SwLeoAIAddin
 			int options = -1;
 			bool retval;
 
-			//Add Message
-			retval = swPropertyPage.SetMessage3("Select a face to search for a compatible componet with Leo. " + "\n" +
-				" For instance, choose a hole face to look for a fitting screw.",
-																			(int)swPropertyManagerPageMessageVisibility.swImportantMessageBox,
-																			(int)swPropertyManagerPageMessageExpanded.swMessageBoxExpand,
-																			"Leo AI - Find Component.");
-
-
-			////Add the groups
-			options = (int)swAddGroupBoxOptions_e.swGroupBoxOptions_Visible | (int)swAddGroupBoxOptions_e.swGroupBoxOptions_Expanded;
-
-			group1 = (IPropertyManagerPageGroup)swPropertyPage.AddGroupBox(group1ID, "Selected Faces", options);
-
-
-
-			//Add controls to group2
-			//selection1
-			controlType = (int)swPropertyManagerPageControlType_e.swControlType_Selectionbox;
-			align = (int)swPropertyManagerPageControlLeftAlign_e.swControlAlign_LeftEdge;
-			options = (int)swAddControlOptions_e.swControlOptions_Enabled |
-								(int)swAddControlOptions_e.swControlOptions_Visible;
-
-			selection1 = (IPropertyManagerPageSelectionbox)group1.AddControl(selection1ID, controlType, "Face Selection", align, options, "Displays features selected in main view");
-			if (selection1 != null)
+			// Configure UI based on mode
+			if (Mode == PMPMode.FindComponent)
 			{
-				int[] filter = { (int)swSelectType_e.swSelFACES, (int)swSelectType_e.swSelEDGES };
-				selection1.Height = 40;
-				selection1.SetSelectionFilters(filter);
-				selection1.SingleEntityOnly = true;//Allow only one entity selection
+				//Add Message for Find Component
+				retval = swPropertyPage.SetMessage3("Select a face to search for a compatible component with Leo. " + "\n" +
+					" For instance, choose a hole face to look for a fitting screw.",
+																				(int)swPropertyManagerPageMessageVisibility.swImportantMessageBox,
+																				(int)swPropertyManagerPageMessageExpanded.swMessageBoxExpand,
+																				"Leo AI - Find Component.");
+
+				////Add the groups
+				options = (int)swAddGroupBoxOptions_e.swGroupBoxOptions_Visible | (int)swAddGroupBoxOptions_e.swGroupBoxOptions_Expanded;
+
+				group1 = (IPropertyManagerPageGroup)swPropertyPage.AddGroupBox(group1ID, "Selected Faces", options);
+
+				//Add controls to group1
+				//selection1
+				controlType = (int)swPropertyManagerPageControlType_e.swControlType_Selectionbox;
+				align = (int)swPropertyManagerPageControlLeftAlign_e.swControlAlign_LeftEdge;
+				options = (int)swAddControlOptions_e.swControlOptions_Enabled |
+									(int)swAddControlOptions_e.swControlOptions_Visible;
+
+				selection1 = (IPropertyManagerPageSelectionbox)group1.AddControl(selection1ID, controlType, "Face Selection", align, options, "Displays features selected in main view");
+				if (selection1 != null)
+				{
+					int[] filter = { (int)swSelectType_e.swSelFACES, (int)swSelectType_e.swSelEDGES };
+					selection1.Height = 40;
+					selection1.SetSelectionFilters(filter);
+					selection1.SingleEntityOnly = true;//Allow only one entity selection
+				}
+			}
+			else if (Mode == PMPMode.PartReplacer)
+			{
+				//Add Message for Part Replacer
+				retval = swPropertyPage.SetMessage3("Select a part or component to replace. " + "\n" +
+					" You can select a component in the assembly or a part document.",
+																				(int)swPropertyManagerPageMessageVisibility.swImportantMessageBox,
+																				(int)swPropertyManagerPageMessageExpanded.swMessageBoxExpand,
+																				"Leo AI - Part Replacer.");
+
+				////Add the groups
+				options = (int)swAddGroupBoxOptions_e.swGroupBoxOptions_Visible | (int)swAddGroupBoxOptions_e.swGroupBoxOptions_Expanded;
+
+				group1 = (IPropertyManagerPageGroup)swPropertyPage.AddGroupBox(group1ID, "Selected Part/Component", options);
+
+				//Add controls to group1
+				//selection1
+				controlType = (int)swPropertyManagerPageControlType_e.swControlType_Selectionbox;
+				align = (int)swPropertyManagerPageControlLeftAlign_e.swControlAlign_LeftEdge;
+				options = (int)swAddControlOptions_e.swControlOptions_Enabled |
+									(int)swAddControlOptions_e.swControlOptions_Visible;
+
+				selection1 = (IPropertyManagerPageSelectionbox)group1.AddControl(selection1ID, controlType, "Part/Component Selection", align, options, "Displays part or component selected in main view");
+				if (selection1 != null)
+				{
+					// Allow selection of components, faces (to get component), and parts
+					int[] filter = { (int)swSelectType_e.swSelCOMPONENTS, (int)swSelectType_e.swSelFACES };
+					selection1.Height = 40;
+					selection1.SetSelectionFilters(filter);
+					selection1.SingleEntityOnly = true;//Allow only one entity selection
+				}
 			}
 		}
 

@@ -1,4 +1,4 @@
-﻿using SolidWorks.Interop.sldworks;
+using SolidWorks.Interop.sldworks;
 using SolidWorks.Interop.swconst;
 using sw_addin.Data;
 using System;
@@ -76,7 +76,7 @@ namespace sw_addin
 				return;
 			}
 
-			solidworksDocument = (ModelDoc2)swModel;
+			solidworksDocument = (ModelDoc2)swModel;	
 			LogFileWriter.Write($"Leo AI - Active mode in Solidworks : {swModel.GetPathName()}: ");
 			solidworksMeasure = swModel.Extension.CreateMeasure();
 
@@ -330,6 +330,34 @@ namespace sw_addin
 			return false;
 		}
 
+		public bool OpenInsertComponentDialog(string swFilePath)
+		{
+			bool isDialogOpened = false;
+			ModelDoc2 activeModelDoc = (ModelDoc2)solidWorksApplication.ActiveDoc;
+			LogFileWriter.Write($"Leo AI - Insert - Opening Insert Component dialog. File path provided: {swFilePath ?? "null"}");
+			
+			if (activeModelDoc is AssemblyDoc)
+			{
+				AssemblyDoc swAsmDoc = (AssemblyDoc)activeModelDoc;
+				string title = activeModelDoc.GetTitle();
+				
+				LogFileWriter.Write($"Leo AI - Insert - Active document is an assembly: {title}");
+				
+				solidWorksApplication.ActivateDoc3(title, false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, 0);
+				
+				LogFileWriter.Write($"Leo AI - Insert - Triggering Insert Component dialog...");
+				solidWorksApplication.RunCommand((int)swCommands_e.swCommands_InsertComponents, "");
+				
+				LogFileWriter.Write($"Leo AI - Insert - Insert Component dialog opened. User can now browse and select file manually.");
+				isDialogOpened = true;
+			}
+			else
+			{
+				LogFileWriter.Write($"Leo AI - Insert - ERROR: Active document is not an assembly. Type: ");
+			}
+			
+			return isDialogOpened;
+		}
 		/// <summary>
 		/// Insert Non-native file into active assmembly document
 		/// </summary>
@@ -987,6 +1015,1041 @@ namespace sw_addin
 			}
 
 			return false;
+		}
+
+		/// <summary>
+		/// Gets the file path of the selected part (from face selection or active part document)
+		/// </summary>
+		/// <returns>File path of the selected part, or null if no part can be determined</returns>
+		public string GetSelectedPartFilePath()
+		{
+			ModelDoc2 swModel = solidWorksApplication.ActiveDoc;
+			if (swModel == null)
+			{
+				LogFileWriter.Write($"Leo AI - Active document not exists in Solidworks");
+				return null;
+			}
+
+			solidworksDocument = (ModelDoc2)swModel;
+
+			SelectionMgr selMgr = swModel.SelectionManager as SelectionMgr;
+			if (selMgr == null)
+			{
+				LogFileWriter.Write($"Leo AI - Failed to get SelectionManager");
+				return null;
+			}
+
+			int selCount = selMgr.GetSelectedObjectCount2(-1);
+
+			if (selCount > 0)
+			{
+				object selectedObject = selMgr.GetSelectedObject6(1, -1);
+
+				if (selectedObject is Face2 selectedFace)
+				{
+					LogFileWriter.Write($"Leo AI - Selected entity is a Face for part replacement");
+					Component2 component = selMgr.GetSelectedObjectsComponent4(1, -1) as Component2;
+					if (component != null)
+					{
+						ModelDoc2 componentDoc = component.GetModelDoc2() as ModelDoc2;
+						if (componentDoc != null)
+						{
+							string partPath = componentDoc.GetPathName();
+							LogFileWriter.Write($"Leo AI - Part path from selected face component: {partPath}");
+							return partPath;
+						}
+					}
+					// If no component (in part document), use active document
+					string docPath = swModel.GetPathName();
+					LogFileWriter.Write($"Leo AI - Part path from active document: {docPath}");
+					return docPath;
+				}
+				else if (selectedObject is Component2 selectedComponent)
+				{
+					LogFileWriter.Write($"Leo AI - Selected entity is a Component for part replacement");
+					ModelDoc2 componentDoc = selectedComponent.GetModelDoc2() as ModelDoc2;
+					if (componentDoc != null)
+					{
+						if (componentDoc is AssemblyDoc)
+						{
+							LogFileWriter.Write($"Leo AI - Selected component is an assembly, not a part. Cannot use Part Replacer.");
+							return null;
+						}
+						else if (componentDoc is PartDoc)
+						{
+							string partPath = componentDoc.GetPathName();
+							LogFileWriter.Write($"Leo AI - Part path from selected component: {partPath}");
+							return partPath;
+						}
+					}
+				}
+			}
+
+			// If no selection, check if active document is a part
+			if (swModel is PartDoc)
+			{
+				string partPath = swModel.GetPathName();
+				if (!string.IsNullOrEmpty(partPath))
+				{
+					LogFileWriter.Write($"Leo AI - Part path from active part document: {partPath}");
+					return partPath;
+				}
+			}
+
+			LogFileWriter.Write($"Leo AI - Could not determine part file path for replacement");
+			return null;
+		}
+
+		/// <summary>
+		/// Gets the file path of the selected assembly or the active assembly document
+		/// </summary>
+		/// <returns>Assembly file path, or null if not found</returns>
+		public string GetSelectedAssemblyFilePath()
+		{
+			ModelDoc2 swModel = solidWorksApplication.ActiveDoc;
+			if (swModel == null)
+			{
+				LogFileWriter.Write($"Leo AI - Active document does not exist in SolidWorks");
+				return null;
+			}
+
+			solidworksDocument = (ModelDoc2)swModel;
+
+			SelectionMgr selMgr = swModel.SelectionManager as SelectionMgr;
+			if (selMgr == null)
+			{
+				LogFileWriter.Write($"Leo AI - Failed to get SelectionManager");
+				return null;
+			}
+
+			int selCount = selMgr.GetSelectedObjectCount2(-1);
+
+			if (selCount > 0)
+			{
+				object selectedObject = selMgr.GetSelectedObject6(1, -1);
+
+				if (selectedObject is Component2 selectedComponent)
+				{
+					LogFileWriter.Write($"Leo AI - Selected entity is a Component for assembly inspection");
+					ModelDoc2 componentDoc = selectedComponent.GetModelDoc2() as ModelDoc2;
+					if (componentDoc != null)
+					{
+						if (componentDoc is AssemblyDoc)
+						{
+							string assemblyPath = componentDoc.GetPathName();
+							LogFileWriter.Write($"Leo AI - Assembly path from selected component: {assemblyPath}");
+							return assemblyPath;
+						}
+						else
+						{
+							LogFileWriter.Write($"Leo AI - Selected component is not an assembly, it's a part");
+							return null;
+						}
+					}
+				}
+			}
+
+			if (swModel is AssemblyDoc)
+			{
+				string assemblyPath = swModel.GetPathName();
+				if (!string.IsNullOrEmpty(assemblyPath))
+				{
+					LogFileWriter.Write($"Leo AI - Assembly path from active assembly document: {assemblyPath}");
+					return assemblyPath;
+				}
+			}
+
+			LogFileWriter.Write($"Leo AI - Could not determine assembly file path for inspection");
+			return null;
+		}
+
+		/// <summary>
+		/// Checks if we can get a selected part path (for enabling/disabling Part Replacer button)
+		/// </summary>
+		/// <returns>True if a part path can be determined, false otherwise</returns>
+		public bool CanGetSelectedPartPath()
+		{
+			string partPath = GetSelectedPartFilePath();
+			return !string.IsNullOrEmpty(partPath);
+		}
+
+		/// <summary>
+		/// Checks if we can get a selected part or assembly path (for enabling/disabling Part Replacer button)
+		/// </summary>
+		/// <returns>True if a part or assembly path can be determined, false otherwise</returns>
+		public bool CanGetSelectedPartOrAssemblyPath()
+		{
+			// Check for part path first
+			string partPath = GetSelectedPartFilePath();
+			if (!string.IsNullOrEmpty(partPath))
+			{
+				return true;
+			}
+			
+			// Check for assembly path
+			string assemblyPath = GetSelectedAssemblyFilePath();
+			return !string.IsNullOrEmpty(assemblyPath);
+		}
+
+		/// <summary>
+		/// Replaces assemblies in assembly: finds assembly components by name or file path, removes them, and inserts new assembly
+		/// </summary>
+		/// <param name="placeLikeComponentTitle">Assembly component name to search for (first priority)</param>
+		/// <param name="placeLikeFilePath">Assembly component file path to search for (fallback if name not found)</param>
+		/// <param name="newAssemblyFilePath">Path to the new assembly file to insert</param>
+		/// <param name="replaceExisting">If true, removes the original assembly after replacement</param>
+		/// <returns>True if replacement was successful, false otherwise</returns>
+		public bool ReplaceAssemblyInAssembly(string placeLikeComponentTitle, string placeLikeFilePath, string newAssemblyFilePath, bool replaceExisting = false)
+		{
+			try
+			{
+				LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - START");
+				LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Parameters:");
+				LogFileWriter.Write($"Leo AI :   - Title: {placeLikeComponentTitle ?? "null"}");
+				LogFileWriter.Write($"Leo AI :   - FilePath: {placeLikeFilePath ?? "null"}");
+				LogFileWriter.Write($"Leo AI :   - NewAssembly: {newAssemblyFilePath ?? "null"}");
+				LogFileWriter.Write($"Leo AI :   - ReplaceExisting: {replaceExisting}");
+				LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Thread ID: {System.Threading.Thread.CurrentThread.ManagedThreadId}");
+
+				if (solidWorksApplication == null)
+				{
+					LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR: SolidWorks application is null.");
+					return false;
+				}
+
+				ModelDoc2 activeModelDoc = solidWorksApplication.ActiveDoc;
+				if (activeModelDoc == null)
+				{
+					LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR: No active document.");
+					return false;
+				}
+
+				AssemblyDoc assemblyDoc = activeModelDoc as AssemblyDoc;
+				if (assemblyDoc == null)
+				{
+					LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR: Active document is not an assembly. Type: {activeModelDoc.GetType()}");
+					return false;
+				}
+
+				List<Component2> allFoundComponents = FindComponentsToReplace(assemblyDoc, placeLikeComponentTitle, placeLikeFilePath);
+
+				if (allFoundComponents == null)
+				{
+					LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR: FindComponentsToReplace returned null");
+					return false;
+				}
+
+				List<Component2> assemblyComponentsToReplace = new List<Component2>();
+				foreach (Component2 comp in allFoundComponents)
+				{
+					try
+					{
+						ModelDoc2 compDoc = comp.GetModelDoc2() as ModelDoc2;
+						if (compDoc != null && compDoc is AssemblyDoc)
+						{
+							assemblyComponentsToReplace.Add(comp);
+							LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Found assembly component: {comp.Name2}");
+						}
+					}
+					catch (Exception compEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Error checking component type: {compEx.Message}");
+					}
+				}
+
+				if (assemblyComponentsToReplace.Count == 0)
+				{
+					LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - WARNING: No assembly components found to replace.");
+					return false;
+				}
+
+				List<Component2> uniqueComponents = new List<Component2>();
+				HashSet<IntPtr> seenPointers = new HashSet<IntPtr>();
+				foreach (Component2 comp in assemblyComponentsToReplace)
+				{
+					try
+					{
+						IntPtr compPtr = Marshal.GetIUnknownForObject(comp);
+						if (!seenPointers.Contains(compPtr))
+						{
+							seenPointers.Add(compPtr);
+							uniqueComponents.Add(comp);
+							string compName = comp?.Name2 ?? "null";
+							LogFileWriter.Write($"Leo AI :   - Unique assembly component: {compName}");
+						}
+						else
+						{
+							LogFileWriter.Write($"Leo AI :   - Skipping duplicate assembly component");
+							Marshal.Release(compPtr);
+						}
+					}
+					catch (Exception dupEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Error checking duplicate: {dupEx.Message}");
+					}
+				}
+				assemblyComponentsToReplace = uniqueComponents;
+
+				List<ComponentPlacementInfo> placementInfos = new List<ComponentPlacementInfo>();
+				for (int i = 0; i < assemblyComponentsToReplace.Count; i++)
+				{
+					try
+					{
+						LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Getting placement info for assembly component {i + 1}...");
+						ComponentPlacementInfo info = GetComponentPlacementInfo(assemblyComponentsToReplace[i]);
+						placementInfos.Add(info);
+					}
+					catch (Exception infoEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR getting placement info for assembly component {i + 1}: {infoEx.Message}");
+					}
+				}
+				LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Stored {placementInfos.Count} placement info(s)");
+
+				List<Component2> insertedComponents = new List<Component2>();
+				for (int i = 0; i < placementInfos.Count; i++)
+				{
+					try
+					{
+						LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Inserting assembly component {i + 1} of {placementInfos.Count}...");
+						Component2 insertedComp = InsertComponentAtLocation(assemblyDoc, newAssemblyFilePath, placementInfos[i]);
+						if (insertedComp != null)
+						{
+							insertedComponents.Add(insertedComp);
+						}
+					}
+					catch (Exception insertEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR inserting assembly component {i + 1}: {insertEx.Message}");
+					}
+				}
+				LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Assembly component insertion phase completed. Successfully inserted: {insertedComponents.Count} of {placementInfos.Count}");
+
+				if (replaceExisting)
+				{
+					LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ReplaceExisting is true, removing original assembly components...");
+					for (int i = 0; i < assemblyComponentsToReplace.Count; i++)
+					{
+						try
+						{
+							LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - Removing assembly component {i + 1} of {assemblyComponentsToReplace.Count}...");
+							RemoveComponent(assemblyDoc, assemblyComponentsToReplace[i]);
+						}
+						catch (Exception removeEx)
+						{
+							LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - ERROR removing assembly component {i + 1}: {removeEx.Message}");
+						}
+					}
+				}
+
+				return true;
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : ReplaceAssemblyInAssembly - FATAL ERROR: {ex.Message}");
+				return false;
+			}
+		}
+
+		/// <summary>
+		/// Replaces parts in assembly: finds components by name or file path, removes them, and inserts new part
+		/// </summary>
+		/// <param name="placeLikeComponentTitle">Component name to search for (first priority)</param>
+		/// <param name="placeLikeFilePath">Component file path to search for (fallback if name not found)</param>
+		/// <param name="newPartFilePath">Path to the new part file to insert</param>
+		/// <returns>True if replacement was successful, false otherwise</returns>
+		public bool ReplacePartInAssembly(string placeLikeComponentTitle, string placeLikeFilePath, string newPartFilePath, bool replaceExisting = false)
+		{
+			try
+			{
+				LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - START");
+				LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Parameters:");
+				LogFileWriter.Write($"Leo AI :   - Title: {placeLikeComponentTitle ?? "null"}");
+				LogFileWriter.Write($"Leo AI :   - FilePath: {placeLikeFilePath ?? "null"}");
+				LogFileWriter.Write($"Leo AI :   - NewPart: {newPartFilePath ?? "null"}");
+				LogFileWriter.Write($"Leo AI :   - ReplaceExisting: {replaceExisting}");
+				LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Thread ID: {System.Threading.Thread.CurrentThread.ManagedThreadId}");
+
+				if (solidWorksApplication == null)
+				{
+					return false;
+				}
+
+				ModelDoc2 activeModelDoc = solidWorksApplication.ActiveDoc;
+				if (activeModelDoc == null)
+				{
+					return false;
+				}
+
+				AssemblyDoc assemblyDoc = activeModelDoc as AssemblyDoc;
+				if (assemblyDoc == null)
+				{
+					return false;
+				}
+
+				// Find components to replace
+				List<Component2> componentsToReplace = FindComponentsToReplace(assemblyDoc, placeLikeComponentTitle, placeLikeFilePath);
+
+				if (componentsToReplace == null)
+				{
+					return false;
+				}
+
+				if (componentsToReplace.Count == 0)
+				{
+					return false;
+				}
+
+				// Remove duplicates from the list (same component reference)
+				List<Component2> uniqueComponents = new List<Component2>();
+				HashSet<IntPtr> seenPointers = new HashSet<IntPtr>();
+				foreach (Component2 comp in componentsToReplace)
+				{
+					try
+					{
+						IntPtr compPtr = Marshal.GetIUnknownForObject(comp);
+						if (!seenPointers.Contains(compPtr))
+						{
+							seenPointers.Add(compPtr);
+							uniqueComponents.Add(comp);
+							string compName = comp?.Name2 ?? "null";
+							LogFileWriter.Write($"Leo AI :   - Unique component: {compName}");
+						}
+						else
+						{
+							LogFileWriter.Write($"Leo AI :   - Skipping duplicate component");
+							Marshal.Release(compPtr);
+						}
+					}
+					catch (Exception dupEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Error checking duplicate: {dupEx.Message}");
+					}
+				}
+				componentsToReplace = uniqueComponents;
+
+				// Store positions and transformations before removing
+				List<ComponentPlacementInfo> placementInfos = new List<ComponentPlacementInfo>();
+				for (int i = 0; i < componentsToReplace.Count; i++)
+				{
+					try
+					{
+						LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Getting placement info for component {i + 1}...");
+						ComponentPlacementInfo info = GetComponentPlacementInfo(componentsToReplace[i]);
+						placementInfos.Add(info);
+					}
+					catch (Exception infoEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - ERROR getting placement info for component {i + 1}: {infoEx.Message}");
+					}
+				}
+				LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Stored {placementInfos.Count} placement info(s)");
+
+				List<Component2> insertedComponents = new List<Component2>();
+				for (int i = 0; i < placementInfos.Count; i++)
+				{
+					try
+					{
+						LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Inserting component {i + 1} of {placementInfos.Count}...");
+						Component2 insertedComp = InsertComponentAtLocation(assemblyDoc, newPartFilePath, placementInfos[i]);
+						if (insertedComp != null)
+						{
+							insertedComponents.Add(insertedComp);
+							LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Component {i + 1} insertion completed successfully");
+						}
+					}
+					catch (Exception insertEx)
+					{
+						LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - ERROR inserting component {i + 1}: {insertEx.Message}");
+					}
+				}
+				LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Component insertion phase completed. Successfully inserted: {insertedComponents.Count} of {placementInfos.Count}");
+
+				// Remove old components only if replaceExisting is true
+				if (replaceExisting)
+				{
+					LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - ReplaceExisting is true, removing original components...");
+					for (int i = 0; i < componentsToReplace.Count; i++)
+					{
+						try
+						{
+							LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - Removing component {i + 1} of {componentsToReplace.Count}...");
+							RemoveComponent(assemblyDoc, componentsToReplace[i]);
+						}
+						catch (Exception removeEx)
+						{
+							LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - ERROR removing component {i + 1}: {removeEx.Message}");
+						}
+					}
+				}
+
+				return true;
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : ReplacePartInAssembly - FATAL ERROR: {ex.Message}");
+				return false;
+			}
+		}
+
+		/// <summary>
+		/// Finds components in assembly by name (first) or file path (fallback)
+		/// </summary>
+		/// <param name="assemblyDoc">The assembly document</param>
+		/// <param name="componentTitle">Component name to search for</param>
+		/// <param name="componentFilePath">Component file path to search for</param>
+		/// <returns>List of matching components</returns>
+		private List<Component2> FindComponentsToReplace(AssemblyDoc assemblyDoc, string componentTitle, string componentFilePath)
+		{
+			List<Component2> foundComponents = new List<Component2>();
+
+			try
+			{
+				LogFileWriter.Write($"Leo AI : FindComponentsToReplace - START");
+				LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Title: {componentTitle ?? "null"}, FilePath: {componentFilePath ?? "null"}");
+
+				// Get all components in the assembly (including root and all children)
+				LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Calling GetComponents(false)...");
+				object[] allComponents = assemblyDoc.GetComponents(false) as object[];
+				LogFileWriter.Write($"Leo AI : FindComponentsToReplace - GetComponents returned: {(allComponents == null ? "null" : $"{allComponents.Length} components")}");
+
+				if (allComponents == null || allComponents.Length == 0)
+				{
+					LogFileWriter.Write($"Leo AI : FindComponentsToReplace - No components found in assembly.");
+					return foundComponents;
+				}
+
+				// First, try to find by component title (name)
+				if (!string.IsNullOrEmpty(componentTitle))
+				{
+					LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Searching by title: {componentTitle}");
+					int compIndex = 0;
+					foreach (object compObj in allComponents)
+					{
+						try
+						{
+							compIndex++;
+							Component2 comp = compObj as Component2;
+							if (comp != null)
+							{
+								LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Processing component {compIndex}/{allComponents.Length}");
+								FindComponentsByTitle(comp, componentTitle, foundComponents);
+							}
+						}
+						catch (Exception compEx)
+						{
+							LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Error processing component {compIndex}: {compEx.Message}");
+						}
+					}
+				}
+
+				// If not found by title, search by file path
+				if (foundComponents.Count == 0 && !string.IsNullOrEmpty(componentFilePath))
+				{
+					LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Title search failed, searching by file path: {componentFilePath}");
+					int compIndex = 0;
+					foreach (object compObj in allComponents)
+					{
+						try
+						{
+							compIndex++;
+							Component2 comp = compObj as Component2;
+							if (comp != null)
+							{
+								LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Processing component {compIndex}/{allComponents.Length} for file path search");
+								FindComponentsByFilePath(comp, componentFilePath, foundComponents);
+							}
+						}
+						catch (Exception compEx)
+						{
+							LogFileWriter.Write($"Leo AI : FindComponentsToReplace - Error processing component {compIndex} for file path: {compEx.Message}");
+						}
+					}
+				}
+
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : FindComponentsToReplace - FATAL ERROR: {ex.Message}");
+			}
+
+			return foundComponents;
+		}
+
+		/// <summary>
+		/// Recursively finds components by title (name)
+		/// </summary>
+		private void FindComponentsByTitle(Component2 component, string targetTitle, List<Component2> results)
+		{
+			LogFileWriter.Write($"Leo AI : FindComponentsByTitle - start");
+			if (component == null) return;
+			LogFileWriter.Write($"Leo AI : FindComponentsByTitle - component is not null");
+			try
+			{
+				// Check if this component matches
+				string componentName = component.Name2;
+				LogFileWriter.Write($"Leo AI : FindComponentsByTitle - Found component: {componentName}");
+				if (!string.IsNullOrEmpty(componentName) && 
+				    componentName.Equals(targetTitle, StringComparison.OrdinalIgnoreCase))
+				{
+					results.Add(component);
+					LogFileWriter.Write($"Leo AI : FindComponentsByTitle - Found component: {componentName}");
+				}
+
+				// Recursively search child components
+				object[] children = component.GetChildren() as object[];
+				if (children != null)
+				{
+					foreach (object childObj in children)
+					{
+						Component2 childComp = childObj as Component2;
+						if (childComp != null)
+						{
+							FindComponentsByTitle(childComp, targetTitle, results);
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : FindComponentsByTitle Error - {ex.Message}");
+			}
+		}
+
+		/// <summary>
+		/// Recursively finds components by file path
+		/// </summary>
+		private void FindComponentsByFilePath(Component2 component, string targetFilePath, List<Component2> results)
+		{
+			LogFileWriter.Write($"Leo AI : FindComponentsByFilePath start");
+			if (component == null) return;
+
+			try
+			{
+				// Get the model document for this component
+				ModelDoc2 compDoc = component.GetModelDoc2() as ModelDoc2;
+				if (compDoc != null)
+				{
+					string compPath = compDoc.GetPathName();
+					LogFileWriter.Write($"Leo AI : FindComponentsByFilePath - compPath: {compPath}");
+					if (!string.IsNullOrEmpty(compPath))
+					{
+						// Compare file paths (case-insensitive, normalize paths)
+						string normalizedCompPath = Path.GetFullPath(compPath);
+						string normalizedTargetPath = Path.GetFullPath(targetFilePath);
+						LogFileWriter.Write($"Leo AI : FindComponentsByFilePath - normalizedCompPath: {normalizedCompPath}");
+						LogFileWriter.Write($"Leo AI : FindComponentsByFilePath - normalizedTargetPath: {normalizedTargetPath}");
+
+						if (normalizedCompPath.Equals(normalizedTargetPath, StringComparison.OrdinalIgnoreCase))
+						{
+							results.Add(component);
+							LogFileWriter.Write($"Leo AI : FindComponentsByFilePath - Found component: {compPath}");
+						}
+					}
+				}
+
+				// Recursively search child components
+				object[] children = component.GetChildren() as object[];
+				if (children != null)
+				{
+					foreach (object childObj in children)
+					{
+						Component2 childComp = childObj as Component2;
+						if (childComp != null)
+						{
+							FindComponentsByFilePath(childComp, targetFilePath, results);
+						}
+					}
+				}
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : FindComponentsByFilePath Error - {ex.Message}");
+			}
+		}
+
+		/// <summary>
+		/// Stores component placement information (position, rotation, mates)
+		/// </summary>
+		private class ComponentPlacementInfo
+		{
+			public double[] Transform { get; set; }
+			public bool IsFixed { get; set; }
+			public string Name { get; set; }
+		}
+
+		/// <summary>
+		/// Gets placement information from a component
+		/// </summary>
+		private ComponentPlacementInfo GetComponentPlacementInfo(Component2 component)
+		{
+			ComponentPlacementInfo info = new ComponentPlacementInfo();
+			try
+			{
+				
+				if (component == null)
+				{
+					return info;
+				}
+
+				// Get component name
+				try
+				{
+					info.Name = component.Name2;
+				}
+				catch (Exception nameEx)
+				{
+					info.Name = "unknown";
+				}
+
+				// Get fixed state
+				try
+				{
+					info.IsFixed = component.IsFixed();
+				}
+				catch (Exception fixedEx)
+				{
+					info.IsFixed = false;
+				}
+				
+				// Get transformation matrix (16-element array: 4x4 matrix)
+				try
+				{
+					MathTransform transform = component.Transform2;
+					if (transform != null)
+					{
+						LogFileWriter.Write($"Leo AI : GetComponentPlacementInfo - Transform2 is not null");
+						object arrayData = transform.ArrayData;
+						if (arrayData != null)
+						{
+							info.Transform = arrayData as double[];
+							if (info.Transform != null)
+							{
+								LogFileWriter.Write($"Leo AI : GetComponentPlacementInfo - Transform array length: {info.Transform.Length}");
+								if (info.Transform.Length >= 16)
+								{
+									LogFileWriter.Write($"Leo AI : GetComponentPlacementInfo - Transform values: [{string.Join(", ", info.Transform.Take(16))}]");
+								}
+							}
+						}
+					}
+				}
+				catch (Exception transformEx)
+				{
+					LogFileWriter.Write($"Leo AI : GetComponentPlacementInfo - Error getting transform: {transformEx.Message}");
+				}
+
+				// Default identity matrix if no transform
+				if (info.Transform == null || info.Transform.Length < 16)
+				{
+					info.Transform = new double[] {
+						1, 0, 0, 0,
+						0, 1, 0, 0,
+						0, 0, 1, 0,
+						0, 0, 0, 1
+					};
+				}
+
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : GetComponentPlacementInfo - FATAL ERROR: {ex.Message}");
+			}
+			return info;
+		}
+
+		/// <summary>
+		/// Removes a component from the assembly
+		/// </summary>
+		private void RemoveComponent(AssemblyDoc assemblyDoc, Component2 component)
+		{
+			try
+			{
+				LogFileWriter.Write($"Leo AI : RemoveComponent - START");
+				
+				if (component == null)
+				{
+					return;
+				}
+
+				string compName = "unknown";
+				try
+				{
+					compName = component.Name2;
+				}
+				catch (Exception nameEx)
+				{
+					LogFileWriter.Write($"Leo AI : RemoveComponent - Error getting component name: {nameEx.Message}");
+				}
+
+				// Get the ModelDoc2 interface for EditDelete
+				ModelDoc2 modelDoc = assemblyDoc as ModelDoc2;
+				if (modelDoc == null)
+				{
+					return;
+				}
+
+				bool selected = false;
+				try
+				{
+					selected = component.Select2(false, 0);
+				}
+				catch (Exception selectEx)
+				{
+					LogFileWriter.Write($"Leo AI : RemoveComponent - ERROR in Select2: {selectEx.Message}");
+					return;
+				}
+
+				if (selected)
+				{
+					LogFileWriter.Write($"Leo AI : RemoveComponent - Component selected, calling EditDelete...");
+					try
+					{
+						modelDoc.EditDelete();
+						LogFileWriter.Write($"Leo AI : RemoveComponent - EditDelete completed successfully");
+					}
+					catch (Exception deleteEx)
+					{
+						LogFileWriter.Write($"Leo AI : RemoveComponent - ERROR in EditDelete: {deleteEx.Message}");
+						throw;
+					}
+				}
+
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : RemoveComponent - FATAL ERROR: {ex.Message}");
+				throw;
+			}
+		}
+
+		/// <summary>
+		/// Inserts a new component at the specified location
+		/// </summary>
+		/// <returns>The inserted component, or null if insertion failed</returns>
+		private Component2 InsertComponentAtLocation(AssemblyDoc assemblyDoc, string newPartFilePath, ComponentPlacementInfo placementInfo)
+		{
+			try
+			{
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - START");
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - File path: {newPartFilePath ?? "null"}");
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Placement info: Name={placementInfo?.Name ?? "null"}, IsFixed={placementInfo?.IsFixed ?? false}");
+
+				if (placementInfo == null)
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR: PlacementInfo is null");
+					return null;
+				}
+
+				// Open the new part document if not already open
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Checking if part is already open...");
+				ModelDoc2 newPartDoc = null;
+				try
+				{
+					newPartDoc = solidWorksApplication.GetOpenDocumentByName(newPartFilePath);
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - GetOpenDocumentByName returned: {(newPartDoc == null ? "null" : newPartDoc.GetTitle())}");
+				}
+				catch (Exception getDocEx)
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Error in GetOpenDocumentByName: {getDocEx.Message}");
+				}
+
+				if (newPartDoc == null)
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Part not open, opening now...");
+					try
+					{
+						DocumentSpecification swDocSpecification = solidWorksApplication.GetOpenDocSpec(newPartFilePath);
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - GetOpenDocSpec completed");
+						newPartDoc = solidWorksApplication.OpenDoc7(swDocSpecification);
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - OpenDoc7 returned: {(newPartDoc == null ? "null" : newPartDoc.GetTitle())}");
+					}
+					catch (Exception openEx)
+					{
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR opening document: {openEx.Message}");
+						return null;
+					}
+
+					if (newPartDoc == null)
+					{
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR: Failed to open new part: {newPartFilePath}");
+						return null;
+					}
+				}
+
+				// Activate the assembly
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Activating assembly...");
+				ModelDoc2 assemblyModel = assemblyDoc as ModelDoc2;
+				if (assemblyModel != null)
+				{
+					try
+					{
+						string assemblyTitle = assemblyModel.GetTitle();
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Assembly title: {assemblyTitle}");
+						solidWorksApplication.ActivateDoc3(assemblyTitle, false, 
+							(int)swRebuildOnActivation_e.swDontRebuildActiveDoc, 0);
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Assembly activated");
+					}
+					catch (Exception activateEx)
+					{
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR activating assembly: {activateEx.Message}");
+					}
+				}
+				else
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - WARNING: Could not cast to ModelDoc2");
+				}
+
+				// Extract position from transformation matrix
+				// SolidWorks MathTransform.ArrayData format: 16-element array representing 4x4 matrix
+				// Based on the log, the format appears to be: [r11, r12, r13, 0, r21, r22, r23, 0, r31, r32, r33, 0, tx, ty, tz, 1]
+				// OR: [r11, r12, r13, tx, r21, r22, r23, ty, r31, r32, r33, tz, 0, 0, 0, 1]
+				// Looking at actual data: [1, 0, 0, 0, 1, 0, 0, 0, 1, -0.068476037414632, 0.02, 0, 1, 0, 0, 0]
+				// This suggests: Translation is at indices 9, 10, 11 (after 3x3 rotation matrix at 0-8)
+				double x = 0, y = 0, z = 0;
+				if (placementInfo.Transform != null && placementInfo.Transform.Length >= 16)
+				{
+					// Format based on actual data: Translation at indices 9, 10, 11
+					x = placementInfo.Transform[9];
+					y = placementInfo.Transform[10];
+					z = placementInfo.Transform[11];
+					
+				}
+
+				// Verify file exists before insertion
+				if (!File.Exists(newPartFilePath))
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR: File does not exist: {newPartFilePath}");
+					return null;
+				}
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - File exists, proceeding with insertion");
+
+				// Insert component at the same location
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Calling AddComponent4 with path: {newPartFilePath}, config: '', position: ({x}, {y}, {z})");
+				Component2 insertedComp = null;
+				try
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - About to call AddComponent4...");
+					insertedComp = assemblyDoc.AddComponent4(newPartFilePath, "", x, y, z) as Component2;
+					
+					if (insertedComp != null)
+					{
+						try
+						{
+							string insertedName = insertedComp.Name2;
+							LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - AddComponent4 SUCCESS - Component name: {insertedName}");
+						}
+						catch (Exception nameEx)
+						{
+							LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - AddComponent4 returned component but error getting name: {nameEx.Message}");
+						}
+					}
+					else
+					{
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - AddComponent4 returned NULL");
+						
+						// Try to get error information
+						ModelDoc2 asmModel = assemblyDoc as ModelDoc2;
+						if (asmModel != null)
+						{
+							try
+							{
+								// GetFeatureCount takes only 1 argument (includeHidden)
+								int featureCount = asmModel.GetFeatureCount();
+							}
+							catch (Exception featEx)
+							{
+								LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Error getting feature count: {featEx.Message}");
+							}
+						}
+						
+						// Try alternative: use the opened document reference instead of file path
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Attempting alternative insertion method...");
+						if (newPartDoc != null)
+						{
+							try
+							{
+								string partPath = newPartDoc.GetPathName();
+								LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Trying with document path: {partPath}");
+								insertedComp = assemblyDoc.AddComponent4(partPath, "", x, y, z) as Component2;
+								if (insertedComp != null)
+								{
+									LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Alternative method SUCCESS");
+								}
+							}
+							catch (Exception altEx)
+							{
+								LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Alternative method error: {altEx.Message}");
+							}
+						}
+					}
+				}
+				catch (Exception addCompEx)
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - CRASH in AddComponent4: {addCompEx.Message}");
+					throw;
+				}
+
+				if (insertedComp != null)
+				{
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Successfully inserted component at ({x}, {y}, {z})");
+
+					// If original component was fixed, fix the new one too
+					if (placementInfo.IsFixed)
+					{
+						// Select the component first, then fix it
+						bool selected = false;
+						try
+						{
+							selected = insertedComp.Select2(false, 0);
+							LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Select2 for fixing returned: {selected}");
+						}
+						catch (Exception selectEx)
+						{
+							LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR in Select2 for fixing: {selectEx.Message}");
+						}
+
+						if (selected)
+						{
+							try
+							{
+								// Use FixComponent method from AssemblyDoc to fix the selected component
+								assemblyDoc.FixComponent();
+								LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - FixComponent completed");
+							}
+							catch (Exception fixEx)
+							{
+								LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR in FixComponent: {fixEx.Message}");
+							}
+						}
+						else
+						{
+							LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Failed to select component for fixing");
+						}
+					}
+
+					// Close the opened part document
+					LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Closing part document...");
+					try
+					{
+						string partTitle = newPartDoc.GetTitle();
+						solidWorksApplication.CloseDoc(partTitle);
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - Part document closed: {partTitle}");
+					}
+					catch (Exception closeEx)
+					{
+						LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - ERROR closing document: {closeEx.Message}");
+					}
+				}
+
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - END");
+				return insertedComp;
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI : InsertComponentAtLocation - FATAL ERROR: {ex.Message}");
+				return null;
+			}
 		}
 	}
 }

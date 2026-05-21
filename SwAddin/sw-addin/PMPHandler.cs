@@ -10,12 +10,14 @@ namespace SwLeoAIAddin
 		ISldWorks iSwApp;
 		SwAddin userAddin;
 		UserPMPage ppage;
+		PMPMode mode;
 
-		public PMPHandler(SwAddin addin, UserPMPage page)
+		public PMPHandler(SwAddin addin, UserPMPage page, PMPMode mode)
 		{
 			userAddin = addin;
 			iSwApp = (ISldWorks)userAddin.SwApp;
 			ppage = page;
+			this.mode = mode;
 		}
 
 		//Implement these methods from the interface
@@ -39,10 +41,32 @@ namespace SwLeoAIAddin
 			//.NET runtime environment from doing garbage collection at the wrong time.
 			if (reason == (int)swPropertyManagerPageCloseReasons_e.swPropertyManagerPageClose_Okay)
 			{
-				//Process selected face..
-				if (userAddin.SolidWorksHelper.IsFaceSelected())
+				if (mode == PMPMode.FindComponent)
 				{
-					userAddin.SolidWorksHelper.ProcessSelectedObject();
+					//Process selected face for Find Component
+					// Check if face is selected (from PMP selection box or global selection)
+					if (userAddin.SolidWorksHelper.IsFaceSelected())
+					{
+						userAddin.SolidWorksHelper.ProcessSelectedObject();
+					}
+					else
+					{
+						iSwApp.SendMsgToUser2("Please select a face to search for compatible components.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
+					}
+				}
+				else if (mode == PMPMode.PartReplacer)
+				{
+					//Process selected part/component for Part Replacer
+					string partFilePath = userAddin.SolidWorksHelper.GetSelectedPartFilePath();
+					if (!string.IsNullOrEmpty(partFilePath))
+					{
+						// Send part replacement request to Leo app
+						_ = userAddin.SendPartReplacementRequestAsync(partFilePath);
+					}
+					else
+					{
+						iSwApp.SendMsgToUser2("No part selected. Please select a part or component.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
+					}
 				}
 			}
 		}

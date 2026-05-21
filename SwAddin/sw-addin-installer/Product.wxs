@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package
-    Name="Leo AI Solidworks Addin"
+    Name="Leo AI SolidWorks Add-in"
     Version="1.0.0.0"
     Manufacturer="Opensource"
     UpgradeCode="f4f2f472-ebf8-40b5-a659-807bc05ab6e9"
@@ -9,47 +10,129 @@
     Compressed="yes"
     Scope="perMachine">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MajorUpgrade 
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed." 
+      Schedule="afterInstallValidate" />
+
     <MediaTemplate EmbedCab="yes" />
 
+    <!-- Standard wizard UI: Welcome, License, install folder, Ready to install (same pattern as LeoAI PDM setup) -->
+    <WixVariable Id="WixUILicenseRtf" Value="License.rtf" />
+    <UI>
+      <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    </UI>
+
     <Feature Id="ProductFeature" Title="Leo AI SolidWorks Addin" Level="1">
-      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="MainComponent" />
+      <ComponentRef Id="IconsComponent" />
+      <ComponentRef Id="UserStartupComponent" />
     </Feature>
 
     <StandardDirectory Id="ProgramFiles64Folder">
-      <Directory Id="LEO" Name="Leo">
-        <Directory Id="LEOSWADDIN" Name="LeoSWAddin">
-          <Directory Id="INSTALLFOLDER" Name="plugin" />
-        </Directory>
+      <Directory Id="INSTALLFOLDER" Name="Leo-SW-Addin">
+        <Directory Id="ICONSFOLDER" Name="icons" />
       </Directory>
     </StandardDirectory>
     
     <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
       <Component Id="MainComponent" Guid="{68196E00-1C80-4FA4-A7B0-9A69C04BDB30}">
-
-        <File Id="MainDllCopy" Source="sw-addin.dll" KeyPath="no" />
-        <File Id="NewtonsoftJsonCopy" Source="Newtonsoft.Json.dll" KeyPath="no" />
-        <File Id="SolidWorksToolsCopy" Source="solidworkstools.dll" KeyPath="no" />
-        <!-- COM registration for .NET add-in -->
-        <RegistryKey Root="HKLM" Key="SOFTWARE\Classes\CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}">
-          <RegistryValue Name="InprocServer32" Value="mscoree.dll" Type="string" KeyPath="no" />
-          <RegistryValue Name="Assembly" Value="sw_addin, Version=1.0.0.0, Culture=neutral, PublicKeyToken=null" Type="string" />
-          <RegistryValue Name="Class" Value="SwLeoAIAddin.SwAddin" Type="string" />
-          <RegistryValue Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
-          <RegistryValue Name="CodeBase" Value="[INSTALLFOLDER]sw-addin.dll" Type="string" />
-        </RegistryKey>
-        <!-- SolidWorks Addin registration -->
-        <RegistryKey Root="HKLM" Key="SOFTWARE\SolidWorks\Addins\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}">
-          <RegistryValue Name="Description" Value="Your AI engineering design copilot" Type="string" />
-          <RegistryValue Name="Title" Value="Leo AI copilot" Type="string" />
-          <RegistryValue Name="LoadAtStartup" Value="1" Type="integer" />
-          <RegistryValue Name="CommandLine" Value="" Type="string" />
-        </RegistryKey>
+        <File Id="SwAddinDll" Source="sw-addin.dll" KeyPath="yes" />
+        <File Id="NewtonsoftJsonCopy" Source="Newtonsoft.Json.dll" />
+        <File Id="SolidWorksToolsCopy" Source="solidworkstools.dll" />
+        <File Id="SwAddinBmp" Source="sw-addin.bmp" />
+        <File Id="SwAddin32Bmp" Source="sw-addin_32.bmp" />
+        <RegistryValue Root="HKCR" Key="SwLeoAIAddin.AssemblyEventHandler+Point3D" Value="SwLeoAIAddin.AssemblyEventHandler+Point3D" Type="string" />
+        <RegistryValue Root="HKCR" Key="SwLeoAIAddin.AssemblyEventHandler+Point3D\CLSID" Value="{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\ProgID" Value="SwLeoAIAddin.AssemblyEventHandler+Point3D" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32" Value="mscoree.dll" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}" Value="SwLeoAIAddin.AssemblyEventHandler+Point3D" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32" Name="ThreadingModel" Value="Both" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="SwLeoAIAddin.SwAddin" Value="SwLeoAIAddin.SwAddin" Type="string" />
+        <RegistryValue Root="HKCR" Key="SwLeoAIAddin.SwAddin\CLSID" Value="{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\ProgID" Value="SwLeoAIAddin.SwAddin" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32" Value="mscoree.dll" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}" Value="SwLeoAIAddin.SwAddin" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32" Name="ThreadingModel" Value="Both" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="SwLeoAIAddin.AssemblyEventHandler+MeasurementData" Value="SwLeoAIAddin.AssemblyEventHandler+MeasurementData" Type="string" />
+        <RegistryValue Root="HKCR" Key="SwLeoAIAddin.AssemblyEventHandler+MeasurementData\CLSID" Value="{6DFF9042-3B7E-31B1-A884-250783946723}" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\ProgID" Value="SwLeoAIAddin.AssemblyEventHandler+MeasurementData" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32" Value="mscoree.dll" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}" Value="SwLeoAIAddin.AssemblyEventHandler+MeasurementData" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32" Name="ThreadingModel" Value="Both" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\Implemented Categories\{62C8FE65-4EBB-45e7-B440-6E39B2CDBF29}" Value="" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\Implemented Categories\{62C8FE65-4EBB-45e7-B440-6E39B2CDBF29}" Value="" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\Implemented Categories\{62C8FE65-4EBB-45e7-B440-6E39B2CDBF29}" Value="" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32\1.0.9035.16620" Name="Class" Value="SwLeoAIAddin.AssemblyEventHandler+MeasurementData" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32\1.0.9035.16620" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32\1.0.9035.16620" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32\1.0.9035.16620" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32\1.0.9035.16620" Name="Class" Value="SwLeoAIAddin.AssemblyEventHandler+Point3D" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32\1.0.9035.16620" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32\1.0.9035.16620" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32\1.0.9035.16620" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32\1.0.9035.16620" Name="Class" Value="SwLeoAIAddin.SwAddin" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32\1.0.9035.16620" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32\1.0.9035.16620" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32\1.0.9035.16620" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32" Name="Class" Value="SwLeoAIAddin.AssemblyEventHandler+MeasurementData" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{6DFF9042-3B7E-31B1-A884-250783946723}\InprocServer32" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32" Name="Class" Value="SwLeoAIAddin.AssemblyEventHandler+Point3D" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{8C4C2C65-1139-36A4-BE35-09F66C89AFBC}\InprocServer32" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32" Name="Class" Value="SwLeoAIAddin.SwAddin" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="CLSID\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}\InprocServer32" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKCR" Key="Record\{C7044F4E-27E1-4095-B6A5-35682477B8C8}\1.0.9035.16620" Name="Class" Value="SolidWorks.Interop.swconst.swComponentSuppressionState_e" Type="string" />
+        <RegistryValue Root="HKCR" Key="Record\{C7044F4E-27E1-4095-B6A5-35682477B8C8}\1.0.9035.16620" Name="Assembly" Value="sw-addin, Version=1.0.9035.16620, Culture=neutral, PublicKeyToken=null" Type="string" />
+        <RegistryValue Root="HKCR" Key="Record\{C7044F4E-27E1-4095-B6A5-35682477B8C8}\1.0.9035.16620" Name="RuntimeVersion" Value="v4.0.30319" Type="string" />
+        <RegistryValue Root="HKCR" Key="Record\{C7044F4E-27E1-4095-B6A5-35682477B8C8}\1.0.9035.16620" Name="CodeBase" Value="file:///[#SwAddinDll]" Type="string" />
+        
+        <RegistryValue Root="HKLM" Key="SOFTWARE\SolidWorks\Addins\{f46b2d04-9b8b-48f8-9f68-c1c022d4991c}" Value="0" Type="integer" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\SolidWorks\Addins\{f46b2d04-9b8b-48f8-9f68-c1c022d4991c}" Name="Description" Value="Your AI engineering design copilot" Type="string" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\SolidWorks\Addins\{f46b2d04-9b8b-48f8-9f68-c1c022d4991c}" Name="Title" Value="Leo AI copilot" Type="string" />
+        <RegistryValue Root="HKLM" Key="SOFTWARE\SolidWorks\Addins\{f46b2d04-9b8b-48f8-9f68-c1c022d4991c}" Name="Icon Path" Value="[INSTALLFOLDER]sw-addin_32.bmp" Type="string" />
       </Component>
-      <Component Id="UserStartupComponent" Guid="*">
-        <RegistryKey Root="HKCU" Key="Software\SolidWorks\AddInsStartup\{F46B2D04-9B8B-48F8-9F68-C1C022D4991C}">
-          <RegistryValue Value="1" Type="integer" />
-        </RegistryKey>
+      
+      <Component Id="IconsComponent" Directory="ICONSFOLDER" Guid="{A1B2C3D4-E5F6-4789-A0B1-C2D3E4F5A6B7}">
+        <File Id="Icon16x16" Source="icons\icon16x16.bmp" KeyPath="yes" />
+        <File Id="Icon20x20" Source="icons\icon20x20.bmp" />
+        <File Id="Icon32x32" Source="icons\icon32x32.bmp" />
+        <File Id="Icon40x40" Source="icons\icon40x40.bmp" />
+
+        <File Id="FindComponent16x16" Source="icons\findComponent16x16.png"/>
+        <File Id="FindComponent20x20" Source="icons\findComponent20x20.png" />
+        <File Id="FindComponent32x32" Source="icons\findComponent32x32.png" />
+        <File Id="FindComponent40x40" Source="icons\findComponent40x40.png" />
+
+        <File Id="PartReplacer16x16" Source="icons\partReplacer16x16.png"/>
+        <File Id="PartReplacer20x20" Source="icons\partReplacer20x20.png" />
+        <File Id="PartReplacer32x32" Source="icons\partReplacer32x32.png" />
+        <File Id="PartReplacer40x40" Source="icons\partReplacer40x40.png" />
+
+        <File Id="AssemblyInspector16x16" Source="icons\assemblyInspector16x16.png"/>
+        <File Id="AssemblyInspector20x20" Source="icons\assemblyInspector20x20.png" />
+        <File Id="AssemblyInspector32x32" Source="icons\assemblyInspector32x32.png" />
+        <File Id="AssemblyInspector40x40" Source="icons\assemblyInspector40x40.png" />
+        <File Id="LogoAnimation" Source="icons\Logo_animation_Dark.gif" />
+      </Component>
+      
+      <Component Id="UserStartupComponent" Guid="{B2C3D4E5-F6A7-4890-B1C2-D3E4F5A6B7C8}">
+        <RegistryValue Root="HKCU" Key="Software\SolidWorks\AddInsStartup\{f46b2d04-9b8b-48f8-9f68-c1c022d4991c}" Value="1" Type="integer" KeyPath="yes" />
       </Component>
     </ComponentGroup>
   </Package>
