@@ -1164,6 +1164,45 @@ namespace sw_addin
 		}
 
 		/// <summary>
+		/// Assembly to inspect: selected subassembly if the first selection is an assembly component,
+		/// otherwise the active document when it is an assembly. Does not require the file to be saved.
+		/// </summary>
+		public AssemblyDoc GetAssemblyDocumentForInspection()
+		{
+			ModelDoc2 swModel = solidWorksApplication.ActiveDoc;
+			if (swModel == null)
+			{
+				LogFileWriter.Write($"Leo AI - Active document does not exist in SolidWorks");
+				return null;
+			}
+
+			solidworksDocument = swModel;
+			SelectionMgr selMgr = swModel.SelectionManager as SelectionMgr;
+			if (selMgr != null && selMgr.GetSelectedObjectCount2(-1) > 0)
+			{
+				object selectedObject = selMgr.GetSelectedObject6(1, -1);
+				if (selectedObject is Component2 selectedComponent)
+				{
+					ModelDoc2 componentDoc = selectedComponent.GetModelDoc2() as ModelDoc2;
+					if (componentDoc is AssemblyDoc)
+					{
+						LogFileWriter.Write($"Leo AI - Assembly inspection target: selected subassembly component");
+						return (AssemblyDoc)componentDoc;
+					}
+				}
+			}
+
+			if (swModel is AssemblyDoc activeAsm)
+			{
+				LogFileWriter.Write($"Leo AI - Assembly inspection target: active assembly document");
+				return activeAsm;
+			}
+
+			LogFileWriter.Write($"Leo AI - No assembly document context for inspection");
+			return null;
+		}
+
+		/// <summary>
 		/// Checks if we can get a selected part path (for enabling/disabling Part Replacer button)
 		/// </summary>
 		/// <returns>True if a part path can be determined, false otherwise</returns>

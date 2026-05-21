@@ -375,7 +375,7 @@ namespace SwLeoAIAddin
 				"Assembly Inspector",
 				0,  // Icon index: uses IconList[0] and IconList[1]
 				"InspectAssembly",
-				"",
+				"EnableOrDisableInspectAssembly",
 				mainItemID4,
 				menuToolbarOption
 			);
@@ -867,15 +867,12 @@ namespace SwLeoAIAddin
 	/// <returns></returns>
 	public int EnableOrDisableInspectAssembly()
 	{
-		if (iSwApp.ActiveDoc != null && SolidWorksHelper != null)
-		{
-			string assemblyPath = SolidWorksHelper.GetSelectedAssemblyFilePath();
-			return !string.IsNullOrEmpty(assemblyPath) ? 1 : 0;
-		}
-		else
+		if (iSwApp.ActiveDoc == null || SolidWorksHelper == null)
 		{
 			return 0;
 		}
+
+		return SolidWorksHelper.GetAssemblyDocumentForInspection() != null ? 1 : 0;
 	}
 
 	/// <summary>
@@ -913,17 +910,6 @@ namespace SwLeoAIAddin
 			return;
 		}
 
-		string assemblyFilePath = SolidWorksHelper.GetSelectedAssemblyFilePath();
-		
-		if (string.IsNullOrEmpty(assemblyFilePath))
-		{
-			LogFileWriter.Write($"Leo AI - Assembly Inspector: No assembly selected");
-			iSwApp.SendMsgToUser2("No assembly selected. Please select an assembly in the feature tree or open an assembly document.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
-			return;
-		}
-
-		LogFileWriter.Write($"Leo AI - Assembly Inspector: Assembly selected - {assemblyFilePath}");
-		
 		InspectAssemblyCommand();
 	}
 
@@ -1139,99 +1125,30 @@ namespace SwLeoAIAddin
 		{
 			await SolidWorksHelper.OpenElectronApp("Leo is starting...");
 
-			string assemblyFilePath = SolidWorksHelper.GetSelectedAssemblyFilePath();
-
-			if (!string.IsNullOrEmpty(assemblyFilePath))
+			ModelDoc2 activeDoc = (ModelDoc2)iSwApp.ActiveDoc;
+			AssemblyDoc assemblyDoc = SolidWorksHelper.GetAssemblyDocumentForInspection();
+			if (assemblyDoc == null)
 			{
-				if (!File.Exists(assemblyFilePath))
-				{
-					LogFileWriter.Write($"Leo AI - Assembly file not saved to disk, prompting user to save: {assemblyFilePath}");
-					
-					ModelDoc2 activeDoc = (ModelDoc2)iSwApp.ActiveDoc;
-					if (activeDoc != null)
-					{
-						ModelDoc2 docToSave = null;
-						
-						SelectionMgr selMgr = activeDoc.SelectionManager as SelectionMgr;
-						if (selMgr != null && selMgr.GetSelectedObjectCount2(-1) > 0)
-						{
-							object selectedObj = selMgr.GetSelectedObject6(1, -1);
-							if (selectedObj is Component2 comp)
-							{
-								docToSave = comp.GetModelDoc2() as ModelDoc2;
-								if (docToSave != null && !(docToSave is AssemblyDoc))
-								{
-									docToSave = null;
-								}
-							}
-						}
-						
-						if (docToSave == null)
-						{
-							docToSave = activeDoc;
-						}
-						
-						if (docToSave != null && docToSave is AssemblyDoc)
-						{
-							string docPath = docToSave.GetPathName();
-							if (string.IsNullOrEmpty(docPath) || !File.Exists(docPath))
-							{
-								int result = iSwApp.SendMsgToUser2("The assembly document needs to be saved before inspection. Do you want to save it now?", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbYesNo);
-								if (result == (int)swMessageBoxResult_e.swMbHitYes)
-								{
-									if (docToSave != activeDoc)
-									{
-										string docTitle = docToSave.GetTitle();
-										iSwApp.ActivateDoc3(docTitle, false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, 0);
-									}
-									
-									docToSave.Save();
-									assemblyFilePath = docToSave.GetPathName();
-									
-									if (!string.IsNullOrEmpty(assemblyFilePath) && File.Exists(assemblyFilePath))
-									{
-										LogFileWriter.Write($"Leo AI - Assembly document saved successfully: {assemblyFilePath}");
-										
-										if (docToSave != activeDoc)
-										{
-											iSwApp.ActivateDoc3(activeDoc.GetTitle(), false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, 0);
-										}
-									}
-									else
-									{
-										iSwApp.SendMsgToUser2("Failed to save the assembly document. Assembly inspection cancelled.", (int)swMessageBoxIcon_e.swMbStop, (int)swMessageBoxBtn_e.swMbOk);
-										LogFileWriter.Write($"Leo AI - Failed to save assembly document for inspection");
-										return;
-									}
-								}
-								else
-								{
-									LogFileWriter.Write($"Leo AI - User cancelled saving assembly document for inspection");
-									return;
-								}
-							}
-							else
-							{
-								assemblyFilePath = docPath;
-							}
-						}
-					}
-				}
+				iSwApp.SendMsgToUser2("No assembly to inspect. Open an assembly document, or select a subassembly in the feature tree.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
+				LogFileWriter.Write($"Leo AI - No assembly document context for inspection");
+				return;
+			}
 
-				if (File.Exists(assemblyFilePath))
-				{
-					await LeoWebClientHelper.SendAssemblyInspectionRequest(assemblyFilePath);
-				}
-				else
-				{
-					iSwApp.SendMsgToUser2($"Assembly file not found: {assemblyFilePath}. Please save the document first.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
-					LogFileWriter.Write($"Leo AI - Assembly file does not exist: {assemblyFilePath}");
-				}
+			ModelDoc2 assemblyModelDoc = (ModelDoc2)assemblyDoc;
+			string assemblyFilePath = null;
+			if (!TryEnsureAssemblySavedForInspection(activeDoc, assemblyModelDoc, ref assemblyFilePath))
+			{
+				return;
+			}
+
+			if (File.Exists(assemblyFilePath))
+			{
+				await LeoWebClientHelper.SendAssemblyInspectionRequest(assemblyFilePath);
 			}
 			else
 			{
-				iSwApp.SendMsgToUser2("No assembly selected. Please select an assembly in the feature tree or open an assembly document to inspect.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
-				LogFileWriter.Write($"Leo AI - No assembly selected for inspection");
+				iSwApp.SendMsgToUser2($"Assembly file not found: {assemblyFilePath}. Please save the document first.", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbOk);
+				LogFileWriter.Write($"Leo AI - Assembly file does not exist: {assemblyFilePath}");
 			}
 		}
 		catch (Exception ex)
@@ -1239,6 +1156,55 @@ namespace SwLeoAIAddin
 			LogFileWriter.Write($"Leo AI - Error in InspectAssemblyCommand: {ex.Message}");
 			iSwApp.SendMsgToUser2($"Error initiating assembly inspection: {ex.Message}", (int)swMessageBoxIcon_e.swMbStop, (int)swMessageBoxBtn_e.swMbOk);
 		}
+	}
+
+	/// <summary>
+	/// Ensures the assembly has a path on disk (prompts to save when new, unsaved, or file missing).
+	/// </summary>
+	private bool TryEnsureAssemblySavedForInspection(ModelDoc2 activeDoc, ModelDoc2 assemblyModelDoc, ref string assemblyFilePath)
+	{
+		if (assemblyModelDoc == null || !(assemblyModelDoc is AssemblyDoc))
+		{
+			return false;
+		}
+
+		assemblyFilePath = assemblyModelDoc.GetPathName();
+		if (!string.IsNullOrEmpty(assemblyFilePath) && File.Exists(assemblyFilePath))
+		{
+			return true;
+		}
+
+		LogFileWriter.Write($"Leo AI - Assembly file not on disk (path empty or missing), prompting user to save: '{assemblyFilePath ?? ""}'");
+
+		int result = iSwApp.SendMsgToUser2("The assembly document needs to be saved before inspection. Do you want to save it now?", (int)swMessageBoxIcon_e.swMbWarning, (int)swMessageBoxBtn_e.swMbYesNo);
+		if (result != (int)swMessageBoxResult_e.swMbHitYes)
+		{
+			LogFileWriter.Write($"Leo AI - User cancelled saving assembly document for inspection");
+			return false;
+		}
+
+		if (activeDoc != null && assemblyModelDoc != activeDoc)
+		{
+			string docTitle = assemblyModelDoc.GetTitle();
+			iSwApp.ActivateDoc3(docTitle, false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, 0);
+		}
+
+		assemblyModelDoc.Save();
+		assemblyFilePath = assemblyModelDoc.GetPathName();
+
+		if (!string.IsNullOrEmpty(assemblyFilePath) && File.Exists(assemblyFilePath))
+		{
+			LogFileWriter.Write($"Leo AI - Assembly document saved successfully: {assemblyFilePath}");
+			if (activeDoc != null && assemblyModelDoc != activeDoc)
+			{
+				iSwApp.ActivateDoc3(activeDoc.GetTitle(), false, (int)swRebuildOnActivation_e.swDontRebuildActiveDoc, 0);
+			}
+			return true;
+		}
+
+		iSwApp.SendMsgToUser2("Failed to save the assembly document. Assembly inspection cancelled.", (int)swMessageBoxIcon_e.swMbStop, (int)swMessageBoxBtn_e.swMbOk);
+		LogFileWriter.Write($"Leo AI - Failed to save assembly document for inspection");
+		return false;
 	}
 	#endregion
 
