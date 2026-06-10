@@ -22,6 +22,8 @@ using System.Runtime.InteropServices;
 // The following GUID is for the ID of the typelib if this project is exposed to COM
 [assembly: Guid("bb844d54-bb27-418d-8af5-94366356dba7")]
 
+[assembly: InternalsVisibleTo("LeoAICadDataClient.Tests")]
+
 // Version information for an assembly consists of the following four values:
 //
 //      Major Version

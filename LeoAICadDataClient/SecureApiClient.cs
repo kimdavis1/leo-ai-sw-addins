@@ -8,6 +8,7 @@ namespace LeoAICadDataClient
     using System.Net.Http;
     using System.Net.Http.Headers;
     using System.Text;
+    using System.Text.RegularExpressions;
     using System.Threading;
     using System.Threading.Tasks;
     using LeoAICadDataClient.Utilities;
@@ -22,7 +23,24 @@ namespace LeoAICadDataClient
         private string _jwtToken;
         private readonly SemaphoreSlim _tokenRefreshLock = new SemaphoreSlim(1, 1);
         private const int MaxRetries = 5;
-        private const int InitialRetryDelayMs = 1000;
+        // 5s baseline applies when the server's 429 response carries no retryAfterMs — most
+        // commonly the nginx ingress limit (no JSON body, no retryAfterMs field). In production,
+        // nginx is configured at 10 r/s per client IP with a burst of 50, so a 5s wait refills
+        // the entire burst capacity. The previous 1s start was too aggressive for nginx and
+        // caused retry storms. Server-supplied retryAfterMs (leo-api) is honored separately
+        // and is not affected by this constant.
+        // Sequence with current MaxRetries=5: 5s -> 10s -> 20s -> 40s -> 60s (clamped) ~= 135s
+        // total wait before the call is reported to Sentry as exhausted.
+        private const int InitialRetryDelayMs = 5000;
+        // 60s matches leo-api's largest legitimate rate-limit window (the IP-based limit on
+        // GET /synced-directories -- see leo-api/src/api/v1/synced-directories.ts). The hot
+        // metadata endpoint uses a 3s window, so values that high are pathological; the cap
+        // is defensive headroom rather than a frequently-hit ceiling.
+        private const int MaxRetryDelayMs = 60_000;
+        // Small buffer beyond the server's retryAfterMs so we don't race the bucket reset by a millisecond.
+        private const int RetryAfterBufferMs = 100;
+        private static readonly Regex RetryAfterMsRegex = new Regex(@"""retryAfterMs""\s*:\s*(\d+)", RegexOptions.Compiled);
+        private static readonly Random _retryJitter = new Random();
 
         public SecureApiClient(string apiKey, string projectId)
         {
@@ -278,11 +296,19 @@ namespace LeoAICadDataClient
         }
 
         /// <summary>
-        /// Executes an async function with retry logic for rate limit errors (HTTP 429)
+        /// Executes an async function with retry logic for rate limit errors (HTTP 429).
+        /// Honors the server-supplied <c>retryAfterMs</c> from the response body when present,
+        /// and falls back to exponential backoff otherwise. Adds jitter so concurrent workers
+        /// don't retry in lockstep.
+        ///
+        /// Sentry capture policy: transient 429s that succeed on retry are NOT captured — only
+        /// 429s that exhaust the retry budget reach Sentry, tagged with <c>retry_exhausted=true</c>.
+        /// The inner catches in each public method are expected to skip <c>CaptureException</c> when
+        /// <see cref="IsRateLimitException"/> returns true, leaving the decision to this method.
         /// </summary>
-        private async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> operation, string operationName)
+        internal async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> operation, string operationName)
         {
-            int retryDelay = InitialRetryDelayMs;
+            int exponentialDelay = InitialRetryDelayMs;
 
             for (int attempt = 0; attempt <= MaxRetries; attempt++)
             {
@@ -292,27 +318,116 @@ namespace LeoAICadDataClient
                 }
                 catch (Exception ex)
                 {
-                    // Check if it's a rate limit error (HTTP 429)
-                    bool isRateLimit = ex.Message.Contains("429") ||
-                                      ex.Message.ToLower().Contains("rate limit") ||
-                                      ex.Message.ToLower().Contains("too many requests");
+                    bool isRateLimit = IsRateLimitException(ex);
 
                     if (isRateLimit && attempt < MaxRetries)
                     {
-                        // Exponential backoff for rate limits
-                        Logger.Info($"Rate limit hit for {operationName}, retrying in {retryDelay}ms (attempt {attempt + 1}/{MaxRetries})");
-                        await Task.Delay(retryDelay).ConfigureAwait(false);
-                        retryDelay *= 2; // Exponential backoff
+                        int delay = ComputeRateLimitDelayMs(ex.Message, exponentialDelay, out bool usedServerValue);
+                        Logger.Info($"Rate limit hit for {operationName}, retrying in {delay}ms (attempt {attempt + 1}/{MaxRetries}, source={(usedServerValue ? "server" : "backoff")})");
+                        await Task.Delay(delay).ConfigureAwait(false);
+                        // Advance the exponential backoff regardless — only used on the next retry if the server doesn't supply a value.
+                        exponentialDelay = Math.Min(exponentialDelay * 2, MaxRetryDelayMs);
                         continue;
                     }
 
-                    // For all other errors or exhausted retries, re-throw
+                    if (isRateLimit)
+                    {
+                        // Exhausted the retry budget — this is the first time we report the 429 to Sentry.
+                        // All earlier transient 429s on this call were suppressed by the inner catches.
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", operationName },
+                            { "retry_exhausted", "true" },
+                            { "retry_attempts", (MaxRetries + 1).ToString() },
+                        });
+                    }
+
+                    // Non-rate-limit errors were already captured by the inner catch; rate-limit
+                    // exhaustion was captured just above. Either way, let it bubble.
                     throw;
                 }
             }
 
             // Should never reach here, but compiler requires return
             throw new Exception($"Failed to execute {operationName} after {MaxRetries} retries");
+        }
+
+        /// <summary>
+        /// Returns true when <paramref name="ex"/> represents an HTTP 429 response from the API.
+        /// Shared between <see cref="ExecuteWithRetryAsync"/> and the inner catches in each public
+        /// method so the suppression decision stays in sync.
+        /// </summary>
+        internal static bool IsRateLimitException(Exception ex)
+        {
+            if (ex == null || string.IsNullOrEmpty(ex.Message)) return false;
+            return ex.Message.Contains("429") ||
+                   ex.Message.ToLower().Contains("rate limit") ||
+                   ex.Message.ToLower().Contains("too many requests");
+        }
+
+        /// <summary>
+        /// Picks a retry delay for a 429: server-supplied <c>retryAfterMs</c> (plus a small buffer)
+        /// when present in the response body, otherwise the current exponential backoff value.
+        /// Clamps to <see cref="MaxRetryDelayMs"/>.
+        ///
+        /// Jitter is applied differently in each case:
+        /// <list type="bullet">
+        ///   <item>Server-supplied: positive-only jitter (0..+15%). The server's value is a hard
+        ///   floor — retrying earlier than that guarantees another 429.</item>
+        ///   <item>Exponential fallback: symmetric jitter (±15%). No hard floor; spreading both
+        ///   directions helps break lockstep retries across concurrent workers.</item>
+        /// </list>
+        /// </summary>
+        internal static int ComputeRateLimitDelayMs(string exceptionMessage, int exponentialFallbackMs, out bool usedServerValue)
+        {
+            int? serverRetryMs = ParseRetryAfterMs(exceptionMessage);
+            usedServerValue = serverRetryMs.HasValue;
+
+            int baseDelay;
+            int jitterLow;
+            int jitterHighExclusive;
+
+            if (serverRetryMs.HasValue)
+            {
+                baseDelay = Math.Min(serverRetryMs.Value + RetryAfterBufferMs, MaxRetryDelayMs);
+                int jitterRange = Math.Max(1, baseDelay * 15 / 100);
+                jitterLow = 0;
+                jitterHighExclusive = jitterRange + 1;
+            }
+            else
+            {
+                baseDelay = Math.Min(exponentialFallbackMs, MaxRetryDelayMs);
+                int jitterRange = Math.Max(1, baseDelay * 15 / 100);
+                jitterLow = -jitterRange;
+                jitterHighExclusive = jitterRange + 1;
+            }
+
+            int jitter;
+            lock (_retryJitter)
+            {
+                jitter = _retryJitter.Next(jitterLow, jitterHighExclusive);
+            }
+
+            // 50ms floor matters only for the exponential branch with tiny fallbacks; the server
+            // branch is already floor-protected by the buffer and positive-only jitter.
+            return Math.Max(50, baseDelay + jitter);
+        }
+
+        /// <summary>
+        /// Extracts the <c>retryAfterMs</c> field from a JSON body embedded in the exception message
+        /// (e.g. <c>"Rate limit (429): {\"error\":\"...\",\"retryAfterMs\":2699}"</c>).
+        /// Returns <c>null</c> when the field is absent — typical for 429s that originate outside the
+        /// leo-api rate limiter (e.g. the monolith advisory-lock collision).
+        /// </summary>
+        internal static int? ParseRetryAfterMs(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return null;
+            var match = RetryAfterMsRegex.Match(text);
+            if (match.Success && int.TryParse(match.Groups[1].Value, out int ms))
+            {
+                return ms;
+            }
+            return null;
         }
 
         /// <summary>
@@ -410,7 +525,11 @@ namespace LeoAICadDataClient
                         errorContext.Add("inner_error_type", ex.InnerException.GetType().Name);
                     }
 
-                    SentryApiErrorHandler.CaptureException(ex, errorContext);
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
+                    {
+                        SentryApiErrorHandler.CaptureException(ex, errorContext);
+                    }
 
                     throw;
                 }
@@ -494,13 +613,16 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"CreateDirectory failed: {ex.Message}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "CreateDirectory" },
-                        { "machineId", machineId },
-                        { "uri", uri }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "CreateDirectory" },
+                            { "machineId", machineId },
+                            { "uri", uri }
+                        });
+                    }
 
                     throw;
                 }
@@ -545,12 +667,15 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"Error in GetDirectoryInfo: {ex.Message}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "GetDirectoryInfo" },
-                        { "machineId", machineId }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "GetDirectoryInfo" },
+                            { "machineId", machineId }
+                        });
+                    }
 
                     throw;
                 }
@@ -656,14 +781,17 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"GetSyncMetadataPaged: Exception occurred: {ex.Message}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "GetSyncMetadataPaged" },
-                        { "directoryId", directoryId },
-                        { "page", page.ToString() },
-                        { "limit", limit.ToString() }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "GetSyncMetadataPaged" },
+                            { "directoryId", directoryId },
+                            { "page", page.ToString() },
+                            { "limit", limit.ToString() }
+                        });
+                    }
 
                     throw;
                 }
@@ -764,13 +892,16 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"GetSyncMetadata: Exception occurred: {ex.Message}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "GetSyncMetadata" },
-                        { "directoryId", directoryId },
-                        { "filepath", filepathInDirectory ?? "all" }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "GetSyncMetadata" },
+                            { "directoryId", directoryId },
+                            { "filepath", filepathInDirectory ?? "all" }
+                        });
+                    }
 
                     throw;
                 }
@@ -825,13 +956,16 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in DeleteFile: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "DeleteFile" },
-                        { "file", filePathInDirectory },
-                        { "directoryId", directoryId }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "DeleteFile" },
+                            { "file", filePathInDirectory },
+                            { "directoryId", directoryId }
+                        });
+                    }
 
                     throw;
                 }
@@ -931,13 +1065,16 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in UpdateFileLocation: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "UpdateFileLocation" },
-                        { "file", filePath },
-                        { "directoryId", directoryId }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "UpdateFileLocation" },
+                            { "file", filePath },
+                            { "directoryId", directoryId }
+                        });
+                    }
 
                     throw;
                 }
@@ -984,12 +1121,15 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in DeleteDirectory: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Capture exception to Sentry
-                    SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
+                    if (!IsRateLimitException(ex))
                     {
-                        { "operation", "DeleteDirectory" },
-                        { "directoryId", directoryId }
-                    });
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", "DeleteDirectory" },
+                            { "directoryId", directoryId }
+                        });
+                    }
 
                     throw;
                 }
