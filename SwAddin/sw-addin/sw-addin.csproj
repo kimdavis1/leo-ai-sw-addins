@@ -166,6 +166,7 @@
     <Compile Include="Data\SwPoint3D.cs" />
     <Compile Include="Data\SwUnitsConverter.cs" />
     <Compile Include="EventHandling.cs" />
+    <Compile Include="LeoDesktopAppLocator.cs" />
     <Compile Include="LeoWebClientHelper.cs" />
     <Compile Include="LeoWebServerListener.cs" />
     <Compile Include="LoadingForm.cs">

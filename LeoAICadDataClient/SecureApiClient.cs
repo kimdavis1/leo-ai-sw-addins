@@ -233,35 +233,87 @@ namespace LeoAICadDataClient
             public string ProjectId { get; set; }
         }
 
+        /// <summary>
+        /// Stores the current Descope JWT. Auth headers are NOT applied to the shared
+        /// <see cref="_httpClient"/> here — they are attached per-request in
+        /// <see cref="ApplyAuthHeaders"/>. Mutating <see cref="System.Net.Http.Headers.HttpRequestHeaders"/>
+        /// <paramref name="token"/> is valid and means "fall back to the X-API-Key credential".
+        /// </summary>
         public void SetJwtToken(string token)
         {
             _jwtToken = token;
-            // Clear previous auth headers
-            _httpClient.DefaultRequestHeaders.Authorization = null;
-            _httpClient.DefaultRequestHeaders.Remove("X-API-Key");
+        }
 
-            if (!string.IsNullOrEmpty(_jwtToken))
+        /// <summary>
+        /// Attaches the auth credential to a single outgoing request, read atomically from the current
+        /// token state. Prefers the Descope JWT (Bearer) and falls back to the static API key (X-API-Key).
+        /// If neither is available the request is NOT sent.
+        /// </summary>
+        private void ApplyAuthHeaders(HttpRequestMessage request)
+        {
+            // Single atomic reference read — string assignment is atomic, so a concurrent refresh
+            // swapping _jwtToken can only ever hand us a complete old-or-new value, never a torn one.
+            string jwt = _jwtToken;
+            if (!string.IsNullOrEmpty(jwt))
             {
-                _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _jwtToken);
+                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", jwt);
+            }
+            else if (!string.IsNullOrEmpty(_apiKey))
+            {
+                request.Headers.Add("X-API-Key", _apiKey);
             }
             else
             {
-                _httpClient.DefaultRequestHeaders.Add("X-API-Key", _apiKey);
+                throw new InvalidOperationException(
+                    "SecureApiClient has no usable credential: both the JWT and the API key are empty. " +
+                    "Auth initialization had not completed before the request was issued.");
             }
-            Logger.Info("Auth headers set on HttpClient.");
         }
 
-        private async Task RefreshTokenIfRequiredAsync()
+        /// <summary>
+        /// Sends a request with the auth credential applied per-request (see <see cref="ApplyAuthHeaders"/>)
+        /// instead of relying on the shared client's default headers, eliminating the race where a concurrent
+        /// token refresh could drop the header off an in-flight request. The caller owns
+        /// <paramref name="content"/> and remains responsible for disposing it; the request only holds a
+        /// reference to it.
+        /// </summary>
+        private Task<HttpResponseMessage> SendWithAuthAsync(HttpMethod method, string requestUri, HttpContent content = null)
+        {
+            var request = new HttpRequestMessage(method, requestUri);
+            if (content != null)
+            {
+                request.Content = content;
+            }
+            ApplyAuthHeaders(request);
+            return _httpClient.SendAsync(request);
+        }
+
+        /// <summary>
+        /// Refreshes the Descope JWT when required and stores it via <see cref="SetJwtToken"/>.
+        /// Auth headers are applied per-request in <see cref="ApplyAuthHeaders"/>.
+        /// </summary>
+        /// <param name="force">
+        /// When <c>true</c>, bypasses the local <see cref="JwtAuthHelper.ValidateJwtToken"/> check and
+        /// always exchanges for a fresh token. This is used after the server rejects a token with a 401
+        /// <c>isAuthTokenExpired</c> response: a Descope JWT can be revoked or force-expired server-side
+        /// (session revocation, force-logout) while still appearing valid locally by its <c>exp</c> claim,
+        /// so the local check alone would never trigger a refresh in that case.
+        /// </param>
+        private async Task RefreshTokenIfRequiredAsync(bool force = false)
         {
             // Prevent concurrent token refreshes - only one thread should refresh at a time
             await _tokenRefreshLock.WaitAsync().ConfigureAwait(false);
             try
             {
-                // Double-check token validity after acquiring lock (another thread may have already refreshed)
-                bool isTokenValid = JwtAuthHelper.ValidateJwtToken(_jwtToken, _apiKey, _projectId);
+                // Double-check token validity after acquiring lock (another thread may have already refreshed).
+                // A forced refresh skips the local check entirely — the server told us the token is bad even
+                // though it still looks valid locally.
+                bool isTokenValid = !force && JwtAuthHelper.ValidateJwtToken(_jwtToken, _apiKey, _projectId);
                 if (!isTokenValid)
                 {
-                    Logger.Info("Token is not valid, attempting to refresh.");
+                    Logger.Info(force
+                        ? "Forcing token refresh (server rejected current token with 401)."
+                        : "Token is not valid, attempting to refresh.");
                     var descopeClient = new DescopeClient(_projectId, "https://api.descope.com");
 
                     var tokenTask = descopeClient.ExchangeTokenAsync(_apiKey);
@@ -283,7 +335,6 @@ namespace LeoAICadDataClient
                         Logger.Error("Token refresh timed out after 10 seconds.");
                     }
                 }
-                SetJwtToken(_jwtToken);
             }
             catch (Exception ex)
             {
@@ -305,10 +356,19 @@ namespace LeoAICadDataClient
         /// 429s that exhaust the retry budget reach Sentry, tagged with <c>retry_exhausted=true</c>.
         /// The inner catches in each public method are expected to skip <c>CaptureException</c> when
         /// <see cref="IsRateLimitException"/> returns true, leaving the decision to this method.
+        ///
+        /// Auth-expiry policy (HTTP 401 <c>isAuthTokenExpired</c>): mirrors the 429 policy but with a
+        /// single retry. On the first such 401 we force a token refresh (<see cref="RefreshTokenIfRequiredAsync"/>
+        /// with <c>force: true</c>) and retry the operation exactly once — a second 401 after a fresh token is a
+        /// genuine auth failure, not a stale token. The inner catches skip <c>CaptureException</c> for
+        /// <see cref="IsAuthTokenExpiredException"/>, so the single Sentry report on a real failure is emitted
+        /// here, tagged with <c>auth_retry_exhausted=true</c>. A 401 that succeeds after the refresh produces
+        /// no Sentry event at all — this is the noise reduction the fix targets.
         /// </summary>
         internal async Task<T> ExecuteWithRetryAsync<T>(Func<Task<T>> operation, string operationName)
         {
             int exponentialDelay = InitialRetryDelayMs;
+            bool authRefreshRetried = false;
 
             for (int attempt = 0; attempt <= MaxRetries; attempt++)
             {
@@ -319,6 +379,37 @@ namespace LeoAICadDataClient
                 catch (Exception ex)
                 {
                     bool isRateLimit = IsRateLimitException(ex);
+                    bool isAuthExpired = IsAuthTokenExpiredException(ex);
+
+                    // 401 isAuthTokenExpired: the server rejected a token that still looked valid locally
+                    // (revoked / force-expired server-side). Force a fresh token and retry the operation
+                    // ONCE. Guarded by authRefreshRetried so a persistent 401 can't loop.
+                    if (isAuthExpired && !authRefreshRetried)
+                    {
+                        authRefreshRetried = true;
+                        Logger.Info($"Auth token rejected by server (401) in {operationName} — forcing token refresh and retrying once");
+                        await RefreshTokenIfRequiredAsync(force: true).ConfigureAwait(false);
+                        // The one-shot auth retry must not consume a rate-limit attempt slot — otherwise a
+                        // first 401 arriving on the final iteration (after the 429 budget is spent) would exit
+                        // the loop before the refreshed token is ever tried. The authRefreshRetried guard above
+                        // makes this strictly one-shot, so decrementing here cannot loop (worst case is
+                        // MaxRetries + 2 total iterations).
+                        attempt--;
+                        continue;
+                    }
+
+                    if (isAuthExpired)
+                    {
+                        // Already retried once with a fresh token and still 401 → genuine auth failure.
+                        // The inner catch suppressed this (mirroring the 429 policy), so report it here, once.
+                        Logger.Error($"Auth token refresh did not fix 401 in {operationName} — giving up and reporting to Sentry");
+                        SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
+                        {
+                            { "operation", operationName },
+                            { "auth_retry_exhausted", "true" },
+                        });
+                        throw;
+                    }
 
                     if (isRateLimit && attempt < MaxRetries)
                     {
@@ -363,6 +454,36 @@ namespace LeoAICadDataClient
             return ex.Message.Contains("429") ||
                    ex.Message.ToLower().Contains("rate limit") ||
                    ex.Message.ToLower().Contains("too many requests");
+        }
+
+        /// <summary>
+        /// Returns true when <paramref name="ex"/> represents a leo-api HTTP 401 "auth token expired"
+        /// response. The inner catches in each public method throw an exception whose message embeds the
+        /// response body (e.g. <c>{"error":"Authorization token expired","isAuthTokenExpired":true}</c>),
+        /// so this matches on either marker. Shared between <see cref="ExecuteWithRetryAsync"/> (which
+        /// forces a token refresh and retries once) and the inner catches (which skip
+        /// <c>CaptureException</c> for this class so the single report happens centrally).
+        /// </summary>
+        internal static bool IsAuthTokenExpiredException(Exception ex)
+        {
+            if (ex == null || string.IsNullOrEmpty(ex.Message)) return false;
+            return ex.Message.Contains("isAuthTokenExpired") ||
+                   ex.Message.Contains("Authorization token expired");
+        }
+
+        /// <summary>
+        /// Detects the leo-api "auth token expired" signal directly from an HTTP response: status 401 with
+        /// a body carrying <c>isAuthTokenExpired</c> or <c>Authorization token expired</c>. Used by each
+        /// public method's non-success branch to decide whether to throw a retryable auth-expiry exception
+        /// (so <see cref="ExecuteWithRetryAsync"/> can refresh + retry) instead of reporting and returning.
+        /// Other 401s (e.g. a bad API key) do NOT match and keep their existing report-and-return behavior —
+        /// retrying those would loop without ever succeeding.
+        /// </summary>
+        internal static bool IsAuthTokenExpiredResponse(int statusCode, string responseBody)
+        {
+            if (statusCode != 401 || string.IsNullOrEmpty(responseBody)) return false;
+            return responseBody.Contains("isAuthTokenExpired") ||
+                   responseBody.Contains("Authorization token expired");
         }
 
         /// <summary>
@@ -475,7 +596,7 @@ namespace LeoAICadDataClient
                             content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
                         }
 
-                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content).ConfigureAwait(false);
+                        var response = await SendWithAuthAsync(HttpMethod.Post, $"api/v1/synced-directories/{directoryId}/files", content).ConfigureAwait(false);
                         var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                         if (response.IsSuccessStatusCode)
@@ -487,10 +608,13 @@ namespace LeoAICadDataClient
                         {
                             Logger.Error($"Failed to create file: {logicalFilePath}. Status: {response.StatusCode}, Response: {responseString}");
 
+                            bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, responseString);
+
                             // Capture unexpected API errors to Sentry (excluding rate limits and conflicts which are handled separately)
                             // 429 = Rate limit (handled by retry logic)
                             // 409 = Conflict (expected when file already exists - handled by optimistic upload logic)
-                            if ((int)response.StatusCode != 429 && (int)response.StatusCode != 409)
+                            // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                            if ((int)response.StatusCode != 429 && (int)response.StatusCode != 409 && !isAuthExpired)
                             {
                                 SentryApiErrorHandler.CaptureApiError("CreateFile", (int)response.StatusCode, responseString,
                                     new Dictionary<string, string> { { "file", logicalFilePath }, { "directoryId", directoryId } });
@@ -499,6 +623,11 @@ namespace LeoAICadDataClient
                             if ((int)response.StatusCode == 429)
                             {
                                 throw new Exception($"Rate limit (429): {responseString}");
+                            }
+                            if (isAuthExpired)
+                            {
+                                Logger.Info($"CreateFile: auth token rejected by server (401 isAuthTokenExpired) for '{logicalFilePath}' — throwing for one-shot token-refresh retry");
+                                throw new Exception($"Authorization token expired (401) in CreateFile: {responseString}");
                             }
                             return null;
                         }
@@ -525,8 +654,9 @@ namespace LeoAICadDataClient
                         errorContext.Add("inner_error_type", ex.InnerException.GetType().Name);
                     }
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, errorContext);
                     }
@@ -582,7 +712,7 @@ namespace LeoAICadDataClient
                     var jsonPayload = JsonConvert.SerializeObject(new { machineId, uri });
                     var content = new StringContent(jsonPayload, Encoding.UTF8, "application/json");
 
-                    var response = await _httpClient.PostAsync("api/v1/synced-directories", content).ConfigureAwait(false);
+                    var response = await SendWithAuthAsync(HttpMethod.Post, "api/v1/synced-directories", content).ConfigureAwait(false);
                     var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
@@ -595,8 +725,11 @@ namespace LeoAICadDataClient
                     {
                         Logger.Error($"Failed to create directory. Status: {response.StatusCode}, Response: {responseString}");
 
+                        bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, responseString);
+
                         // Capture unexpected API errors to Sentry
-                        if ((int)response.StatusCode != 429)
+                        // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                        if ((int)response.StatusCode != 429 && !isAuthExpired)
                         {
                             SentryApiErrorHandler.CaptureApiError("CreateDirectory", (int)response.StatusCode, responseString,
                                 new Dictionary<string, string> { { "machineId", machineId }, { "uri", uri } });
@@ -606,6 +739,11 @@ namespace LeoAICadDataClient
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
                         }
+                        if (isAuthExpired)
+                        {
+                            Logger.Info($"CreateDirectory: auth token rejected by server (401 isAuthTokenExpired) for machine '{machineId}' — throwing for one-shot token-refresh retry");
+                            throw new Exception($"Authorization token expired (401) in CreateDirectory: {responseString}");
+                        }
                         return string.Empty;
                     }
                 }
@@ -613,8 +751,9 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"CreateDirectory failed: {ex.Message}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {
@@ -638,7 +777,7 @@ namespace LeoAICadDataClient
                 try
                 {
                     Logger.Info($"GetDirectoryInfo: Starting to fetch directory info for machine {machineId}");
-                    var response = await _httpClient.GetAsync("api/v1/synced-directories").ConfigureAwait(false);
+                    var response = await SendWithAuthAsync(HttpMethod.Get, "api/v1/synced-directories").ConfigureAwait(false);
                     var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
@@ -649,8 +788,11 @@ namespace LeoAICadDataClient
                     {
                         Logger.Error($"GetDirectoryInfo failed. Status: {response.StatusCode}, Response: {responseString}");
 
+                        bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, responseString);
+
                         // Capture unexpected API errors to Sentry
-                        if ((int)response.StatusCode != 429)
+                        // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                        if ((int)response.StatusCode != 429 && !isAuthExpired)
                         {
                             SentryApiErrorHandler.CaptureApiError("GetDirectoryInfo", (int)response.StatusCode, responseString,
                                 new Dictionary<string, string> { { "machineId", machineId } });
@@ -660,6 +802,11 @@ namespace LeoAICadDataClient
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
                         }
+                        if (isAuthExpired)
+                        {
+                            Logger.Info($"GetDirectoryInfo: auth token rejected by server (401 isAuthTokenExpired) for machine '{machineId}' — throwing for one-shot token-refresh retry");
+                            throw new Exception($"Authorization token expired (401) in GetDirectoryInfo: {responseString}");
+                        }
                         return null;
                     }
                 }
@@ -667,8 +814,9 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"Error in GetDirectoryInfo: {ex.Message}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {
@@ -747,7 +895,7 @@ namespace LeoAICadDataClient
                     string url = $"api/v1/synced-directories/{directoryId}/files/sync-metadata?page={page}&limit={limit}";
                     Logger.Info($"GetSyncMetadataPaged: Fetching page {page} (limit {limit}) for directory {directoryId}");
 
-                    var response = await _httpClient.GetAsync(url).ConfigureAwait(false);
+                    var response = await SendWithAuthAsync(HttpMethod.Get, url).ConfigureAwait(false);
                     var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
@@ -758,8 +906,11 @@ namespace LeoAICadDataClient
                     {
                         Logger.Error($"GetSyncMetadataPaged failed. Status: {response.StatusCode}, Body: {responseString}");
 
+                        bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, responseString);
+
                         // Capture unexpected API errors to Sentry
-                        if ((int)response.StatusCode != 429)
+                        // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                        if ((int)response.StatusCode != 429 && !isAuthExpired)
                         {
                             SentryApiErrorHandler.CaptureApiError("GetSyncMetadataPaged", (int)response.StatusCode, responseString,
                                 new Dictionary<string, string>
@@ -774,6 +925,11 @@ namespace LeoAICadDataClient
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
                         }
+                        if (isAuthExpired)
+                        {
+                            Logger.Info($"GetSyncMetadataPaged: auth token rejected by server (401 isAuthTokenExpired) for directory '{directoryId}' (page {page}) — throwing for one-shot token-refresh retry");
+                            throw new Exception($"Authorization token expired (401) in GetSyncMetadataPaged: {responseString}");
+                        }
                         return null;
                     }
                 }
@@ -781,8 +937,9 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"GetSyncMetadataPaged: Exception occurred: {ex.Message}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {
@@ -861,7 +1018,7 @@ namespace LeoAICadDataClient
                         Logger.Info($"GetSyncMetadata: Fetching all sync metadata for directory {directoryId}");
                     }
 
-                    var response = await _httpClient.GetAsync(url).ConfigureAwait(false);
+                    var response = await SendWithAuthAsync(HttpMethod.Get, url).ConfigureAwait(false);
                     var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
@@ -874,8 +1031,11 @@ namespace LeoAICadDataClient
                     {
                         Logger.Error($"GetSyncMetadata failed. Status: {response.StatusCode}, Body: {responseString}");
 
+                        bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, responseString);
+
                         // Capture unexpected API errors to Sentry
-                        if ((int)response.StatusCode != 429)
+                        // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                        if ((int)response.StatusCode != 429 && !isAuthExpired)
                         {
                             SentryApiErrorHandler.CaptureApiError("GetSyncMetadata", (int)response.StatusCode, responseString,
                                 new Dictionary<string, string> { { "directoryId", directoryId }, { "filepath", filepathInDirectory ?? "all" } });
@@ -885,6 +1045,11 @@ namespace LeoAICadDataClient
                         {
                             throw new Exception($"Rate limit (429): {responseString}");
                         }
+                        if (isAuthExpired)
+                        {
+                            Logger.Info($"GetSyncMetadata: auth token rejected by server (401 isAuthTokenExpired) for directory '{directoryId}' (filepath '{filepathInDirectory ?? "all"}') — throwing for one-shot token-refresh retry");
+                            throw new Exception($"Authorization token expired (401) in GetSyncMetadata: {responseString}");
+                        }
                         return null;
                     }
                 }
@@ -892,8 +1057,9 @@ namespace LeoAICadDataClient
                 {
                     Logger.Error($"GetSyncMetadata: Exception occurred: {ex.Message}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {
@@ -923,7 +1089,7 @@ namespace LeoAICadDataClient
                     Logger.Info($"[API CALL] DeleteFile: path={normalizedPath}, directoryId={directoryId}");
                     Logger.Info($"Sending DELETE request to: {requestUri}");
 
-                    var response = await _httpClient.DeleteAsync(requestUri).ConfigureAwait(false);
+                    var response = await SendWithAuthAsync(HttpMethod.Delete, requestUri).ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -935,10 +1101,13 @@ namespace LeoAICadDataClient
                         var errorContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         Logger.Error($"Failed to delete file: {normalizedPath}. Status: {response.StatusCode}, Response: {errorContent}");
 
+                        bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, errorContent);
+
                         // Capture unexpected API errors to Sentry (excluding expected errors)
                         // 429 = Rate limit (handled by retry logic)
                         // 404 = Not found (expected when trying to delete old path that doesn't exist on server)
-                        if ((int)response.StatusCode != 429 && (int)response.StatusCode != 404)
+                        // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                        if ((int)response.StatusCode != 429 && (int)response.StatusCode != 404 && !isAuthExpired)
                         {
                             SentryApiErrorHandler.CaptureApiError("DeleteFile", (int)response.StatusCode, errorContent,
                                 new Dictionary<string, string> { { "file", normalizedPath }, { "directoryId", directoryId } });
@@ -948,6 +1117,11 @@ namespace LeoAICadDataClient
                         {
                             throw new Exception($"Rate limit (429): {errorContent}");
                         }
+                        if (isAuthExpired)
+                        {
+                            Logger.Info($"DeleteFile: auth token rejected by server (401 isAuthTokenExpired) for '{normalizedPath}' — throwing for one-shot token-refresh retry");
+                            throw new Exception($"Authorization token expired (401) in DeleteFile: {errorContent}");
+                        }
                         return false;
                     }
                 }
@@ -956,8 +1130,9 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in DeleteFile: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {
@@ -1016,7 +1191,7 @@ namespace LeoAICadDataClient
                             content.Add(new StringContent(JsonConvert.SerializeObject(childDatas)), "dependencies");
                         }
 
-                        var response = await _httpClient.PostAsync($"api/v1/synced-directories/{directoryId}/files", content).ConfigureAwait(false);
+                        var response = await SendWithAuthAsync(HttpMethod.Post, $"api/v1/synced-directories/{directoryId}/files", content).ConfigureAwait(false);
                         var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
                         if (response.IsSuccessStatusCode)
@@ -1028,10 +1203,13 @@ namespace LeoAICadDataClient
                         {
                             Logger.Error($"Failed to update file location: {filePath}. Status: {response.StatusCode}, Response: {responseString}");
 
+                            bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, responseString);
+
                             // Capture unexpected API errors to Sentry (excluding expected errors)
                             // 429 = Rate limit (handled by retry logic)
                             // 409 = Conflict (expected when destination path already exists - handled by optimistic upload logic)
                             // 400 with "File is required" = Bad request (expected when server needs file content because checksum doesn't match)
+                            // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
                             bool shouldReport = true;
                             if ((int)response.StatusCode == 429)
                             {
@@ -1042,6 +1220,10 @@ namespace LeoAICadDataClient
                                 shouldReport = false;
                             }
                             else if ((int)response.StatusCode == 400 && responseString != null && responseString.Contains("File is required"))
+                            {
+                                shouldReport = false;
+                            }
+                            else if (isAuthExpired)
                             {
                                 shouldReport = false;
                             }
@@ -1056,6 +1238,11 @@ namespace LeoAICadDataClient
                             {
                                 throw new Exception($"Rate limit (429): {responseString}");
                             }
+                            if (isAuthExpired)
+                            {
+                                Logger.Info($"UpdateFileLocation: auth token rejected by server (401 isAuthTokenExpired) for '{filePath}' — throwing for one-shot token-refresh retry");
+                                throw new Exception($"Authorization token expired (401) in UpdateFileLocation: {responseString}");
+                            }
                             return null;
                         }
                     }
@@ -1065,8 +1252,9 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in UpdateFileLocation: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {
@@ -1090,7 +1278,7 @@ namespace LeoAICadDataClient
                 try
                 {
                     Logger.Info($"Attempting to delete directory: {directoryId}");
-                    var response = await _httpClient.DeleteAsync($"api/v1/synced-directories/{directoryId}").ConfigureAwait(false);
+                    var response = await SendWithAuthAsync(HttpMethod.Delete, $"api/v1/synced-directories/{directoryId}").ConfigureAwait(false);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -1102,8 +1290,11 @@ namespace LeoAICadDataClient
                         var errorContent = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
                         Logger.Error($"Failed to delete directory: {directoryId}. Status: {response.StatusCode}, Response: {errorContent}");
 
+                        bool isAuthExpired = IsAuthTokenExpiredResponse((int)response.StatusCode, errorContent);
+
                         // Capture unexpected API errors to Sentry
-                        if ((int)response.StatusCode != 429)
+                        // 401 isAuthTokenExpired = handled by the token-refresh retry in ExecuteWithRetryAsync
+                        if ((int)response.StatusCode != 429 && !isAuthExpired)
                         {
                             SentryApiErrorHandler.CaptureApiError("DeleteDirectory", (int)response.StatusCode, errorContent,
                                 new Dictionary<string, string> { { "directoryId", directoryId } });
@@ -1113,6 +1304,11 @@ namespace LeoAICadDataClient
                         {
                             throw new Exception($"Rate limit (429): {errorContent}");
                         }
+                        if (isAuthExpired)
+                        {
+                            Logger.Info($"DeleteDirectory: auth token rejected by server (401 isAuthTokenExpired) for directory '{directoryId}' — throwing for one-shot token-refresh retry");
+                            throw new Exception($"Authorization token expired (401) in DeleteDirectory: {errorContent}");
+                        }
                         return false;
                     }
                 }
@@ -1121,8 +1317,9 @@ namespace LeoAICadDataClient
                     Logger.Error($"An exception occurred in DeleteDirectory: {ex.Message}");
                     Logger.Error($"StackTrace: {ex.StackTrace}");
 
-                    // Transient 429s are reported once by ExecuteWithRetryAsync on retry exhaustion.
-                    if (!IsRateLimitException(ex))
+                    // Transient 429s and 401-auth-expired are reported once by ExecuteWithRetryAsync on
+                    // retry/refresh exhaustion — skip them here to avoid double-reporting.
+                    if (!IsRateLimitException(ex) && !IsAuthTokenExpiredException(ex))
                     {
                         SentryApiErrorHandler.CaptureException(ex, new Dictionary<string, string>
                         {

@@ -52,7 +52,6 @@ namespace sw_addin
 
 		private const string loadingText = "Leo is starting...";
 
-		private const string ElectronAppPath = @"C:\Program Files\Leo\Leo.exe";// @"Leo.exe";
 		public SwHelper(ISldWorks iSwApp)
 		{
 			solidWorksApplication = (SldWorks)iSwApp;
@@ -817,7 +816,18 @@ namespace sw_addin
 				if (!IsElectronAppRunning())
 				{
 					LogFileWriter.Write($"Leo AI -  Leo App not running in the machine. ");
-					//application is not running
+
+					//Application is not running — locate the installed Leo desktop app.
+					//It installs per-user by default (%LOCALAPPDATA%\Programs\Leo) but may also be
+					//installed for all users (C:\Program Files\Leo), so probe both before launching.
+					string leoAppPath = LeoDesktopAppLocator.ResolveInstalledPath();
+					if (string.IsNullOrEmpty(leoAppPath))
+					{
+						LogFileWriter.Write($"Leo AI -  Leo desktop app not found in any known install location. Prompting user to download. ");
+						PromptToInstallLeoApp();
+						return;
+					}
+
 					string AssemblyLocation = Path.GetDirectoryName(Assembly.GetAssembly(GetType()).Location);
 					loadingForm = new LoadingForm(launchText, AssemblyLocation + @"\Icons" + @"\Logo_animation_Dark.gif");
 					loadingForm.Show();
@@ -826,8 +836,8 @@ namespace sw_addin
 						await Task.Delay(3000);
 					}
 
-					LogFileWriter.Write($"Leo AI -  Leo App runing from {ElectronAppPath}: ");
-					Process.Start(ElectronAppPath);
+					LogFileWriter.Write($"Leo AI -  Leo App runing from {leoAppPath}: ");
+					Process.Start(leoAppPath);
 				}
 				else
 				{
@@ -874,6 +884,44 @@ namespace sw_addin
 			finally
 			{
 				loadingForm?.Invoke(new Action(() => loadingForm.Close()));
+			}
+		}
+
+
+		/// <summary>
+		/// Tells the user the Leo desktop app isn't installed and offers to open the download
+		/// page. Shown instead of a cryptic Win32 "system cannot find the file specified" error
+		/// when "Turn Leo On" can't locate Leo.exe (e.g. the add-in was deployed but the desktop
+		/// app was never installed).
+		/// </summary>
+		private void PromptToInstallLeoApp()
+		{
+			string message =
+				"The Leo desktop app is not installed on this computer.\n\n" +
+				"Leo for SOLIDWORKS needs the Leo desktop app to run.\n\n" +
+				"Would you like to download it now?";
+
+			int response = solidWorksApplication.SendMsgToUser2(
+				message,
+				(int)swMessageBoxIcon_e.swMbWarning,
+				(int)swMessageBoxBtn_e.swMbYesNo);
+
+			if (response != (int)swMessageBoxResult_e.swMbHitYes)
+			{
+				return;
+			}
+
+			try
+			{
+				Process.Start(LeoDesktopAppLocator.DownloadUrl);
+			}
+			catch (Exception ex)
+			{
+				LogFileWriter.Write($"Leo AI -  Failed to open Leo download page: {ex.Message} ");
+				solidWorksApplication.SendMsgToUser2(
+					$"Please download the Leo desktop app from:\n{LeoDesktopAppLocator.DownloadUrl}",
+					(int)swMessageBoxIcon_e.swMbWarning,
+					(int)swMessageBoxBtn_e.swMbOk);
 			}
 		}
 

@@ -496,13 +496,13 @@ namespace LeoAISwPdmAddIn
             string folderRelativePath = GetRelativePath(vault.RootFolderPath, operation.OldPath);
             LogFileWriter.LogMessage($"Deleting all files in folder from server: {folderRelativePath}");
 
-            // Get all files from server that are in this folder path
-            var serverData = await leoClient.GetSyncMetadataAsync(directoryId);
+            // Get all files from server that are in this folder path (paginated)
+            var serverFiles = await leoClient.GetAllSyncMetadataAsync(directoryId);
             List<string> filesToDelete = new List<string>();
 
-            if (serverData?.Files != null)
+            if (serverFiles != null)
             {
-                foreach (var serverFile in serverData.Files)
+                foreach (var serverFile in serverFiles)
                 {
                     // Check if file path starts with folder path (including subfolder files)
                     if (serverFile.FilePathInDirectory.StartsWith(folderRelativePath, StringComparison.OrdinalIgnoreCase))
